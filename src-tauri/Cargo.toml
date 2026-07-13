@@ -1,0 +1,36 @@
+[package]
+name = "translate-lector"
+version = "0.1.0"
+description = "A Tauri App"
+authors = ["you"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "translate_lector_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+# Secure API-key storage via the OS credential store. Default features enable
+# `windows-native-keyring-store` (Windows Credential Manager). See NFR07 / §3.5.
+keyring = "4"
+# Partial file hashing for document recognition (decision D2, ticket 06).
+sha2 = "0.10"
+# Native file picker for "Apri PDF" (ticket 06, SPECIFICATION §3.1).
+tauri-plugin-dialog = "2"
+# OpenRouter HTTP transport (ticket 08, §4.4). Blocking client used inside a
+# `spawn_blocking` task; rustls-tls avoids a system OpenSSL dependency.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+
