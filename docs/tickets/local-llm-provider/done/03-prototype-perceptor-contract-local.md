@@ -78,3 +78,45 @@ avviato in ambiente autonomo. Nessun risultato di QA è stato inventato.
    strutturato OCR nel parent spec, poi sposta il ticket in `done/`.
 
 **Blocca:** nulla a valle strettamente, ma il verdetto informa D1/D6 del [decision-brief Ticket 04](../../specs/decision-brief-local-llm-04.md).
+
+---
+
+## VERDETTO (eseguito 2026-07-14) — ✅ DONE
+
+Endpoint fornito dall'utente: **Unsloth Studio** su `http://localhost:8888/v1/chat/completions`, modello
+servito con id **`unsloth/gemma-4-E2B-it-qat-GGUF`** (E2B ≈ 2B effettivi, instruction-tuned). Harness
+`prototypes/local-llm/validate-perceptor-contract.mjs` eseguito CON e SENZA `--schema`, 3 pagine consecutive
+EN→IT, su **due caricamenti**: (A) quant iniziale QAT, (B) dopo passaggio dell'utente a un quant **Q4**
+(stesso id servito).
+
+**Risultati:**
+
+| Metrica | (A) QAT — schema | (A) QAT — fallback | (B) Q4 — schema | (B) Q4 — fallback |
+|---|---|---|---|---|
+| Contratto JSON | **3/3** | **3/3** | **3/3** | **3/3** |
+| Latenza media | ~9.8 s/pag | ~7.3 s/pag | ~42 s/pag | ~38 s/pag |
+| Qualità traduzione | scarsa ("Il testo è stato convocato", "tempesta im geste") | mediocre ("Il consiglio si è riunito all'alba", ma mix EN/IT) | **buona** ("Il consiglio si riunì all'alba…") | **buona** (minor slip: "board"→"la tavola") |
+| Summary/glossario | scarsi/rotti | vuoti | **popolati** (pag 2: summary + termini mainsail/reefed/board/course) | vuoti |
+
+**Conclusioni:**
+1. **Integrazione validata**: il provider locale funziona end-to-end col contratto del percettore (§4.4);
+   il client esistente + estrazione JSON robusta bastano. **Contratto 3/3 in tutti e 4 i run.** Nessun
+   blocco tecnico all'aggiunta del provider locale.
+2. **La qualità dipende fortemente dal quant/modello**: lo stesso id servito è passato da output rotto
+   (QAT) a traduzione fluente e corretta (Q4). → **D1**: puntare a un quant **Q4** (o modello ~7B-14B Q4_K_M)
+   per l'uso reale; evitare quant troppo aggressivi/QAT minuscoli.
+3. **`json_schema` non è universalmente peggiore**: sul QAT minuscolo degradava la fluenza (→ meglio il
+   fallback); sul **Q4 va bene e anzi aiuta a popolare summary/glossario**. → conferma il valore del design
+   (Ticket 02) di poter **attivare/disattivare `response_format` per-provider**; default ragionevole per
+   locale: **provare con schema, la ladder lo rimuove se rifiutato**. Aggiorna **D6**.
+4. **Percettore (summary/glossario) inaffidabile su ~2B**: popolamento incostante (solo pag 2 in un run,
+   vuoto altrove). La *traduzione* regge, la *percezione di contesto* no. → per una coerenza forte su
+   documenti lunghi serve un modello più capace; su ~2B considerare summary/glossario "best-effort".
+5. **Latenza**: ~38-42 s/pagina sul Q4 in questo setup — **lenta** per l'interattività. Con prefetch + cache
+   è tollerabile per una lettura pagina-per-pagina, ma il primo caricamento di ogni pagina non-cache pesa.
+   → alimenta **D2** (hardware: tenere il modello interamente in GPU) e conferma il valore di prefetch/cache.
+6. **Compatibilità contratto OCR (epica OCR, Ticket 05)**: se un ~2B popola già a fatica il JSON semplice
+   del percettore, quasi certamente **non reggerà** il contratto strutturato per-blocco più complesso. Per
+   la ricostruzione OCR servirà un modello locale più grande, o restare su cloud per quel caso.
+
+Evidenza: output completi dei 4 run dell'harness (cronologia sessione 2026-07-14).

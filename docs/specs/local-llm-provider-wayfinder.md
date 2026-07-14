@@ -43,6 +43,15 @@ motore di traduzione esistente.
   ladder di degradazione e fallback JSON invariati. Dettaglio + change-point (file:func) + slice di build:
   [design-provider-abstraction.md](./design-provider-abstraction.md). *Domande aperte per il gate umano*
   ripiegate nel Ticket 04.
+- **Validazione locale = ESEGUITA** (Ticket 03, 2026-07-14, endpoint reale dell'utente: Unsloth Studio
+  `localhost:8888`, `gemma-4-E2B-it-qat-GGUF`; testato su quant QAT e poi Q4). **Contratto percettore 3/3
+  in tutti e 4 i run** (schema/fallback × QAT/Q4) → integrazione tecnicamente validata, nessun blocco.
+  **La qualità dipende dal quant**: QAT minuscolo → output rotto; **Q4 → traduzione fluente e corretta**.
+  **`json_schema`**: dannoso sul QAT (meglio il fallback), **ok e utile sul Q4** (popola summary/glossario)
+  → conferma il valore del toggle `response_format` per-provider. **Percettore inaffidabile su ~2B**
+  (summary/glossario incostanti) → best-effort; per coerenza forte serve modello più grande. **Latenza
+  ~38-42 s/pagina** sul Q4 in questo setup → lenta, mitigata da prefetch+cache; tenere il modello in GPU
+  (D2). Dettaglio e tabella nel Ticket 03.
 
 ## Fatti di codebase rilevanti (grounding)
 
@@ -111,7 +120,7 @@ Cartella: `docs/tickets/local-llm-provider/`
 |---|------|--------|-------|
 | 01 | research | Unsloth Studio: come serve un LLM locale (endpoint/protocollo/auth) | ✅ done (`done/`) — [research](./research-unsloth-serving.md) |
 | 02 | research | Astrazione di provider nell'app (base-URL/key/modello configurabili) | ✅ done (`done/`) — [design](./design-provider-abstraction.md) |
-| 03 | prototype | Tenuta del contratto percettore su modello locale (json/fallback/qualità) | ⛔ blocked — richiede endpoint locale in esecuzione (non AFK) |
+| 03 | prototype | Tenuta del contratto percettore su modello locale (json/fallback/qualità) | ✅ done (`done/`) — verdetto: contratto 3/3; Q4 buono, percettore best-effort, ~40s/pag |
 | 04 | grilling | Decisioni: modello/quant, hardware, default vs opt-in, offline | ⛔ gate umano — brief pronto: [decision-brief](./decision-brief-local-llm-04.md) (D1-D7 attendono conferma) |
 
 ## Next Review
