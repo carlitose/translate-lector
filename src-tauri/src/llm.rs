@@ -212,6 +212,17 @@ pub enum LlmError {
     /// No network connection reached the provider (EC02). Transient: retried a
     /// bounded number of times, then surfaced so cached pages stay readable.
     Offline(String),
+    /// A **local** provider endpoint refused the connection / could not be
+    /// reached (connection refused, host down): the local server is simply not
+    /// running or the address/port is wrong (D3/D7, ticket 09). Distinct from
+    /// [`Offline`] (a remote endpoint unreachable = EC02): this carries the
+    /// `base_url` and a dedicated, actionable message. **Permanent** (fail-fast):
+    /// it is NOT retried, because spinning on a server that is down only delays
+    /// the clear message. There is deliberately **no** automatic fallback to the
+    /// cloud (decision D4).
+    ///
+    /// [`Offline`]: LlmError::Offline
+    Unreachable(String),
     /// The response could not be parsed even after the correction retry.
     ParseFailed(String),
     /// A local storage error while reading/writing the cache.
@@ -262,6 +273,12 @@ impl LlmError {
                 format!(
                     "EC02: nessuna connessione. Le pagine già tradotte restano \
                      leggibili dalla cache. {m}"
+                )
+            }
+            LlmError::Unreachable(base_url) => {
+                format!(
+                    "Server locale non raggiungibile a {base_url}. \
+                     Avvia il server (es. Unsloth Studio) o verifica l'indirizzo in ⚙️."
                 )
             }
             LlmError::ParseFailed(m) => {
@@ -436,15 +453,9 @@ impl ChatClient for ChatCompletionsClient {
             .send()
             .map_err(|e| {
                 // Classify transport failures so the retry layer can react
-                // (timeout/offline = transient; anything else = permanent).
-                let msg = e.to_string();
-                if e.is_timeout() {
-                    LlmError::Timeout(msg)
-                } else if e.is_connect() {
-                    LlmError::Offline(msg)
-                } else {
-                    LlmError::Http(msg)
-                }
+                // (timeout = transient; connection refused to a local server =
+                // fail-fast Unreachable; to a remote endpoint = offline EC02).
+                classify_send_error(e.is_timeout(), e.is_connect(), &self.base_url, e.to_string())
             })?;
 
         let status = resp.status();
@@ -529,6 +540,91 @@ pub fn is_unsupported_params_error(status: u16, body: &str) -> bool {
     let rejection_cue =
         m.contains("unsupported") || ((m.contains("support") || m.contains("accept")) && negated);
     param_cue && rejection_cue
+}
+
+/// Classify a transport-level `send()` failure into a typed [`LlmError`], given
+/// the `reqwest` error flags and the target `base_url`. Split out as a pure,
+/// unit-testable function because constructing a real `reqwest::Error` in a test
+/// is awkward (ticket 09):
+///
+/// - **timeout** → [`Timeout`] (transient, retried with backoff, NFR06).
+/// - **connect** (connection refused / cannot connect to host): for a **local**
+///   endpoint → [`Unreachable`] carrying the `base_url` (the local server is
+///   down — fail-fast, no retry, no cloud fallback, D4); for a **remote**
+///   endpoint → [`Offline`] (EC02, no connection).
+/// - anything else → [`Http`] (permanent).
+///
+/// [`Timeout`]: LlmError::Timeout
+/// [`Unreachable`]: LlmError::Unreachable
+/// [`Offline`]: LlmError::Offline
+/// [`Http`]: LlmError::Http
+pub fn classify_send_error(
+    is_timeout: bool,
+    is_connect: bool,
+    base_url: &str,
+    msg: String,
+) -> LlmError {
+    if is_timeout {
+        LlmError::Timeout(msg)
+    } else if is_connect {
+        if is_local_url(base_url) {
+            LlmError::Unreachable(base_url.to_string())
+        } else {
+            LlmError::Offline(msg)
+        }
+    } else {
+        LlmError::Http(msg)
+    }
+}
+
+/// Whether `url`'s host is a loopback/local address (`localhost`, `127.x.x.x`,
+/// `::1`, `0.0.0.0`). Used to tell a **local server down** ([`LlmError::Unreachable`])
+/// apart from a **remote endpoint unreachable** ([`LlmError::Offline`], EC02) on
+/// a connection failure. Pure string parsing (no DNS), unit-testable.
+pub fn is_local_url(url: &str) -> bool {
+    // Drop the scheme, then keep only the authority (up to the first '/').
+    let after_scheme = url.split("://").nth(1).unwrap_or(url);
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    // Strip any userinfo ("user:pass@host").
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    // Strip the port, honouring bracketed IPv6 literals ("[::1]:8080").
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        host_port.split(':').next().unwrap_or(host_port)
+    };
+    let h = host.to_ascii_lowercase();
+    h == "localhost" || h == "::1" || h == "0.0.0.0" || h.starts_with("127.")
+}
+
+/// Derive a cheap `/v1/models` reachability-probe URL from a chat-completions
+/// `base_url` (ticket 09). `…/v1/chat/completions` → `…/v1/models`; any other
+/// URL is probed as-is (a successful TCP connection is what proves reachability,
+/// regardless of the path). Pure and unit-testable.
+pub fn models_probe_url(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    match trimmed.strip_suffix("/chat/completions") {
+        Some(prefix) => format!("{prefix}/models"),
+        None => trimmed.to_string(),
+    }
+}
+
+/// Cheap, dependency-free reachability probe for the onboarding hint (ticket 09):
+/// a short-timeout blocking `GET` to the provider's [`models_probe_url`]. Returns
+/// `true` when the server answers **at all** (any HTTP status, even 401/404 — the
+/// endpoint is up), `false` on connection refused / timeout / DNS error. Never
+/// surfaces an error: "down" is simply `false`. It performs no cloud fallback and
+/// never translates — it only checks whether the endpoint is listening.
+pub fn probe_reachable(base_url: &str) -> bool {
+    let url = models_probe_url(base_url);
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_millis(1500))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    client.get(&url).send().is_ok()
 }
 
 /// Extract a human-readable error string from an OpenRouter error body. Handles
@@ -1177,6 +1273,149 @@ mod tests {
     fn rate_limit_and_offline_carry_their_edge_case_codes() {
         assert!(LlmError::RateLimited("".into()).user_message().contains("EC07"));
         assert!(LlmError::Offline("".into()).user_message().contains("EC02"));
+    }
+
+    // --- Local server unreachable (ticket 09, D3/D4/D7, EC02 local case) ------
+
+    #[test]
+    fn connection_error_to_a_local_server_maps_to_unreachable_with_base_url() {
+        // A connection refused (is_connect) to a loopback endpoint means the
+        // local server is simply down: a dedicated, fail-fast Unreachable that
+        // names the base_url — not a generic Http nor a cloud-y Offline.
+        let base = "http://localhost:8888/v1/chat/completions";
+        let err = classify_send_error(
+            /* is_timeout = */ false,
+            /* is_connect = */ true,
+            base,
+            "connection refused".into(),
+        );
+        assert_eq!(err, LlmError::Unreachable(base.to_string()));
+        let msg = err.user_message();
+        assert!(msg.contains(base), "message names the configured base_url");
+        assert!(msg.contains("Server locale non raggiungibile"), "clear local-down copy");
+        assert!(msg.contains("⚙️"), "actionable: points at settings");
+    }
+
+    #[test]
+    fn connection_error_to_a_remote_endpoint_stays_offline_ec02() {
+        // The same connection failure to a REMOTE endpoint is the EC02 offline
+        // case (no internet), not the local-server-down case.
+        let err = classify_send_error(
+            false,
+            true,
+            OPENROUTER_URL,
+            "dns error".into(),
+        );
+        assert_eq!(err, LlmError::Offline("dns error".into()));
+        assert!(err.user_message().contains("EC02"));
+    }
+
+    #[test]
+    fn timeout_and_generic_send_errors_are_classified_independently_of_host() {
+        assert_eq!(
+            classify_send_error(true, false, "http://localhost:8888/v1/chat/completions", "t".into()),
+            LlmError::Timeout("t".into())
+        );
+        assert_eq!(
+            classify_send_error(false, false, "http://localhost:8888/v1/chat/completions", "x".into()),
+            LlmError::Http("x".into())
+        );
+    }
+
+    #[test]
+    fn unreachable_is_fail_fast_not_transient_and_not_degradable() {
+        let e = LlmError::Unreachable("http://localhost:8888/v1/chat/completions".into());
+        // Must NOT be retried with backoff (would spin on a down server), and is
+        // not a param-relaxation case either — it surfaces immediately.
+        assert!(!e.is_transient(), "a down local server fails fast, no backoff retry");
+        assert!(!e.is_param_unsupported());
+    }
+
+    #[test]
+    fn retry_layer_returns_unreachable_immediately_without_spinning() {
+        // A down local server (Unreachable) must fail fast: the RetryingChatClient
+        // returns it on the first attempt, never looping/hanging (ticket 09).
+        let inner = SeqClient::new(vec![Err(LlmError::Unreachable(
+            "http://localhost:8888/v1/chat/completions".into(),
+        ))]);
+        let client = RetryingChatClient::new(&inner, RetryPolicy::no_delay(5));
+        let err = client.complete(&a_request()).unwrap_err();
+        assert!(matches!(err, LlmError::Unreachable(_)));
+        assert_eq!(inner.calls.get(), 1, "no retry on a fail-fast Unreachable");
+    }
+
+    #[test]
+    fn complete_with_fallback_passes_unreachable_through_without_cloud_fallback() {
+        // D4: an unreachable local server must NOT trigger any fallback — the
+        // error surfaces unchanged (no second, cloud-bound attempt).
+        let inner = SeqClient::new(vec![Err(LlmError::Unreachable("http://127.0.0.1:8080".into()))]);
+        let err = complete_with_fallback(&inner, &a_request()).unwrap_err();
+        assert!(matches!(err, LlmError::Unreachable(_)));
+        assert_eq!(inner.calls.get(), 1, "no degrade/fallback attempt on Unreachable");
+    }
+
+    #[test]
+    fn is_local_url_recognises_loopback_hosts_only() {
+        assert!(is_local_url("http://localhost:8888/v1/chat/completions"));
+        assert!(is_local_url("http://127.0.0.1:8080/v1/chat/completions"));
+        assert!(is_local_url("http://127.5.6.7:1234/v1"));
+        assert!(is_local_url("http://0.0.0.0:11434/v1/chat/completions"));
+        assert!(is_local_url("http://[::1]:1234/v1/chat/completions"));
+        // Remote hosts are not local.
+        assert!(!is_local_url(OPENROUTER_URL));
+        assert!(!is_local_url("https://api.example.com/v1/chat/completions"));
+        assert!(!is_local_url("http://192.168.1.10:8888/v1")); // LAN IP, not loopback
+    }
+
+    #[test]
+    fn models_probe_url_maps_chat_completions_to_models() {
+        assert_eq!(
+            models_probe_url("http://localhost:8888/v1/chat/completions"),
+            "http://localhost:8888/v1/models"
+        );
+        assert_eq!(
+            models_probe_url("http://127.0.0.1:8080/v1/chat/completions/"),
+            "http://127.0.0.1:8080/v1/models"
+        );
+        // A non-standard URL is probed as-is (connecting is what matters).
+        assert_eq!(models_probe_url("http://localhost:1234/health"), "http://localhost:1234/health");
+    }
+
+    #[test]
+    fn probe_reachable_is_false_when_nothing_is_listening() {
+        // Bind then drop to obtain an almost-certainly-free loopback port; a probe
+        // there gets connection refused fast → false (AC: "false con server spento").
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let base = format!("http://127.0.0.1:{port}/v1/chat/completions");
+        assert!(!probe_reachable(&base), "a closed port is not reachable");
+    }
+
+    #[test]
+    fn probe_reachable_is_true_when_the_endpoint_answers() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                // Any HTTP status proves the endpoint is up (even 404).
+                let body = r#"{"data":[]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        let base = format!("http://{addr}/v1/chat/completions");
+        assert!(probe_reachable(&base), "a listening endpoint is reachable");
+        handle.join().unwrap();
     }
 
     #[test]

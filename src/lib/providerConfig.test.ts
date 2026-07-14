@@ -8,7 +8,10 @@ import {
   PROVIDERS,
   providerById,
   resolveBaseUrl,
-  keyAcceptable
+  keyAcceptable,
+  isLocalProvider,
+  shouldShowLocalHint,
+  LOCAL_UNREACHABLE_HINT
 } from './providerConfig';
 
 describe('resolveModel', () => {
@@ -125,5 +128,42 @@ describe('keyAcceptable', () => {
     expect(keyAcceptable(null)).toBe(false);
     expect(keyAcceptable('local')).toBe(true);
     expect(keyAcceptable('sk-or-abc')).toBe(isValidKey('sk-or-abc'));
+  });
+});
+
+describe('isLocalProvider', () => {
+  it('is true for every local preset and false for the cloud one', () => {
+    expect(isLocalProvider('unsloth')).toBe(true);
+    expect(isLocalProvider('lmstudio')).toBe(true);
+    expect(isLocalProvider('ollama')).toBe(true);
+    expect(isLocalProvider('llamaserver')).toBe(true);
+    expect(isLocalProvider('openrouter')).toBe(false);
+  });
+
+  it('treats unknown/nullish ids as non-local (no hint)', () => {
+    expect(isLocalProvider('mystery')).toBe(false);
+    expect(isLocalProvider(null)).toBe(false);
+    expect(isLocalProvider(undefined)).toBe(false);
+  });
+});
+
+describe('shouldShowLocalHint', () => {
+  it('shows the hint only for a local provider that is unreachable', () => {
+    expect(shouldShowLocalHint('unsloth', false)).toBe(true);
+  });
+
+  it('never shows the hint when the local server is reachable', () => {
+    expect(shouldShowLocalHint('unsloth', true)).toBe(false);
+  });
+
+  it('never shows the hint for the cloud provider, even when unreachable', () => {
+    // D4/D3: OpenRouter is cloud — no local-server onboarding hint.
+    expect(shouldShowLocalHint('openrouter', false)).toBe(false);
+    expect(shouldShowLocalHint('openrouter', true)).toBe(false);
+  });
+
+  it('has actionable Italian copy pointing at the server and ⚙️', () => {
+    expect(LOCAL_UNREACHABLE_HINT).toContain('Server locale non raggiungibile');
+    expect(LOCAL_UNREACHABLE_HINT).toContain('⚙️');
   });
 });

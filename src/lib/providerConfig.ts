@@ -114,6 +114,40 @@ export function providerById(id: string | null | undefined): ProviderPreset | un
 }
 
 /**
+ * Whether `id` is a known **local** provider (a non-cloud preset such as Unsloth
+ * / LM Studio / Ollama / llama.cpp). Only local providers get the onboarding
+ * reachability hint — the cloud provider (OpenRouter) never does. An unknown id
+ * is treated as non-local (no hint). Ticket 09 (D3/D7).
+ */
+export function isLocalProvider(id: string | null | undefined): boolean {
+  const p = providerById(id);
+  return p !== undefined && !p.cloud;
+}
+
+/**
+ * Whether to show the non-blocking "local server unreachable" onboarding hint:
+ * only when the active provider is local AND the reachability probe came back
+ * `false` (ticket 09). Cloud providers, reachable local servers, and an
+ * indeterminate probe never trigger it. It never blocks using the app or
+ * switching to OpenRouter — it is purely informational.
+ */
+export function shouldShowLocalHint(
+  id: string | null | undefined,
+  reachable: boolean
+): boolean {
+  return isLocalProvider(id) && reachable === false;
+}
+
+/**
+ * Onboarding hint shown when the active local provider is not reachable (D3/D7).
+ * Mirrors the core `LlmError::Unreachable` copy but stays generic (no base_url),
+ * since it fires proactively from a health check, not from a failed translation.
+ */
+export const LOCAL_UNREACHABLE_HINT =
+  'Server locale non raggiungibile. Avvia il server (es. Unsloth Studio) ' +
+  'oppure apri ⚙️ Impostazioni per verificarne l’indirizzo o passare a OpenRouter.';
+
+/**
  * Resolve the effective base-URL for a provider: the stored override when it is a
  * non-blank string, otherwise the provider's built-in default (empty for an
  * unknown id). Mirrors the core's `get_provider_config` base-URL fallback.

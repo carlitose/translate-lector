@@ -7,6 +7,7 @@
   import { reconstruct, type TextItem } from '$lib/pdfExtract';
   import ProviderConfig from '$lib/ProviderConfig.svelte';
   import GlossaryPanel from '$lib/GlossaryPanel.svelte';
+  import { isLocalProvider, shouldShowLocalHint, LOCAL_UNREACHABLE_HINT } from '$lib/providerConfig';
   import {
     translationErrorMessage,
     pageStatusLabel,
@@ -86,6 +87,10 @@
   let navToken = 0;
   // Prefetch the next page in the background (decision D5, read from settings).
   let prefetchEnabled = $state(true);
+  // Non-blocking onboarding hint shown when the active provider is local and its
+  // server is not reachable (ticket 09, D3/D7). Empty = no hint. Never blocks the
+  // app or switching to OpenRouter.
+  let providerHint = $state('');
 
   /** The identity of the page currently on screen (document, page, language). */
   function currentKey(): RequestKey | null {
@@ -296,10 +301,41 @@
     }
   }
 
+  /**
+   * Onboarding/health check (ticket 09, D3/D7): when the active provider is a
+   * local one, probe its reachability and, if the server is down, show a
+   * non-blocking hint inviting the user to start it or open ⚙️. Best-effort and
+   * silent on any failure — it never blocks the app nor switching to OpenRouter,
+   * and never triggers a translation or a cloud call (D4). Called on mount and
+   * after the Settings panel saves (the provider may have changed).
+   */
+  async function refreshProviderHealth(): Promise<void> {
+    try {
+      const activeId = await invoke<string>('get_active_provider');
+      if (!isLocalProvider(activeId)) {
+        providerHint = '';
+        return;
+      }
+      const reachable = await invoke<boolean>('check_provider_reachable', {
+        providerId: activeId
+      });
+      providerHint = shouldShowLocalHint(activeId, reachable) ? LOCAL_UNREACHABLE_HINT : '';
+    } catch {
+      providerHint = ''; // never block on a health-check failure
+    }
+  }
+
+  /** Re-read live settings after the Settings panel saves (ticket 12/13 + 09). */
+  async function onSettingsSaved(): Promise<void> {
+    await refreshPrefetch();
+    await refreshProviderHealth();
+  }
+
   // Startup restore (FR10): reopen the last document at its saved page/language,
   // or surface the EC06 missing-file state; always populate "Recenti".
   onMount(async () => {
     await refreshPrefetch();
+    void refreshProviderHealth(); // non-blocking onboarding hint (ticket 09)
     await refreshRecents();
     let last: LastSession | null = null;
     try {
@@ -485,7 +521,24 @@
     </button>
   </header>
 
-  <ProviderConfig bind:open={configOpen} onSaved={refreshPrefetch} />
+  <ProviderConfig bind:open={configOpen} onSaved={onSettingsSaved} />
+
+  {#if providerHint}
+    <div class="provider-hint" role="status">
+      <span class="provider-hint-text">{providerHint}</span>
+      <span class="provider-hint-actions">
+        <button onclick={() => (configOpen = true)}>Apri ⚙️ Impostazioni</button>
+        <button onclick={refreshProviderHealth} title="Riprova il controllo">Riprova</button>
+        <button
+          class="provider-hint-dismiss"
+          aria-label="Chiudi avviso"
+          onclick={() => (providerHint = '')}
+        >
+          ✕
+        </button>
+      </span>
+    </div>
+  {/if}
 
   <section class="panes">
     <div class="pane pane-left">
@@ -617,6 +670,34 @@
   .settings-btn {
     padding: 0.3em 0.55em;
     font-size: 1.05rem;
+    line-height: 1;
+  }
+
+  .provider-hint {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+    padding: 0.5rem 0.9rem;
+    background: #fff4e5;
+    border-bottom: 1px solid #f0c98a;
+    color: #7a4a00;
+    font-size: 0.88rem;
+  }
+
+  .provider-hint-text {
+    flex: 1;
+    min-width: 12rem;
+  }
+
+  .provider-hint-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+
+  .provider-hint-dismiss {
+    padding: 0.3em 0.55em;
     line-height: 1;
   }
 
@@ -803,6 +884,11 @@
     .reconstructed {
       background: #1f1f1f;
       border-color: #3a3a3a;
+    }
+    .provider-hint {
+      background: #3a2e18;
+      border-color: #5a4620;
+      color: #ffd9a0;
     }
     button {
       color: #ffffff;

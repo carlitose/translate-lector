@@ -312,6 +312,27 @@ async fn translate_page(
     .map_err(|e| format!("translation task failed: {e}"))?
 }
 
+/// Cheap reachability probe for the active/selected provider (ticket 09, D3/D7),
+/// used by the non-blocking onboarding hint. Resolves the provider's effective
+/// `base_url` and does a short-timeout GET to its `/v1/models`. Returns `true`
+/// when the endpoint answers at all, `false` when it is down (connection refused
+/// / timeout). Never throws for "down" — a missing/misconfigured server is just
+/// `false`. Runs on a worker thread so the short network wait never blocks the UI.
+/// It performs no translation and never falls back to the cloud (D4).
+#[tauri::command]
+async fn check_provider_reachable(
+    app: tauri::AppHandle,
+    provider_id: String,
+) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db(&app)?;
+        let cfg = settings::get_provider_config(&conn, &provider_id).map_err(|e| e.to_string())?;
+        Ok::<bool, String>(llm::probe_reachable(&cfg.base_url))
+    })
+    .await
+    .map_err(|e| format!("reachability check failed: {e}"))?
+}
+
 /// Whether background prefetch of the next page is enabled (§3.5, ticket 12).
 /// Defaults to ON (decision D5).
 #[tauri::command]
@@ -425,6 +446,7 @@ pub fn run() {
             relocate_document,
             remove_recent,
             translate_page,
+            check_provider_reachable,
             get_prefetch_enabled,
             list_glossary,
             update_glossary_term
