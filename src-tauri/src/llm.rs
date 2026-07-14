@@ -197,6 +197,43 @@ impl ChatResponse {
             )),
         }
     }
+
+    /// Like [`content`], but additionally refuses a **truncated** completion: a
+    /// non-empty content with `finish_reason == "length"` means the model ran out
+    /// of budget mid-answer, so the text is cut off (e.g. "…con milioni o"). On
+    /// the translate path we must NOT accept such a partial — it would silently
+    /// drop half a page (unit-truncation-diagnosis, ticket 11) — so it is
+    /// surfaced as [`LlmError::OutputTruncated`], letting the caller retry with a
+    /// larger budget. Everything else defers to [`content`]: the empty+length
+    /// case still maps to [`LlmError::OutputBudgetExhausted`] (EC08) exactly as
+    /// before, and an empty/`null`/blank content stays the generic error.
+    ///
+    /// Deliberately a **separate** accessor. It is used by the whole translate
+    /// path — including the single-unit / cloud-degrade case — so a truncation
+    /// triggers a bounded retry there too (a truncated page is worse than a
+    /// retried one). The **perceptor-update** path keeps calling [`content`] and
+    /// retains its old accept-partial behaviour (it never emits page text).
+    ///
+    /// [`content`]: ChatResponse::content
+    pub fn content_complete(&self) -> Result<&str, LlmError> {
+        // Reuse content() for the no-choice / empty / empty+length (EC08) cases;
+        // an Ok here means there IS a first choice with non-empty text.
+        let text = self.content()?;
+        let truncated = self
+            .choices
+            .first()
+            .and_then(|c| c.finish_reason.as_deref())
+            .is_some_and(|r| r.eq_ignore_ascii_case("length"));
+        if truncated {
+            let reason = self
+                .choices
+                .first()
+                .and_then(|c| c.finish_reason.clone())
+                .unwrap_or_default();
+            return Err(LlmError::OutputTruncated(reason));
+        }
+        Ok(text)
+    }
 }
 
 // --- Errors ------------------------------------------------------------------
@@ -266,6 +303,25 @@ pub enum LlmError {
     ///
     /// [`Http`]: LlmError::Http
     OutputBudgetExhausted(String),
+    /// The response came back with **non-empty** content but
+    /// `finish_reason == "length"`: the model emitted a **partial** answer and hit
+    /// the completion-token budget mid-output — the text is truncated (e.g. a
+    /// paragraph cut at "…con milioni o"). Distinct from
+    /// [`OutputBudgetExhausted`] (empty content + length = EC08): here there IS
+    /// text, but it is incomplete, so accepting it would silently drop half a page
+    /// (unit-truncation-diagnosis, ticket 11). Surfaced only by the dedicated
+    /// [`ChatResponse::content_complete`] used on the whole translate path
+    /// (single-unit / cloud-degrade included); the perceptor-update path keeps
+    /// [`ChatResponse::content`] and its old accept-partial behaviour. On the
+    /// translate path this triggers a retry with a larger `max_tokens`
+    /// ([`crate::translate`]); if the retry still truncates at the maximum
+    /// headroom the partial is refused and re-surfaced as EC08
+    /// ([`OutputBudgetExhausted`]). **Not transient** (a retry with the *same*
+    /// budget would truncate again — the retry must GROW the budget) and not
+    /// param-degradable. The carried string is the reported `finish_reason`.
+    ///
+    /// [`OutputBudgetExhausted`]: LlmError::OutputBudgetExhausted
+    OutputTruncated(String),
     /// The response could not be parsed even after the correction retry.
     ParseFailed(String),
     /// A local storage error while reading/writing the cache.
@@ -328,6 +384,15 @@ impl LlmError {
                 "EC08: il modello locale ha esaurito il budget di token \
                  (probabile reasoning entro una finestra piccola). Usa un modello \
                  non-reasoning, riduci il testo, o aumenta il context (n_ctx) del server."
+                    .into()
+            }
+            LlmError::OutputTruncated(_) => {
+                // Same actionable EC08 framing: the per-unit retry converts a
+                // persistent truncation into OutputBudgetExhausted, but keep a
+                // coherent message here in case this variant ever surfaces.
+                "EC08: la traduzione è stata troncata (budget di token esaurito a \
+                 metà risposta). Riduci il testo, usa un modello meno verboso, o \
+                 aumenta il context (n_ctx) del server."
                     .into()
             }
             LlmError::ParseFailed(m) => {
@@ -926,6 +991,12 @@ l'oggetto JSON, senza testo aggiuntivo, senza markdown, senza code fence.";
 /// (STC-08, D5). Minimale di proposito: traduci fedelmente, rispetta in modo
 /// assoluto i termini bloccati, rispondi con il SOLO testo tradotto (nessun JSON,
 /// nessun riassunto, nessun glossario da generare).
+///
+/// Vieta esplicitamente la **chain-of-thought** nel contenuto ("Thinking
+/// Process"/"Reasoning"): sui modelli locali verbosi quel ragionamento consuma il
+/// budget di output e tronca la traduzione a metà (unit-truncation-diagnosis,
+/// ticket 11). La difesa a valle è [`parse_translation`], che strippa comunque un
+/// eventuale blocco CoT iniziale.
 pub fn build_translate_only_system_prompt() -> String {
     "Sei il motore di traduzione di translate-lector. Traduci fedelmente il testo fornito \
 verso la lingua di destinazione indicata, mantenendo tono, significato e formattazione.\n\n\
@@ -934,6 +1005,8 @@ Regole:\n\
 solo la traduzione indicata, senza eccezioni.\n\
 - Usa i termini suggeriti quando appropriato, per coerenza.\n\
 - Non riassumere, non omettere, non aggiungere commenti o spiegazioni.\n\
+- VIETATO mostrare il ragionamento: NON produrre \"Thinking Process\", \"Reasoning\", \
+catene di pensiero o passaggi intermedi. Vai DIRETTO alla traduzione.\n\
 - Rispondi con IL SOLO testo tradotto, senza virgolette, senza markdown, senza JSON."
         .to_string()
 }
@@ -1025,6 +1098,11 @@ struct TranslateUnitOutput {
 /// (l'intero contenuto senza spazi di bordo). Riesce sempre finché il contenuto
 /// non è vuoto — l'assenza di contenuto (incl. EC08 `finish_reason == "length"`)
 /// è già intercettata a monte da [`ChatResponse::content`].
+///
+/// Sul ramo testo-puro rimuove un eventuale **blocco di ragionamento (CoT)**
+/// iniziale che un modello verboso può emettere prima della traduzione
+/// ([`strip_leading_cot`], unit-truncation-diagnosis ticket 11): difesa a valle
+/// del divieto già presente nel system prompt translate-only.
 pub fn parse_translation(content: &str) -> String {
     let trimmed = content.trim();
     // (a) JSON minimo diretto.
@@ -1037,8 +1115,112 @@ pub fn parse_translation(content: &str) -> String {
             return v.translated_text;
         }
     }
-    // (c) testo puro: il contenuto è già la traduzione.
+    // (c) testo puro: il contenuto è già la traduzione, meno un eventuale
+    // blocco chain-of-thought iniziale.
+    strip_leading_cot(trimmed)
+}
+
+/// Rimuove un blocco di **chain-of-thought (CoT)** in testa a una risposta
+/// translate-only, restituendo la sola traduzione (ticket 11). È volutamente
+/// **conservativo**: non deve MAI poter rimuovere testo di traduzione legittimo
+/// (era il bug "mezza pagina mancante" che il ticket 11 corregge). Gestisce due
+/// forme, entrambe non ambigue:
+///
+/// 1. Un blocco XML-ish `<think>…</think>`: è CoT di macchina inequivocabile,
+///    quindi si strippa sempre in sicurezza.
+/// 2. Una sezione etichettata: si strippa SOLO quando sono presenti **entrambi**
+///    (a) un'intestazione CoT distintiva a inizio testo (frasi multi-parola come
+///    "Thinking process:"/"Chain of thought:" — mai parole comuni come
+///    "Reasoning"/"Ragionamento" che possono aprire legittimamente un paragrafo
+///    di prosa) E (b) un marcatore di traduzione esplicito ("Traduzione:" /
+///    "Translation:") a **inizio di una riga successiva**. In quel caso si taglia
+///    fino al marcatore. Se il marcatore manca NON si strippa nulla (si ritorna
+///    l'input invariato): niente fallback "prima riga vuota", perché è la via
+///    non sicura che mangia il paragrafo iniziale.
+fn strip_leading_cot(text: &str) -> String {
+    let trimmed = text.trim();
+
+    // (1) blocco `<think>…</think>` (chiusura case-insensitive): CoT di macchina
+    // inequivocabile, sempre sicuro da rimuovere.
+    if starts_with_ci(trimmed, "<think>") {
+        if let Some(pos) = find_ascii_ci(trimmed, "</think>") {
+            return trimmed[pos + "</think>".len()..].trim().to_string();
+        }
+    }
+
+    // (2) sezione etichettata: strip SOLO se la prima riga è un'intestazione CoT
+    // distintiva E c'è un marcatore di traduzione a inizio di una riga
+    // successiva. Senza marcatore non si tocca nulla (mai il fallback "riga
+    // vuota", che potrebbe scartare vera traduzione).
+    let first_line = trimmed.lines().next().unwrap_or("");
+    if is_cot_header_line(first_line) {
+        for marker in ["traduzione:", "translation:"] {
+            // Il marcatore deve iniziare una riga OLTRE la prima, così una
+            // menzione della parola nel corpo del ragionamento non può essere
+            // scelta come punto di taglio.
+            if let Some(idx) = find_line_start_marker_after_first_line(trimmed, marker) {
+                return trimmed[idx + marker.len()..].trim().to_string();
+            }
+        }
+    }
+
     trimmed.to_string()
+}
+
+/// Whether `first_line` is a distinctive machine chain-of-thought header. Only
+/// multi-word phrases a human paragraph would not open with are recognized
+/// (never bare words like "reasoning"/"ragionamento"), and each must be
+/// colon-terminated ("Thinking process: …") or be the entire line ("Thinking
+/// process") — so a paragraph that merely *contains* such words is never taken
+/// for CoT.
+fn is_cot_header_line(first_line: &str) -> bool {
+    const HEADERS: [&str; 6] = [
+        "thinking process",
+        "thought process",
+        "reasoning process",
+        "chain of thought",
+        "processo di ragionamento",
+        "catena di pensiero",
+    ];
+    let line = first_line.trim();
+    HEADERS.iter().any(|h| {
+        if !starts_with_ci(line, h) {
+            return false;
+        }
+        // Header colon-terminated ("Thinking process:") or the whole line
+        // ("Thinking process"); "Thinking processing" must NOT match.
+        let rest = line[h.len()..].trim_start();
+        rest.is_empty() || rest.starts_with(':')
+    })
+}
+
+/// Byte offset of a translation `marker` that STARTS a line other than the
+/// first. Searching only at line starts after the header line prevents a mention
+/// of the word inside the reasoning body from being chosen as the split point.
+fn find_line_start_marker_after_first_line(text: &str, marker: &str) -> Option<usize> {
+    text.match_indices('\n')
+        .map(|(i, _)| i + 1)
+        .find(|&start| starts_with_ci(&text[start..], marker))
+}
+
+/// Whether `s` begins with the ASCII `prefix`, case-insensitively. Byte-wise
+/// ASCII comparison so no allocation and no multi-byte offset surprises.
+fn starts_with_ci(s: &str, prefix: &str) -> bool {
+    let (sb, pb) = (s.as_bytes(), prefix.as_bytes());
+    sb.len() >= pb.len() && sb[..pb.len()].iter().zip(pb).all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+/// Byte offset in `haystack` of the first case-insensitive occurrence of the
+/// ASCII `needle`. ASCII-only comparison keeps the returned offset valid on the
+/// original string (it lands on an ASCII byte = a char boundary), unlike a
+/// `to_lowercase()` copy whose offsets can shift on multi-byte input.
+fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
+    let (hb, nb) = (haystack.as_bytes(), needle.as_bytes());
+    if nb.is_empty() || hb.len() < nb.len() {
+        return None;
+    }
+    (0..=hb.len() - nb.len())
+        .find(|&i| hb[i..i + nb.len()].iter().zip(nb).all(|(a, b)| a.eq_ignore_ascii_case(b)))
 }
 
 // --- Contratto perceptor-update snello (STC-10, decisione D5) -----------------
@@ -1537,6 +1719,112 @@ mod tests {
         // il solo translated_text (campi extra ignorati).
         let full = r#"{"translated_text":"Ciao","updated_summary":"s","new_glossary_terms":[]}"#;
         assert_eq!(parse_translation(full), "Ciao");
+    }
+
+    // --- Ticket 11: chain-of-thought suppression + stripping -----------------
+
+    #[test]
+    fn translate_only_system_prompt_forbids_chain_of_thought() {
+        let s = build_translate_only_system_prompt();
+        // Vieta esplicitamente la CoT nel contenuto (assorbe budget → troncamento).
+        assert!(s.contains("Thinking Process"));
+        assert!(s.contains("Reasoning"));
+        assert!(s.to_lowercase().contains("solo testo tradotto"));
+    }
+
+    #[test]
+    fn parse_translation_strips_labeled_cot_only_with_explicit_marker() {
+        // Intestazione CoT distintiva ("Thinking process:") + marcatore di
+        // traduzione a inizio di una riga successiva: esce SOLO la traduzione.
+        let content = "Thinking process:\nThe user wants a faithful, natural rendering. \
+I'll keep the tone.\n\nTraduzione: Ciao, mondo.";
+        assert_eq!(parse_translation(content), "Ciao, mondo.");
+    }
+
+    #[test]
+    fn parse_translation_keeps_cot_header_without_marker_unchanged() {
+        // CONSERVATIVO: intestazione CoT ma NESSUN marcatore di traduzione
+        // esplicito ⇒ non si può sapere dove finisce il ragionamento, quindi non
+        // si strippa nulla (niente fallback "prima riga vuota" che mangiava il
+        // paragrafo iniziale — il bug "mezza pagina mancante" del ticket 11).
+        let content = "Thinking process:\nsome reasoning here.\n\nCiao, mondo.";
+        assert_eq!(parse_translation(content), content);
+    }
+
+    #[test]
+    fn parse_translation_leaves_paragraph_opening_with_reasoning_word_untouched() {
+        // Una traduzione legittima il cui PRIMO paragrafo apre con una parola
+        // comune di ragionamento (prosa di psicologia/filosofia) NON deve essere
+        // scambiata per CoT: senza marcatore e senza <think> resta invariata,
+        // anche se c'è una riga vuota più sotto.
+        let content = "Ragionamento: il filosofo procede per gradi verso la sintesi.\n\n\
+E così, senza fretta, l'argomentazione si chiude.";
+        assert_eq!(parse_translation(content), content);
+    }
+
+    #[test]
+    fn parse_translation_strips_think_xml_block() {
+        let content = "<think>ragiono sul testo e sui termini bloccati</think>\nCiao mondo";
+        assert_eq!(parse_translation(content), "Ciao mondo");
+    }
+
+    #[test]
+    fn parse_translation_leaves_plain_text_untouched_even_mentioning_reasoning() {
+        // "ragionamento" a metà frase non è un'intestazione CoT: nessuno strip.
+        let plain = "Il ragionamento del filosofo era complesso ma affascinante.";
+        assert_eq!(parse_translation(plain), plain);
+    }
+
+    // --- Ticket 11: truncation accessor (content_complete) -------------------
+
+    #[test]
+    fn content_complete_refuses_nonempty_length_as_truncated() {
+        let resp: ChatResponse = serde_json::from_str(
+            r#"{"choices":[{"message":{"role":"assistant","content":"…con milioni o"},"finish_reason":"length"}]}"#,
+        )
+        .unwrap();
+        // Il path pagina/percettore (content) accetta ancora il parziale (invariato).
+        assert_eq!(resp.content().unwrap(), "…con milioni o");
+        // Il path unità (content_complete) lo rifiuta come troncato.
+        assert!(
+            matches!(resp.content_complete().unwrap_err(), LlmError::OutputTruncated(_)),
+            "non-empty + length must be OutputTruncated on the unit path"
+        );
+    }
+
+    #[test]
+    fn content_complete_accepts_nonempty_stop_and_missing_reason() {
+        let stop: ChatResponse = serde_json::from_str(
+            r#"{"choices":[{"message":{"role":"assistant","content":"Ciao mondo"},"finish_reason":"stop"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(stop.content_complete().unwrap(), "Ciao mondo");
+        let no_reason: ChatResponse = serde_json::from_str(
+            r#"{"choices":[{"message":{"role":"assistant","content":"Ciao"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(no_reason.content_complete().unwrap(), "Ciao");
+    }
+
+    #[test]
+    fn content_complete_keeps_empty_plus_length_as_ec08() {
+        // Il caso vuoto+length resta EC08 esattamente come content() (non toccato).
+        let resp: ChatResponse = serde_json::from_str(
+            r#"{"choices":[{"message":{"role":"assistant","content":null},"finish_reason":"length"}]}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            resp.content_complete().unwrap_err(),
+            LlmError::OutputBudgetExhausted(_)
+        ));
+    }
+
+    #[test]
+    fn output_truncated_is_permanent_not_degradable_with_ec08_message() {
+        let e = LlmError::OutputTruncated("length".into());
+        assert!(!e.is_transient(), "same budget would truncate again: not a backoff retry");
+        assert!(!e.is_param_unsupported(), "not a param relaxation case");
+        assert!(e.user_message().contains("EC08"), "actionable EC08 framing");
     }
 
     // --- STC-10: lean perceptor-update contract -----------------------------

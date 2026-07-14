@@ -43,14 +43,26 @@ use rusqlite::{params, Connection, OptionalExtension};
 // --- Modello di budget token (STC-01/STC-08) ---------------------------------
 
 /// Tetto di output **per-unità** (token) sulle chiamate translate-only del
-/// percorso a budget stretto (STC-01/D5). Piccolo di proposito e molto minore del
-/// `max_tokens` per-pagina (che resta per la sola chiamata percettore): tradurre
-/// un paragrafo produce poco output, quindi ~768 basta, libera budget di input e
-/// riduce il rischio EC08 sui modelli locali. È anche la riserva di output nella
-/// formula del budget. NB: quando la pagina è UNA sola unità (degradazione cloud
-/// o pagina corta) si usa invece il `max_tokens` di pagina, così una pagina
-/// intera non viene troncata — vedi [`translate_page`].
-pub const OUT_UNIT_TOKENS: u32 = 768;
+/// percorso a budget stretto (STC-01/D5). Piccolo rispetto al `max_tokens`
+/// per-pagina (che resta per la sola chiamata percettore) ma abbastanza capiente
+/// da assorbire la verbosità di un modello locale: alzato da 768 a **1024**
+/// (ticket 11) perché con 768 un paragrafo denso + un po' di ridondanza sfondava
+/// il tetto → `finish_reason:"length"` a metà frase. 1024 lascia comunque ampio
+/// headroom di input e margine al **retry su troncamento** (che raddoppia questo
+/// budget, vedi [`translate_page`]). È anche la riserva di output nella formula
+/// del budget. NB: quando la pagina è UNA sola unità (degradazione cloud o pagina
+/// corta) si usa invece il `max_tokens` di pagina, così una pagina intera non
+/// viene troncata.
+pub const OUT_UNIT_TOKENS: u32 = 1024;
+
+/// Numero massimo di **retry su troncamento** di una singola unità (ticket 11):
+/// se una chiamata translate-only ritorna `finish_reason == "length"` con
+/// contenuto NON vuoto (traduzione tagliata a metà, [`LlmError::OutputTruncated`])
+/// si ritenta con `max_tokens` raddoppiato, limitato dall'headroom del contesto.
+/// Cap basso (1-2 tentativi) per non moltiplicare le chiamate: dopo l'ultimo, o
+/// quando l'headroom non consente di crescere, il parziale viene rifiutato con un
+/// errore EC08 azionabile ([`LlmError::OutputBudgetExhausted`]) — mai cachato.
+const TRUNCATION_MAX_RETRIES: u32 = 2;
 
 /// Margine (frazione) che assorbe l'imprecisione dell'euristica `chars/token` nel
 /// dimensionamento del budget (STC-01, ~15%).
@@ -528,13 +540,22 @@ fn complete_and_parse_perceptor_update(
 /// Unlike the percettore call there is **no** JSON-correction retry: the
 /// translate-only contract always parses (plain-text fallback), so a malformed
 /// answer becomes the literal translation rather than triggering a second call.
+///
+/// Uses [`crate::llm::ChatResponse::content_complete`] (not `content`) so a
+/// **truncated** completion — non-empty text cut off at `finish_reason ==
+/// "length"` — is refused as [`LlmError::OutputTruncated`] instead of being
+/// accepted as a complete translation (ticket 11). The per-unit loop in
+/// [`translate_page`] catches that and retries with a larger budget; the empty +
+/// length case still surfaces as EC08 exactly as before.
 fn complete_and_parse_translation(
     client: &dyn ChatClient,
     req: ChatRequest,
 ) -> Result<(String, Option<Usage>, ChatRequest), LlmError> {
     let (resp, working) = complete_with_fallback(client, &req)?;
-    // EC08 / empty content surfaces here before we ever try to parse.
-    let content = resp.content()?.to_string();
+    // EC08 (empty+length) / empty content / TRUNCATED (non-empty+length) all
+    // surface here before we ever try to parse — a truncated unit must not be
+    // accepted as complete (ticket 11).
+    let content = resp.content_complete()?.to_string();
     let usage = resp.usage.clone();
     Ok((parse_translation(&content), usage, working))
 }
@@ -686,35 +707,73 @@ pub fn translate_page(
         );
         prompt_chars_sum += messages.iter().map(|m| m.content.chars().count()).sum::<usize>();
 
-        // Per-unit output cap. A SINGLE unit (cloud degrade / short page) keeps the
-        // page `max_tokens` for exact equivalence with the previous whole-page flow
-        // (D2, no cloud regression). On the multi-unit path the cap defaults to the
-        // small `out_unit`, grows for a large unit (translation may expand, e.g.
-        // EN→IT), and is always bounded by the remaining context window so
-        // `prompt + output ≤ n_ctx` (EC08 guard) — a large paragraph on cloud is
-        // NOT truncated (huge headroom), while local units stay small.
-        let per_unit_max_tokens = if units.len() == 1 {
+        // Context headroom for this unit: `n_ctx − prompt − safety`, the ceiling
+        // that keeps `prompt + output ≤ n_ctx` (EC08 guard). It also caps how far
+        // the truncation-retry may grow the output budget below.
+        let prompt_est: u32 = messages.iter().map(|m| est_tokens(&m.content, ratio)).sum();
+        let headroom = p
+            .n_ctx
+            .saturating_sub(prompt_est.saturating_add(OUTPUT_HEADROOM_SAFETY_TOKENS))
+            .max(out_unit);
+
+        // INITIAL per-unit output cap (the retry below may grow it on truncation).
+        // A SINGLE unit (cloud degrade / short page) starts at the page
+        // `max_tokens`, so the common non-truncating case is byte-for-byte
+        // equivalent to the previous whole-page flow (D2, no cloud regression).
+        // FINDING 2 decision (ticket 11): the truncation-detect + retry loop stays
+        // active for ALL paths — single-unit/cloud included — because a truncated
+        // page is strictly worse than a retried one; equivalence is preserved for
+        // the common case by starting at `p.max_tokens`, and truncation there now
+        // triggers a bounded retry (grown budget) rather than accepting a partial.
+        // On the multi-unit path the cap defaults to the small `out_unit`, grows
+        // for a large unit (translation may expand, e.g. EN→IT), and is always
+        // bounded by the remaining context window so `prompt + output ≤ n_ctx` —
+        // a large paragraph on cloud is NOT truncated (huge headroom), while local
+        // units stay small.
+        let initial_max_tokens = if units.len() == 1 {
             p.max_tokens
         } else {
-            let prompt_est: u32 = messages.iter().map(|m| est_tokens(&m.content, ratio)).sum();
             let body_tokens = est_tokens(body, ratio);
             let scaled = body_tokens.saturating_mul(OUTPUT_TOKENS_PER_INPUT).max(out_unit);
-            let headroom = p
-                .n_ctx
-                .saturating_sub(prompt_est.saturating_add(OUTPUT_HEADROOM_SAFETY_TOKENS))
-                .max(out_unit);
             scaled.min(p.max_tokens).min(headroom)
         };
 
-        let mut req = build_translate_only_request(p.model, messages, per_unit_max_tokens);
-        // Reuse the optional-param shape discovered on a previous unit so we don't
-        // re-probe a param the model already rejected this page.
-        if let Some(shape) = &working_shape {
-            req.temperature = shape.temperature;
-            req.response_format = shape.response_format.clone();
-            req.provider = shape.provider.clone();
-        }
-        let (translated, usage, working) = complete_and_parse_translation(client, req)?;
+        // Translate the unit, RETRYING a truncated completion with a larger output
+        // budget (ticket 11). A non-empty answer cut off at `finish_reason ==
+        // "length"` (OutputTruncated) is NOT accepted — it would drop half a
+        // paragraph — so we double `max_tokens`, bounded by `headroom`, up to
+        // `TRUNCATION_MAX_RETRIES` times. If it still truncates when the budget
+        // can no longer grow, the partial is refused with an actionable EC08
+        // (OutputBudgetExhausted). The whole loop runs BEFORE `unit_cache_insert`,
+        // so a truncated partial is never written to the per-unit cache and a retry
+        // genuinely re-translates (criterion c).
+        let mut unit_max_tokens = initial_max_tokens;
+        let mut truncation_retries = 0u32;
+        let (translated, usage, working) = loop {
+            let mut req =
+                build_translate_only_request(p.model, messages.clone(), unit_max_tokens);
+            // Reuse the optional-param shape discovered on a previous unit so we
+            // don't re-probe a param the model already rejected this page.
+            if let Some(shape) = &working_shape {
+                req.temperature = shape.temperature;
+                req.response_format = shape.response_format.clone();
+                req.provider = shape.provider.clone();
+            }
+            match complete_and_parse_translation(client, req) {
+                Ok(ok) => break ok,
+                Err(LlmError::OutputTruncated(reason)) => {
+                    let grown = unit_max_tokens.saturating_mul(2).min(headroom);
+                    if grown > unit_max_tokens && truncation_retries < TRUNCATION_MAX_RETRIES {
+                        truncation_retries += 1;
+                        unit_max_tokens = grown;
+                    } else {
+                        // Cannot grow further: refuse the partial (never cache it).
+                        return Err(LlmError::OutputBudgetExhausted(reason));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        };
         working_shape = Some(working);
 
         // Scrittura IMMEDIATA della cache per-unità, PRIMA del percettore: se il
@@ -1012,6 +1071,16 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "choices": [{ "message": { "role": "assistant", "content": null }, "finish_reason": "length" }],
             "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 }
+        }))
+        .unwrap()
+    }
+
+    /// A TRUNCATED response (ticket 11): NON-empty content but `finish_reason ==
+    /// "length"` — the model hit the output budget mid-answer (text cut off).
+    fn resp_truncated(content: &str, tokens: i64) -> ChatResponse {
+        serde_json::from_value(serde_json::json!({
+            "choices": [{ "message": { "role": "assistant", "content": content }, "finish_reason": "length" }],
+            "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": tokens }
         }))
         .unwrap()
     }
@@ -1818,6 +1887,104 @@ lines, so it stays a single translation unit even though it is not short.";
             .query_row("SELECT COUNT(*) FROM translations_cache", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0, "a failed unit caches nothing");
+    }
+
+    // --- Ticket 11: detect & retry truncated units --------------------------
+
+    /// A unit whose first completion is TRUNCATED (non-empty + finish_reason
+    /// "length") must be RETRIED with a larger `max_tokens`; the retry completes
+    /// and only the COMPLETE translation is cached — the partial is never written
+    /// to the per-unit cache (criteria a/b/c).
+    #[test]
+    fn truncated_unit_is_retried_with_larger_budget_and_only_complete_is_cached() {
+        let c = conn();
+        seed_session(&c);
+        let client = MockClient::new(vec![
+            Ok(resp_truncated("…con milioni o", 100)), // unit truncated mid-sentence
+            Ok(resp("Testo completo.", 200)),          // retry completes
+            Ok(resp(&valid_content(), 300)),           // perceptor-update
+        ]);
+
+        let out = translate_page(&c, &client, &params("Hello")).unwrap();
+        assert_eq!(out.translated_text, "Testo completo.", "the complete retry wins");
+        assert_eq!(client.calls(), 3, "unit truncated + retry + perceptor");
+
+        // The retry grew the output budget beyond the first attempt.
+        let reqs = client.requests.borrow();
+        assert!(
+            reqs[1].max_tokens > reqs[0].max_tokens,
+            "retry doubles the output budget ({} -> {})",
+            reqs[0].max_tokens,
+            reqs[1].max_tokens
+        );
+
+        // Only the COMPLETE translation is in the per-unit cache (no partial).
+        let cached: String = c
+            .query_row(
+                "SELECT translated_text FROM unit_translations
+                  WHERE document_id=1 AND page_number=3 AND unit_index=0 AND target_language='it'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cached, "Testo completo.", "the truncated partial was never cached");
+    }
+
+    /// A unit that keeps truncating even after the bounded retries surfaces an
+    /// actionable EC08 (`OutputBudgetExhausted`) and caches NOTHING — never a
+    /// partial page (criteria b/c).
+    #[test]
+    fn persistently_truncated_unit_surfaces_ec08_and_caches_nothing() {
+        let c = conn();
+        seed_session(&c);
+        // Every attempt truncates: initial + TRUNCATION_MAX_RETRIES growths.
+        let client = MockClient::new(vec![
+            Ok(resp_truncated("part 1", 10)),
+            Ok(resp_truncated("part 1 e 2", 10)),
+            Ok(resp_truncated("part 1 e 2 e 3", 10)),
+        ]);
+
+        let err = translate_page(&c, &client, &params_small(two_paragraphs())).unwrap_err();
+        assert!(
+            matches!(err, LlmError::OutputBudgetExhausted(_)),
+            "persistent truncation escalates to EC08, got {err:?}"
+        );
+        assert!(err.user_message().contains("EC08"));
+        assert_eq!(
+            client.calls(),
+            1 + TRUNCATION_MAX_RETRIES as usize,
+            "initial attempt + bounded retries, then give up"
+        );
+        assert_eq!(unit_rows(&c), 0, "a truncated unit is never cached");
+        assert_eq!(page_rows(&c), 0, "no page cached on failure");
+    }
+
+    /// The retry ceiling never lets `prompt + output` exceed `n_ctx` (EC08 guard
+    /// preserved through the growth): every request the retry issues still fits.
+    #[test]
+    fn truncation_retry_stays_within_the_context_window() {
+        let c = conn();
+        seed_session(&c);
+        let client = MockClient::new(vec![
+            Ok(resp_truncated("PART0-troncato", 10)), // unit 0 truncates once
+            Ok(resp("PART0", 10)),                    // then completes
+            Ok(resp("PART1", 10)),                    // unit 1
+            Ok(resp(&content_with("ignored", "s", &[]), 10)), // perceptor
+        ]);
+        translate_page(&c, &client, &params_small(two_paragraphs())).unwrap();
+
+        let reqs = client.requests.borrow();
+        // The retried request (index 1) grew but still fits within n_ctx=4096.
+        assert!(reqs[1].max_tokens > reqs[0].max_tokens, "budget grew on retry");
+        for r in reqs.iter() {
+            let prompt_est: u32 = r.messages.iter().map(|m| est_tokens(&m.content, RATIO)).sum();
+            assert!(
+                prompt_est + r.max_tokens <= 4096,
+                "prompt + output must fit n_ctx (got {} + {})",
+                prompt_est,
+                r.max_tokens
+            );
+        }
     }
 
     // --- Prefetch: cache-only, no context mutation (ticket 12) --------------
