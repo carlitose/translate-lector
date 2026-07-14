@@ -116,13 +116,23 @@ Aggiornato 2026-07-14: **TUTTE le indagini (01-04) sono chiuse.** Nessun edge di
 3. ~~**Ticket 03** — Validazione contratto percettore in locale~~ → ✅ **DONE** (verdetto su endpoint reale).
 4. ~~**Ticket 04** — Decisioni umane~~ → ✅ **DONE** (D1-D7 confermate).
 
-**Frontiera immediata = derivare i ticket di BUILD verticali** con `to-tickets`, partendo dalle slice già
-elencate in [design-provider-abstraction.md](./design-provider-abstraction.md), aggiornate dalle decisioni:
-selettore provider (**locale default**, D3) → base-URL + chiavi provider-scoped (**chiave sempre presente**,
-D5) → chiamata a endpoint locale con `json_schema`+ladder (D6) → **health-check + errore chiaro** se
-irraggiungibile (D4/D7) → traduzione pagina con percettore (best-effort su modelli piccoli) → cache.
-Nota: rivedere il design del Ticket 02 alla luce di **D5** (rimuovere il ramo key-opzionale) e **D3**
-(default = locale, non openrouter).
+**Build = FATTA (AFK, 2026-07-14).** I ticket di build 05-09 sono stati implementati in TDD e sono in
+`done/`; il 10 (verifica e2e) è HITL e resta da fare manualmente contro il server locale.
+
+| # | Build ticket | Stato |
+|---|---|---|
+| 05 | Core client con base-URL configurabile | ✅ done |
+| 06 | Keychain provider-scoped | ✅ done |
+| 07 | Preset provider + active-provider (default locale, D3) | ✅ done |
+| 08 | UI selettore provider + base-URL + chiave/modello | ✅ done |
+| 09 | Health-check + errore chiaro (no fallback, D4/D7) + onboarding | ✅ done |
+| 10 | Validazione e2e su server reale + tuning default | ⛔ HITL — verifica manuale GUI |
+
+Stato finale verde: `cargo test` 129, `svelte-check` 0 errori, `vitest` 66. Decisioni applicate: **D5** ha
+semplificato il core (nessun ramo key-opzionale, chiave sempre richiesta), **D3** ha reso il provider locale
+il default (`unsloth`), **D4/D7** realizzati come `LlmError::Unreachable` fail-fast + onboarding non
+bloccante, senza fallback cloud. **Frontiera residua = solo il Ticket 10 (HITL)**: `npm run tauri dev`,
+selezionare il provider locale, tradurre una pagina reale, affinare i default dei preset.
 
 ## Ticket Plan
 

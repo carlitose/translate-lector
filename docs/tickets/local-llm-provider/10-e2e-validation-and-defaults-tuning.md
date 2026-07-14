@@ -67,3 +67,20 @@ interpretare la lentezza come blocco. Non reintrodurre fallback cloud.
 - Nuove funzionalità di traduzione o percettore (si riusa l'esistente).
 - Epica OCR (mappa separata).
 - Avvio/gestione del server locale dall'app (D7, post-MVP).
+
+---
+
+## Progress note (autopilot, 2026-07-14) — ⛔ SKIPPED: HITL
+
+Questo ticket è **HITL** ed è stato **escluso** dall'esecuzione autopilot per istruzione esplicita
+dell'utente ("no gli HITL"). Richiede una **verifica manuale nella GUI** contro un server locale in
+esecuzione (l'utente ha Unsloth Studio su `localhost:8888`), cosa non eseguibile in modo affidabile AFK.
+
+**Stato dei prerequisiti**: i Ticket 05-09 (tutta la pipeline core+UI del provider locale) sono **done** e
+verdi (cargo test + npm run check + vitest). Il *contratto* del percettore su modello locale è già stato
+validato dal [Ticket 03](./03-prototype-perceptor-contract-local.md). Resta solo la **verifica e2e
+nell'app reale** e l'eventuale tuning dei default dei preset.
+
+**Per chiudere** (passi umani): esegui `npm run tauri dev`, seleziona il provider locale in ⚙️, imposta
+base-URL/chiave/modello, apri un PDF e traduci una pagina; verifica cache, errore a server spento, e affina
+i default se necessario (vedi piano sopra). Poi sposta il ticket in `done/`.
