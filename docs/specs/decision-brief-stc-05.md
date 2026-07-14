@@ -3,7 +3,11 @@
 **Ticket:** `docs/tickets/small-context-translation/05-grilling-strategy-decisions.md`
 **Parent:** `docs/specs/small-context-translation-wayfinder.md`
 **Data:** 2026-07-14
-**Stato:** ⛔ GATE UMANO — raccomandazioni pronte (informate da STC-01/02/03/04), attendono conferma.
+**Stato:** ✅ RISOLTO — D1-D6 confermate dall'utente il 2026-07-14 (tutte le raccomandazioni accettate):
+D1 **paragrafo** (fallback frase) · D2 **condizionale sul budget** (cloud degrada a pagina intera) ·
+D3 **latenza accettabile** con cache+prefetch · D4 **match bilanciato** (word-boundary + morfologia ultima
+parola, cap unlocked 10-20, locked uncapped) · D5 **split contratto** (translate-only + perceptor per pagina) ·
+D6 **update percettore una volta per pagina**.
 
 | D | Domanda | Raccomandazione (da confermare) |
 |---|---------|-------------------------------|

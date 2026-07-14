@@ -81,6 +81,13 @@ usando `est_tokens` per system/summary/glossario; sostituire la soglia fissa `CH
 (`translate.rs:31`) con un limite derivato dal budget (in token, non char). Il summary resta sotto il suo
 limite (EC05); se il budget è stretto, ridurre prima il glossario selezionato (Ticket 03), poi il summary.
 
+- **Decisioni strategiche = CONFERMATE** (Ticket 05, gate risolto 2026-07-14;
+  [decision-brief-stc-05](./decision-brief-stc-05.md)): D1 unità = **paragrafo** (fallback frase); D2
+  attivazione **condizionale sul budget** (cloud degrada a pagina intera); D3 latenza **accettabile** con
+  cache+prefetch; D4 match glossario **bilanciato** (word-boundary + morfologia ultima parola, cap unlocked
+  10-20, locked uncapped); D5 **split contratto** (translate-only per unità + perceptor-update per pagina);
+  D6 update percettore **una volta per pagina**.
+
 ## Fatti di codebase rilevanti (grounding)
 
 - Chunking già presente ma **troppo grosso**: `CHUNK_CHAR_THRESHOLD = 8000` char (`translate.rs:31`); i
@@ -172,7 +179,7 @@ Cartella: `docs/tickets/small-context-translation/`
 | 02 | prototype | Chunking a livello paragrafo entro budget | ✅ done (`done/`) — `split_into_units`, round-trip OK |
 | 03 | prototype | Selezione deterministica del glossario per unità | ✅ done (`done/`) — `select_glossary`, −98% token |
 | 04 | research | Percettore multi-chiamata + split contratto + cache per-unità | ✅ done (`done/`) — sezione "Design multi-chiamata" |
-| 05 | grilling | Decisioni: granularità, default, latenza, match glossario | ⛔ gate umano — brief pronto: [decision-brief-stc-05](./decision-brief-stc-05.md) |
+| 05 | grilling | Decisioni: granularità, default, latenza, match glossario | ✅ done (`done/`) — D1-D6 confermate |
 
 ## Next Review
 
