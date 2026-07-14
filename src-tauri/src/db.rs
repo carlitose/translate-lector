@@ -48,6 +48,25 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             UNIQUE(document_id, page_number, target_language)
         );
 
+        -- Per-unit translations (cache di ripresa, ticket 09).
+        -- Granularità di unità (paragrafo/frase) entro una pagina: consente di
+        -- riprendere una pagina interrotta a metà senza ritradurre le unità già
+        -- fatte, e di invalidare per singola unità quando il testo cambia
+        -- (`source_hash`). Tabella separata da `translations_cache` per non
+        -- sovraccaricare la riga di pagina: quella resta il segnale "pagina fatta"
+        -- (percettore avanzato), questa è il livello intermedio/di ripresa.
+        CREATE TABLE IF NOT EXISTS unit_translations (
+            id              INTEGER PRIMARY KEY,
+            document_id     INTEGER REFERENCES documents(id),
+            page_number     INTEGER,
+            unit_index      INTEGER,
+            target_language TEXT,
+            source_hash     TEXT,
+            translated_text TEXT,
+            created_at      TEXT,
+            UNIQUE(document_id, page_number, unit_index, target_language)
+        );
+
         -- Glossary terms per document
         CREATE TABLE IF NOT EXISTS glossary (
             id              INTEGER PRIMARY KEY,
@@ -69,12 +88,17 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
-/// Empty the per-page translation cache (§3.5 "Svuota cache", ticket 13).
+/// Empty the translation cache (§3.5 "Svuota cache", ticket 13).
 ///
-/// Deletes every row from `translations_cache` and nothing else — documents,
-/// sessions, glossary and settings are left intact. Returns the row count removed.
+/// Deletes every row from `translations_cache` **and** from the per-unit resume
+/// cache `unit_translations` (ticket 09): svuotare solo la cache di pagina
+/// lascerebbe il livello di ripresa a servire vecchie unità, vanificando lo
+/// svuotamento. Documents, sessions, glossary e settings restano intatti. Ritorna
+/// il numero di righe di **pagina** rimosse (semantica invariata per i chiamanti).
 pub fn clear_translations_cache(conn: &Connection) -> rusqlite::Result<usize> {
-    conn.execute("DELETE FROM translations_cache", [])
+    let removed = conn.execute("DELETE FROM translations_cache", [])?;
+    conn.execute("DELETE FROM unit_translations", [])?;
+    Ok(removed)
 }
 
 /// Open (creating if needed) the database at `path` and initialise the schema.
@@ -108,6 +132,7 @@ mod tests {
             "documents",
             "sessions",
             "translations_cache",
+            "unit_translations",
             "glossary",
             "settings",
         ] {
@@ -116,6 +141,49 @@ mod tests {
                 "missing table `{expected}`; found: {tables:?}"
             );
         }
+    }
+
+    /// Ticket 09: la migrazione crea la tabella di cache per-unità con la sua
+    /// UNIQUE key `(document_id, page_number, unit_index, target_language)`.
+    #[test]
+    fn init_schema_creates_the_unit_translations_table_with_unique_key() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        assert!(table_names(&conn).iter().any(|t| t == "unit_translations"));
+
+        conn.execute(
+            "INSERT INTO documents (id, file_path, file_hash, title, total_pages)
+             VALUES (1, '/x.pdf', 'h', 'Doc', 3)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO unit_translations
+                (document_id, page_number, unit_index, target_language, source_hash, translated_text)
+             VALUES (1, 2, 0, 'it', 'abc', 'ciao')",
+            [],
+        )
+        .unwrap();
+        // Same key again must violate the UNIQUE constraint.
+        let dup = conn.execute(
+            "INSERT INTO unit_translations
+                (document_id, page_number, unit_index, target_language, source_hash, translated_text)
+             VALUES (1, 2, 0, 'it', 'xyz', 'salve')",
+            [],
+        );
+        assert!(dup.is_err(), "duplicate (doc,page,unit_index,lang) must be rejected");
+        // A different unit_index for the same page is a distinct row.
+        conn.execute(
+            "INSERT INTO unit_translations
+                (document_id, page_number, unit_index, target_language, source_hash, translated_text)
+             VALUES (1, 2, 1, 'it', 'def', 'mondo')",
+            [],
+        )
+        .unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM unit_translations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2);
     }
 
     #[test]
@@ -157,6 +225,13 @@ mod tests {
         )
         .unwrap();
         conn.execute(
+            "INSERT INTO unit_translations
+                (document_id, page_number, unit_index, target_language, source_hash, translated_text)
+             VALUES (1, 1, 0, 'it', 'abc', 'ciao')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
             "INSERT INTO glossary (document_id, source_term, translation, type, locked)
              VALUES (1, 'board', 'consiglio', 'tecnico', 0)",
             [],
@@ -170,8 +245,9 @@ mod tests {
 
         let removed = clear_translations_cache(&conn).unwrap();
 
-        assert_eq!(removed, 1, "one cache row removed");
-        assert_eq!(count(&conn, "translations_cache"), 0, "cache emptied");
+        assert_eq!(removed, 1, "one page cache row removed (return = page rows)");
+        assert_eq!(count(&conn, "translations_cache"), 0, "page cache emptied");
+        assert_eq!(count(&conn, "unit_translations"), 0, "per-unit resume cache emptied too");
         assert_eq!(count(&conn, "documents"), 1, "documents kept");
         assert_eq!(count(&conn, "sessions"), 1, "sessions kept");
         assert_eq!(count(&conn, "glossary"), 1, "glossary kept");
@@ -194,6 +270,6 @@ mod tests {
 
         let conn = open_and_init(&db_path).unwrap();
         assert!(db_path.exists());
-        assert_eq!(table_names(&conn).len(), 5);
+        assert_eq!(table_names(&conn).len(), 6);
     }
 }

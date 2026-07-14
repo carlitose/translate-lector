@@ -13,6 +13,16 @@
 //! `sessions.rolling_summary` is updated once (recompressed when over the limit,
 //! EC05) and the new glossary terms are inserted deduped.
 //!
+//! Between the page-level cache and the model there is a **per-unit resume
+//! cache** (`unit_translations`, ticket 09): every unit is written to it the
+//! moment it succeeds, *before* the per-page perceptor call. If the perceptor (or
+//! a later unit) then fails, the units already done survive, so a retry only
+//! re-translates the missing units and re-runs the perceptor once. Per-unit
+//! entries are keyed by `(document_id, page_number, unit_index, target_language)`
+//! plus a `source_hash` of the unit body, so a changed paragraph (or a different
+//! target language) misses and is re-translated. The page-level row stays the
+//! "page fully done" signal (perceptor advanced once).
+//!
 //! The service takes `&Connection` + `&dyn ChatClient`, so tests inject a mock
 //! client and an in-memory DB — no network required.
 
@@ -360,6 +370,106 @@ fn cache_insert(
     Ok(())
 }
 
+// --- Cache per-unità (ticket 09) ---------------------------------------------
+//
+// Livello di ripresa a granularità di unità, sopra la cache di pagina. La pagina
+// resta il segnale "fatta" (percettore avanzato una volta); questa cache evita di
+// ritradurre le unità già completate quando una pagina si interrompe a metà (una
+// unità in errore/timeout, oppure il percettore che fallisce dopo le unità).
+
+/// Hash stabile (FNV-1a 64-bit) del corpo di un'unità, reso in esadecimale. Serve
+/// a invalidare la cache per-unità quando il testo sorgente cambia: corpo diverso
+/// → hash diverso → MISS → ritraduzione della sola unità cambiata. FNV-1a è
+/// deterministico tra build e versioni del compilatore (a differenza di
+/// `DefaultHasher`), quindi la cache persistita resta valida tra riavvii.
+fn source_hash(body: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // offset basis FNV-1a 64-bit
+    for b in body.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime 64-bit
+    }
+    format!("{hash:016x}")
+}
+
+/// Legge la traduzione cachata di una singola unità, valida solo se ancora
+/// coerente col testo sorgente corrente. Ritorna `Some(translated_text)` soltanto
+/// quando esiste una riga con lo stesso `source_hash` (invalidazione per cambio
+/// testo) e per la stessa `target_language` (una lingua diversa non trova riga →
+/// MISS). Il `translated_text` memorizzato è il **corpo** tradotto senza
+/// separatore: il chiamante riappende il separatore di paragrafo in fase di
+/// riassemblaggio.
+fn unit_cache_lookup(
+    conn: &Connection,
+    document_id: i64,
+    page_number: i64,
+    unit_index: i64,
+    target_language: &str,
+    hash: &str,
+) -> Result<Option<String>, LlmError> {
+    conn.query_row(
+        "SELECT translated_text FROM unit_translations
+          WHERE document_id = ?1 AND page_number = ?2 AND unit_index = ?3
+            AND target_language = ?4 AND source_hash = ?5",
+        params![document_id, page_number, unit_index, target_language, hash],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(|e| LlmError::Storage(e.to_string()))
+}
+
+/// Scrive (UPSERT sulla UNIQUE key) la traduzione di una singola unità appena
+/// completata. Chiamata **subito dopo il successo dell'unità e PRIMA del
+/// percettore**: è la vittoria di robustezza del ticket 09 — se il percettore (o
+/// un'unità successiva) fallirà, le unità già tradotte restano in cache e un retry
+/// ritradurrà solo le mancanti. L'UPSERT sovrascrive una riga precedente con lo
+/// stesso indice ma hash diverso (testo pagina cambiato → riscrittura pulita).
+fn unit_cache_insert(
+    conn: &Connection,
+    p: &TranslateParams,
+    unit_index: i64,
+    hash: &str,
+    translated_text: &str,
+) -> Result<(), LlmError> {
+    conn.execute(
+        "INSERT INTO unit_translations
+             (document_id, page_number, unit_index, target_language, source_hash, translated_text, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+         ON CONFLICT(document_id, page_number, unit_index, target_language) DO UPDATE SET
+             source_hash     = excluded.source_hash,
+             translated_text = excluded.translated_text,
+             created_at      = excluded.created_at",
+        params![
+            p.document_id,
+            p.page_number,
+            unit_index,
+            p.target_language,
+            hash,
+            translated_text
+        ],
+    )
+    .map_err(|e| LlmError::Storage(e.to_string()))?;
+    Ok(())
+}
+
+/// Rimuove le righe di unità con `unit_index >= unit_count` per questa
+/// pagina/lingua: quando il testo pagina si accorcia (meno unità) le vecchie unità
+/// in coda restano orfane e non vanno mai servite. Idempotente (no-op quando non
+/// c'è nulla da potare); non serve mai una traduzione stale per hash comunque.
+fn unit_cache_prune(
+    conn: &Connection,
+    p: &TranslateParams,
+    unit_count: i64,
+) -> Result<(), LlmError> {
+    conn.execute(
+        "DELETE FROM unit_translations
+          WHERE document_id = ?1 AND page_number = ?2 AND target_language = ?3
+            AND unit_index >= ?4",
+        params![p.document_id, p.page_number, p.target_language, unit_count],
+    )
+    .map_err(|e| LlmError::Storage(e.to_string()))?;
+    Ok(())
+}
+
 /// Call the client and parse the response with the layered fallback, including
 /// the single correction retry (layer c). Returns the parsed output, the
 /// provider `usage` when reported (used for cost telemetry and ratio
@@ -523,14 +633,32 @@ pub fn translate_page(
     // first unit returns its working body.
     let mut working_shape: Option<ChatRequest> = None;
 
-    for unit in &units {
+    for (idx, unit) in units.iter().enumerate() {
         // Preserve the paragraph separator across translation: translate the body
         // and re-append the trailing separator so the reassembly keeps structure.
         let (body, sep) = split_unit_body_sep(unit);
         if body.trim().is_empty() {
             // A whitespace-only unit (e.g. a blank page): no model call, keep it
-            // verbatim so the round-trip holds.
+            // verbatim so the round-trip holds. Non va in cache (niente da
+            // ritradurre) e non altera l'allineamento degli indici.
             translated_units.push(unit.clone());
+            continue;
+        }
+
+        // Cache per-unità (STC-09): se questo indice è già tradotto per lo stesso
+        // testo (hash) e la stessa lingua → HIT, nessuna chiamata al modello. È il
+        // livello di ripresa: dopo un'interruzione a metà pagina, solo le unità
+        // mancanti vengono ritradotte.
+        let hash = source_hash(body);
+        if let Some(cached) = unit_cache_lookup(
+            conn,
+            p.document_id,
+            p.page_number,
+            idx as i64,
+            p.target_language,
+            &hash,
+        )? {
+            translated_units.push(format!("{cached}{sep}"));
             continue;
         }
 
@@ -579,6 +707,13 @@ pub fn translate_page(
         let (translated, usage, working) = complete_and_parse_translation(client, req)?;
         working_shape = Some(working);
 
+        // Scrittura IMMEDIATA della cache per-unità, PRIMA del percettore: se il
+        // percettore (o un'unità successiva) fallirà più sotto, questa unità resta
+        // salva e un retry non la ritradurrà (robustezza chiave STC-09; colma la
+        // lacuna di STC-08 dove un fallimento del percettore scartava le
+        // traduzioni riuscite).
+        unit_cache_insert(conn, p, idx as i64, &hash, &translated)?;
+
         translated_units.push(format!("{translated}{sep}"));
 
         if let Some(u) = usage {
@@ -587,6 +722,10 @@ pub fn translate_page(
             prompt_tokens_sum += u.prompt_tokens;
         }
     }
+
+    // Poda le unità orfane (pagina accorciata rispetto a una visita precedente):
+    // mai servite, rimosse per igiene della cache di ripresa.
+    unit_cache_prune(conn, p, units.len() as i64)?;
 
     // Reassemble the translated units in order (separators are carried on each
     // unit, so `concat` reproduces the page structure).
@@ -1782,5 +1921,282 @@ Terza frase per riempire il budget. Quarta frase conclusiva.";
                 assert!(!units.is_empty());
             }
         }
+    }
+
+    // --- STC-09: per-unit resume cache --------------------------------------
+
+    fn unit_rows(c: &Connection) -> i64 {
+        c.query_row("SELECT COUNT(*) FROM unit_translations", [], |r| r.get(0))
+            .unwrap()
+    }
+    fn page_rows(c: &Connection) -> i64 {
+        c.query_row("SELECT COUNT(*) FROM translations_cache", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// source_hash is stable and content-sensitive (invalidation primitive).
+    #[test]
+    fn source_hash_is_stable_and_content_sensitive() {
+        assert_eq!(source_hash("hello"), source_hash("hello"), "deterministic");
+        assert_ne!(source_hash("hello"), source_hash("hell0"), "content-sensitive");
+        // Hex, 16 chars (64-bit).
+        assert_eq!(source_hash("x").len(), 16);
+    }
+
+    /// (b) PARTIAL cache after a perceptor failure: the successfully translated
+    /// units are cached even though the page is NOT (perceptor failed), and a
+    /// retry re-runs only the perceptor (both units are per-unit HITs).
+    #[test]
+    fn partial_cache_after_perceptor_failure_only_reruns_perceptor() {
+        let c = conn();
+        seed_session(&c);
+        let page = two_paragraphs(); // two units under small n_ctx
+        assert_eq!(split_into_units(page, 4096, RATIO).len(), 2, "precondition: two units");
+
+        // Run 1: both units OK, then the perceptor fails twice -> page aborts.
+        let client1 = MockClient::new(vec![
+            Ok(resp("UNO", 10)),            // unit 0 ok -> cached
+            Ok(resp("DUE", 10)),            // unit 1 ok -> cached
+            Ok(resp("not json", 10)),       // perceptor malformed
+            Ok(resp("still not json", 10)), // correction still malformed
+        ]);
+        let err = translate_page(&c, &client1, &params_small(page)).unwrap_err();
+        assert!(matches!(err, LlmError::ParseFailed(_)), "perceptor failure surfaces");
+
+        assert_eq!(page_rows(&c), 0, "page NOT cached: it is not 'done' (perceptor failed)");
+        assert_eq!(unit_rows(&c), 2, "both translated units are preserved in the resume cache");
+        // Summary was NOT advanced (perceptor never produced one).
+        assert_eq!(crate::documents::get_rolling_summary(&c, 1).unwrap(), "");
+
+        // Run 2 (retry): units are HITs -> ONLY the perceptor is called.
+        let client2 = MockClient::new(vec![Ok(resp(&content_with("ignored", "riassunto", &[]), 10))]);
+        let out = translate_page(&c, &client2, &params_small(page)).unwrap();
+
+        assert_eq!(client2.calls(), 1, "retry re-runs only the perceptor; units reused from cache");
+        assert!(out.translated_text.contains("UNO") && out.translated_text.contains("DUE"));
+        assert!(
+            out.translated_text.find("UNO").unwrap() < out.translated_text.find("DUE").unwrap(),
+            "reassembly order preserved"
+        );
+        // Perceptor advanced the summary exactly once (not double-advanced).
+        assert_eq!(crate::documents::get_rolling_summary(&c, 1).unwrap(), "riassunto");
+        assert_eq!(page_rows(&c), 1, "page now cached as done");
+    }
+
+    /// (b') A LATER unit errors mid-page; a retry translates only the missing unit
+    /// (the earlier one is a per-unit HIT), then the perceptor.
+    #[test]
+    fn mid_page_unit_error_then_retry_translates_only_the_missing_unit() {
+        let c = conn();
+        seed_session(&c);
+        let page = two_paragraphs();
+
+        // Run 1: unit 0 OK, unit 1 fails with a plain transport error -> aborts.
+        let client1 = MockClient::new(vec![
+            Ok(resp("UNO", 10)),
+            Err(LlmError::Http("boom".into())),
+        ]);
+        let err = translate_page(&c, &client1, &params_small(page)).unwrap_err();
+        assert!(matches!(err, LlmError::Http(_)));
+        assert_eq!(unit_rows(&c), 1, "only the first (successful) unit is cached");
+        assert_eq!(page_rows(&c), 0, "page not cached");
+
+        // Run 2: unit 0 HIT (no call); only unit 1 + the perceptor are called.
+        let client2 = MockClient::new(vec![
+            Ok(resp("DUE", 10)),
+            Ok(resp(&content_with("ignored", "s", &[]), 10)),
+        ]);
+        let out = translate_page(&c, &client2, &params_small(page)).unwrap();
+        assert_eq!(client2.calls(), 2, "unit 0 reused; only unit 1 + perceptor called");
+        assert!(out.translated_text.contains("UNO") && out.translated_text.contains("DUE"));
+        assert!(out.translated_text.find("UNO").unwrap() < out.translated_text.find("DUE").unwrap());
+    }
+
+    /// (c) Invalidation: changing ONE paragraph's source (indices preserved)
+    /// misses only that unit; the unchanged units are reused.
+    #[test]
+    fn changing_one_unit_source_invalidates_only_that_unit() {
+        let c = conn();
+        seed_session(&c);
+        let page1 = "AAA uno.\n\nBBB due.\n\nCCC tre.";
+        assert_eq!(split_into_units(page1, 4096, RATIO).len(), 3, "precondition: three units");
+
+        let client1 = MockClient::new(vec![
+            Ok(resp("T0", 10)),
+            Ok(resp("T1", 10)),
+            Ok(resp("T2", 10)),
+            Ok(resp(&content_with("ignored", "s1", &[]), 10)),
+        ]);
+        translate_page(&c, &client1, &params_small(page1)).unwrap();
+        assert_eq!(client1.calls(), 4, "first run: three units + perceptor");
+
+        // Only the middle paragraph changes; boundaries (and thus indices) hold.
+        let page2 = "AAA uno.\n\nXXX due modificato.\n\nCCC tre.";
+        let client2 = MockClient::new(vec![
+            Ok(resp("T1-nuovo", 10)),                          // only the changed unit
+            Ok(resp(&content_with("ignored", "s2", &[]), 10)), // perceptor re-runs
+        ]);
+        let out = translate_page(&c, &client2, &params_small(page2)).unwrap();
+
+        assert_eq!(client2.calls(), 2, "only the changed unit + perceptor; unchanged units reused");
+        assert!(out.translated_text.contains("T0"), "unit 0 reused from cache");
+        assert!(out.translated_text.contains("T1-nuovo"), "unit 1 re-translated");
+        assert!(out.translated_text.contains("T2"), "unit 2 reused from cache");
+        assert!(!out.translated_text.contains("T1\n"), "the stale unit-1 translation is not served");
+    }
+
+    /// (d) A different target_language misses the per-unit cache entirely; the
+    /// original-language units remain cached and untouched.
+    #[test]
+    fn different_target_language_misses_the_per_unit_cache() {
+        let c = conn();
+        seed_session(&c);
+        let page = two_paragraphs();
+
+        let it = MockClient::new(vec![
+            Ok(resp("UNO", 10)),
+            Ok(resp("DUE", 10)),
+            Ok(resp(&content_with("ignored", "s", &[]), 10)),
+        ]);
+        translate_page(&c, &it, &params_small(page)).unwrap();
+
+        // Same page/indices but a different target language -> all units miss.
+        let fr = MockClient::new(vec![
+            Ok(resp("UN", 10)),
+            Ok(resp("DEUX", 10)),
+            Ok(resp(&content_with("ignored", "s", &[]), 10)),
+        ]);
+        let p_fr = TranslateParams {
+            target_language: "fr",
+            ..params_small(page)
+        };
+        let out = translate_page(&c, &fr, &p_fr).unwrap();
+
+        assert_eq!(fr.calls(), 3, "different language: both units + perceptor re-translated");
+        assert!(out.translated_text.contains("UN") && out.translated_text.contains("DEUX"));
+
+        let it_units: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM unit_translations WHERE target_language='it'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let fr_units: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM unit_translations WHERE target_language='fr'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(it_units, 2, "Italian units untouched");
+        assert_eq!(fr_units, 2, "French units cached separately");
+    }
+
+    /// (e) Reassembly from the per-unit cache is byte-identical to the uncached
+    /// full run.
+    #[test]
+    fn cached_reassembly_matches_the_uncached_result() {
+        let page = "AAA uno.\n\nBBB due.\n\nCCC tre.";
+
+        // Fresh full run (no per-unit reuse).
+        let ca = conn();
+        seed_session(&ca);
+        let a = MockClient::new(vec![
+            Ok(resp("T0", 10)),
+            Ok(resp("T1", 10)),
+            Ok(resp("T2", 10)),
+            Ok(resp(&content_with("ignored", "s", &[]), 10)),
+        ]);
+        let out_a = translate_page(&ca, &a, &params_small(page)).unwrap();
+
+        // A run where the perceptor fails first (units cached), then a retry that
+        // reassembles ENTIRELY from the per-unit cache.
+        let cb = conn();
+        seed_session(&cb);
+        let b1 = MockClient::new(vec![
+            Ok(resp("T0", 10)),
+            Ok(resp("T1", 10)),
+            Ok(resp("T2", 10)),
+            Ok(resp("bad", 10)),
+            Ok(resp("bad", 10)),
+        ]);
+        translate_page(&cb, &b1, &params_small(page)).unwrap_err();
+        let b2 = MockClient::new(vec![Ok(resp(&content_with("ignored", "s", &[]), 10))]);
+        let out_b = translate_page(&cb, &b2, &params_small(page)).unwrap();
+
+        assert_eq!(
+            out_b.translated_text, out_a.translated_text,
+            "per-unit-cache reassembly is byte-identical to the uncached result"
+        );
+    }
+
+    /// (a) Per-unit HIT with no wasted work: after a partial run leaves all units
+    /// cached (page not done), the retry makes ZERO unit calls.
+    #[test]
+    fn all_units_cached_makes_zero_unit_calls_on_retry() {
+        let c = conn();
+        seed_session(&c);
+        let page = two_paragraphs();
+
+        // Partial run: both units succeed, perceptor fails -> page not cached.
+        let client1 = MockClient::new(vec![
+            Ok(resp("UNO", 10)),
+            Ok(resp("DUE", 10)),
+            Ok(resp("bad", 10)),
+            Ok(resp("bad", 10)),
+        ]);
+        translate_page(&c, &client1, &params_small(page)).unwrap_err();
+
+        // Retry with ONLY a perceptor response queued: if any unit tried to call
+        // the model, MockClient would panic on the empty queue.
+        let client2 = MockClient::new(vec![Ok(resp(&content_with("ignored", "s", &[]), 10))]);
+        let out = translate_page(&c, &client2, &params_small(page)).unwrap();
+        assert_eq!(client2.calls(), 1, "zero unit calls; only the perceptor");
+        assert!(out.translated_text.contains("UNO") && out.translated_text.contains("DUE"));
+    }
+
+    /// A shrinking page prunes orphan high-index unit rows (hygiene).
+    #[test]
+    fn shrinking_page_prunes_orphan_unit_rows() {
+        let c = conn();
+        seed_session(&c);
+        let page3 = "AAA uno.\n\nBBB due.\n\nCCC tre.";
+        let client1 = MockClient::new(vec![
+            Ok(resp("T0", 10)),
+            Ok(resp("T1", 10)),
+            Ok(resp("T2", 10)),
+            Ok(resp(&content_with("ignored", "s", &[]), 10)),
+        ]);
+        translate_page(&c, &client1, &params_small(page3)).unwrap();
+        assert_eq!(unit_rows(&c), 3, "three units cached");
+
+        // The page now has only two paragraphs (same first two bodies -> HITs).
+        let page2 = "AAA uno.\n\nBBB due.";
+        let client2 = MockClient::new(vec![Ok(resp(&content_with("ignored", "s", &[]), 10))]);
+        translate_page(&c, &client2, &params_small(page2)).unwrap();
+        assert_eq!(client2.calls(), 1, "two units reused; only the perceptor called");
+        assert_eq!(unit_rows(&c), 2, "the orphan third unit row was pruned");
+    }
+
+    /// (g) A normal cached page still short-circuits without touching the
+    /// perceptor OR the per-unit path (page-level 'done' semantics unchanged).
+    #[test]
+    fn full_page_cache_hit_still_short_circuits_before_units() {
+        let c = conn();
+        seed_session(&c);
+        // First full run caches page + units.
+        let client1 = MockClient::new(vec![
+            Ok(resp("Ciao", 10)),
+            Ok(resp(&valid_content(), 10)),
+        ]);
+        translate_page(&c, &client1, &params("Hello")).unwrap();
+        assert_eq!(unit_rows(&c), 1, "single unit cached too");
+
+        // Second visit: page-level hit -> no model call at all, perceptor untouched.
+        let client2 = MockClient::new(vec![]); // any call panics
+        let out = translate_page(&c, &client2, &params("Hello")).unwrap();
+        assert!(out.from_cache, "served from the page-level cache");
+        assert_eq!(client2.calls(), 0, "page hit short-circuits before the unit loop");
     }
 }
