@@ -74,11 +74,18 @@ provider locale rende meglio con `n_ctx` più ampio.
   sintomo empty-content si riproduce per esaurimento token (`finish_reason=length`), non per rifiuto schema.
 - **Bug di deserializzazione**: escluso — la deserializzazione gestisce già `content:null` (test bug #2).
 
+## Confermato (2026-07-14, verifica live)
+
+Dopo che l'utente ha **aumentato `n_ctx`** nel server, la stessa richiesta shape-app (`max_tokens: 4096`,
+prompt ~1234 token, pagina grande) è passata da `finish_reason: length` + content vuoto a **`finish_reason:
+stop` + content valido** (traduzione IT corretta, `reasoning_tokens: 0` in quel giro). Conferma la causa
+radice (mancanza di spazio nella finestra) e che **alzare `n_ctx` è un workaround efficace**. Nota: i
+`reasoning_tokens` variano tra le richieste (a volte ~2200, a volte 0), quindi con `max_tokens=4096` e
+finestra piccola il problema è intermittente ma sistematico → i fix 02/03 restano necessari per robustezza.
+
 ## Open Questions
 
-- Conferma finale con la richiesta **esatta** dell'app (`max_tokens:4096` + `response_format` json_schema +
-  temperature + pagina reale) → Ticket 01. (I subagenti sono stati troncati dal limite di sessione prima di
-  questo run decisivo.)
+- ~~Conferma finale con la richiesta esatta dell'app~~ → **CONFERMATO** (sopra).
 - Il server/modello espone un modo pulito per disattivare il reasoning via API? (Ticket 02.)
 
 ## Follow-up
