@@ -10,7 +10,9 @@ import {
   pageStatusLabel,
   resultStatus,
   requestKey,
-  isCurrentRequest
+  isCurrentRequest,
+  shouldTranslate,
+  isLatestNav
 } from './translation';
 
 describe('isMissingKeyError', () => {
@@ -93,5 +95,33 @@ describe('requestKey / isCurrentRequest', () => {
     expect(isCurrentRequest(req, { ...req, targetLanguage: 'en' })).toBe(false);
     // Different document — stale.
     expect(isCurrentRequest(req, { ...req, documentId: 2 })).toBe(false);
+  });
+});
+
+describe('shouldTranslate', () => {
+  it('translates only when the extracted text belongs to the current page', () => {
+    // Page↔text invariant holds: the reconstructed text is page 10's text.
+    expect(shouldTranslate(10, 10, 'testo pag. 10')).toBe(true);
+  });
+
+  it('does NOT translate while the extracted text is still the previous page', () => {
+    // The reactive race: currentPage advanced to 10 but the text is still page 9.
+    expect(shouldTranslate(9, 10, 'testo pag. 9')).toBe(false);
+  });
+
+  it('does NOT translate when there is no extractable text', () => {
+    expect(shouldTranslate(10, 10, '')).toBe(false);
+    expect(shouldTranslate(10, 10, '   ')).toBe(false);
+  });
+});
+
+describe('isLatestNav', () => {
+  it('commits when the render is still the latest navigation', () => {
+    expect(isLatestNav(3, 3)).toBe(true);
+  });
+
+  it('does NOT commit a superseded render (a newer navigation started)', () => {
+    // myToken=2 but a newer navigation bumped the counter to 3 meanwhile.
+    expect(isLatestNav(2, 3)).toBe(false);
   });
 });

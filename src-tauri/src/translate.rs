@@ -89,34 +89,44 @@ pub fn split_into_chunks(text: &str, max_chars: usize) -> Vec<String> {
     chunks
 }
 
-/// Read a cached translation, if present.
+/// Read a cached translation, if present. Returns the stored `translated_text`
+/// together with its `source_text` so the caller can verify the cached row was
+/// produced from the SAME page text (ticket 16 defence): a row whose stored
+/// source differs from the current page text is a poisoned entry and must be
+/// treated as a miss, not served.
 fn cache_lookup(
     conn: &Connection,
     document_id: i64,
     page_number: i64,
     target_language: &str,
-) -> Result<Option<String>, LlmError> {
+) -> Result<Option<(String, String)>, LlmError> {
     conn.query_row(
-        "SELECT translated_text FROM translations_cache
+        "SELECT translated_text, source_text FROM translations_cache
           WHERE document_id = ?1 AND page_number = ?2 AND target_language = ?3",
         params![document_id, page_number, target_language],
-        |r| r.get::<_, String>(0),
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
     )
     .optional()
     .map_err(|e| LlmError::Storage(e.to_string()))
 }
 
-/// Insert a freshly translated page into the cache (ignores duplicates so a
-/// race cannot violate the UNIQUE constraint).
+/// Insert a freshly translated page into the cache. Uses an UPSERT on the UNIQUE
+/// key so a corrected translation OVERWRITES a previously poisoned row (ticket
+/// 16 self-heal): a stale write that captured the wrong source_text is replaced
+/// as soon as the page is re-translated from its real text.
 fn cache_insert(
     conn: &Connection,
     p: &TranslateParams,
     translated_text: &str,
 ) -> Result<(), LlmError> {
     conn.execute(
-        "INSERT OR IGNORE INTO translations_cache
+        "INSERT INTO translations_cache
              (document_id, page_number, target_language, source_text, translated_text, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
+         VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+         ON CONFLICT(document_id, page_number, target_language) DO UPDATE SET
+             source_text     = excluded.source_text,
+             translated_text = excluded.translated_text,
+             created_at      = excluded.created_at",
         params![
             p.document_id,
             p.page_number,
@@ -189,14 +199,22 @@ pub fn translate_page(
     client: &dyn ChatClient,
     p: &TranslateParams,
 ) -> Result<TranslationResult, LlmError> {
-    // Cache hit → return immediately, no model call, no percettore rewrite.
-    if let Some(cached) = cache_lookup(conn, p.document_id, p.page_number, p.target_language)? {
-        return Ok(TranslationResult {
-            translated_text: cached,
-            from_cache: true,
-            total_tokens: None,
-            updated_summary: None,
-        });
+    // Cache hit → return immediately, no model call, no percettore rewrite —
+    // but ONLY when the stored source_text matches the page text we were asked
+    // to translate (ticket 16). A mismatch means the row was poisoned by a stale
+    // write (page N holding page N-1's text): treat it as a miss so we
+    // re-translate and overwrite it below (self-heal), never serving it.
+    if let Some((cached_text, cached_source)) =
+        cache_lookup(conn, p.document_id, p.page_number, p.target_language)?
+    {
+        if cached_source == p.page_text {
+            return Ok(TranslationResult {
+                translated_text: cached_text,
+                from_cache: true,
+                total_tokens: None,
+                updated_summary: None,
+            });
+        }
     }
 
     // Load the percettore context (EC03 surfaces later, on the first call).
@@ -443,6 +461,96 @@ mod tests {
         assert_eq!(out.translated_text, "Ciao (cache)");
         assert!(out.from_cache);
         assert_eq!(client.calls(), 0, "cache hit must not call the model");
+    }
+
+    /// A cache hit whose stored `source_text` DIFFERS from the request's
+    /// `page_text` must be treated as a MISS: the model is called and the row is
+    /// overwritten so a poisoned row self-heals (defence-in-depth, ticket 16).
+    #[test]
+    fn cache_hit_with_mismatched_source_text_is_a_miss_and_overwrites() {
+        let c = conn();
+        seed_session(&c);
+        // A poisoned row: page 3 stored the WRONG source text (from another page).
+        c.execute(
+            "INSERT INTO translations_cache
+                (document_id, page_number, target_language, source_text, translated_text, created_at)
+             VALUES (1, 3, 'it', 'WRONG source', 'Traduzione avvelenata', '2026-07-13T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let client = MockClient::new(vec![Ok(resp(&valid_content(), 400))]);
+        // Request page 3 with its REAL text — source_text differs from the row.
+        let out = translate_page(&c, &client, &params("Hello")).unwrap();
+
+        assert!(!out.from_cache, "mismatched source_text must be a miss");
+        assert_eq!(out.translated_text, "Ciao mondo", "re-translated, not the poisoned value");
+        assert_eq!(client.calls(), 1, "the model is called on a source mismatch");
+
+        // The poisoned row was OVERWRITTEN with the correct source + translation.
+        let (stored, src): (String, String) = c
+            .query_row(
+                "SELECT translated_text, source_text FROM translations_cache
+                  WHERE document_id=1 AND page_number=3 AND target_language='it'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, "Ciao mondo", "row overwritten with the fresh translation");
+        assert_eq!(src, "Hello", "row overwritten with the correct source text");
+        // Exactly one row for this key (overwrite, not a duplicate insert).
+        let count: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM translations_cache
+                  WHERE document_id=1 AND page_number=3 AND target_language='it'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "the key still holds exactly one (healed) row");
+    }
+
+    /// The exact poisoning repro from the diagnosis: write page 10 with page-9
+    /// text, then request page 10 with page-10 text. The page-9 translation must
+    /// NOT be served — the page re-translates and the row is corrected.
+    #[test]
+    fn poisoning_repro_stale_write_then_correct_read_retranslates() {
+        let c = conn();
+        seed_session(&c);
+        // Run #1 of the reactive race poisoned page 10 with page-9's text.
+        c.execute(
+            "INSERT INTO translations_cache
+                (document_id, page_number, target_language, source_text, translated_text, created_at)
+             VALUES (1, 10, 'it', 'page 9 text', 'Ignoranza', '2026-07-13T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let client = MockClient::new(vec![Ok(resp(
+            &content_with("Traduzione pagina 10", "s", &[]),
+            500,
+        ))]);
+        let p = TranslateParams {
+            document_id: 1,
+            page_number: 10,
+            target_language: "it",
+            page_text: "page 10 text",
+            model: "openai/gpt-4o",
+            update_context: true,
+        };
+
+        let out = translate_page(&c, &client, &p).unwrap();
+
+        assert_ne!(out.translated_text, "Ignoranza", "must NOT serve the page-9 translation");
+        assert_eq!(out.translated_text, "Traduzione pagina 10");
+        assert!(!out.from_cache, "the mismatched row is not served as a cache hit");
+        assert_eq!(client.calls(), 1, "the page is re-translated");
+
+        // A subsequent visit with the SAME correct text is now a legitimate hit.
+        let out2 = translate_page(&c, &client, &p).unwrap();
+        assert!(out2.from_cache, "healed row is served on the next matching visit");
+        assert_eq!(out2.translated_text, "Traduzione pagina 10");
+        assert_eq!(client.calls(), 1, "no extra model call once healed");
     }
 
     // --- Cache miss ----------------------------------------------------------

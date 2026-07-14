@@ -13,6 +13,8 @@
     resultStatus,
     requestKey,
     isCurrentRequest,
+    shouldTranslate,
+    isLatestNav,
     type TranslationResult,
     type PageStatus,
     type RequestKey
@@ -54,6 +56,11 @@
   let totalPages = $state(0);
   let currentPage = $state(1);
   let reconstructedText = $state('');
+  // The page number `reconstructedText` was extracted from. Set ATOMICALLY with
+  // `reconstructedText` in `showPage` so the translation effect can enforce the
+  // page↔text invariant and never translate stale text under a new page number
+  // (ticket 16). 0 = no page text loaded yet.
+  let reconstructedPage = $state(0);
   let targetLanguage = $state('it');
   let session = $state<SessionRecord | null>(null);
   let loading = $state(false);
@@ -73,6 +80,10 @@
   let pageStatus = $state<PageStatus>('idle');
   // Monotonic token so a slow response for a stale page/language is ignored.
   let translationSeq = 0;
+  // Monotonic navigation token (finding 2): captured at the start of each
+  // `showPage` render so a superseded, out-of-order render never commits its
+  // page↔text state over the page now on screen.
+  let navToken = 0;
   // Prefetch the next page in the background (decision D5, read from settings).
   let prefetchEnabled = $state(true);
 
@@ -114,6 +125,9 @@
   /** Render `pageNo` onto the canvas and show its reconstructed text. */
   async function showPage(pageNo: number): Promise<void> {
     if (!pdfDoc || !canvasEl) return;
+    // Claim this navigation. A later `showPage` bumps `navToken`, so if two
+    // renders race we only let the newest one commit its state (finding 2).
+    const myToken = ++navToken;
     const page = await pdfDoc.getPage(pageNo);
     const viewport = page.getViewport({ scale: RENDER_SCALE });
     canvasEl.width = viewport.width;
@@ -121,7 +135,15 @@
     const ctx = canvasEl.getContext('2d');
     if (!ctx) return;
     await page.render({ canvasContext: ctx, viewport, canvas: canvasEl }).promise;
-    reconstructedText = await extractPageText(pageNo);
+    const text = await extractPageText(pageNo);
+    // Drop a superseded render: committing it would leave `reconstructedPage`
+    // != `currentPage`, and since navigation is the only reliable re-trigger a
+    // later language change would then skip re-translating the visible page.
+    if (!isLatestNav(myToken, navToken)) return;
+    // Assign page + text together so a reader of `reconstructedText` always sees
+    // the matching `reconstructedPage` (no window where they disagree).
+    reconstructedText = text;
+    reconstructedPage = pageNo;
   }
 
   /** Does any sampled page yield extractable text? (EC01 guard.) */
@@ -151,6 +173,8 @@
     translatedText = '';
     translationError = '';
     pageStatus = 'idle';
+    reconstructedText = '';
+    reconstructedPage = 0; // no page text belongs to the incoming document yet
     translationSeq++; // invalidate any in-flight translation from a prior doc
 
     loading = true;
@@ -165,6 +189,7 @@
         pdfDoc = null;
         totalPages = 0;
         reconstructedText = '';
+        reconstructedPage = 0;
         errorMsg = EC01_MESSAGE;
         return;
       }
@@ -310,6 +335,12 @@
 
   async function goTo(pageNo: number): Promise<void> {
     if (!pdfDoc || pageNo < 1 || pageNo > totalPages) return;
+    // Reset the translation pane immediately so the previous page's translation
+    // is not shown while the new page renders (ticket 16). The effect will
+    // re-translate once the new page's text is extracted.
+    translatedText = '';
+    translationError = '';
+    pageStatus = 'idle';
     currentPage = pageNo;
     await showPage(currentPage);
     await persistSession();
@@ -329,8 +360,17 @@
    * while it was translating, the stale result is dropped (ticket 12).
    */
   async function translateCurrentPage(): Promise<void> {
-    const requested = currentKey();
-    if (!requested || !reconstructedText.trim()) return;
+    if (!session) return;
+    // Couple `page_number` with the exact text it was extracted from: send
+    // `reconstructedPage`/`reconstructedText` from the same source, never a
+    // fresh `currentPage` mixed with stale text (ticket 16 invariant).
+    const pageText = reconstructedText;
+    const requested: RequestKey = {
+      documentId: session.document_id,
+      pageNumber: reconstructedPage,
+      targetLanguage
+    };
+    if (!shouldTranslate(reconstructedPage, currentPage, pageText)) return;
     const seq = ++translationSeq;
     translating = true;
     pageStatus = 'loading';
@@ -340,10 +380,15 @@
         documentId: requested.documentId,
         pageNumber: requested.pageNumber,
         targetLanguage: requested.targetLanguage,
-        pageText: reconstructedText,
+        pageText,
         updateContext: true // real navigation advances the percettore context
       });
       // Drop a result the user has navigated away from (obsolete request).
+      // Note the two intentionally different page sources: `requested` is keyed
+      // on `reconstructedPage` (the page whose text we actually translated),
+      // while `now`/`currentKey()` is keyed on `currentPage` (the page on
+      // screen). They are guaranteed equal at send time by the `shouldTranslate`
+      // gate above; this check catches navigation that happened AFTER sending.
       const now = currentKey();
       if (seq !== translationSeq || !now || !isCurrentRequest(requested, now)) return;
       translatedText = result.translated_text;
@@ -389,11 +434,15 @@
   // cache keeps this cheap: only genuinely new (page, language) pairs call out.
   $effect(() => {
     // Track the inputs that define a translation.
-    void currentPage;
     void targetLanguage;
+    const page = currentPage;
+    const textPage = reconstructedPage;
     const text = reconstructedText;
     const ready = session !== null;
-    if (ready && text.trim()) void translateCurrentPage();
+    // Only translate once the extracted text belongs to the page on screen; this
+    // suppresses the stale pre-fire (currentPage=N, text of N-1) that poisoned
+    // the cache (ticket 16).
+    if (ready && shouldTranslate(textPage, page, text)) void translateCurrentPage();
   });
 </script>
 
