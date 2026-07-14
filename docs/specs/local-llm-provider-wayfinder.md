@@ -24,8 +24,16 @@ motore di traduzione esistente.
   OpenRouter resta; l'LLM locale è una scelta selezionabile in più.
 - **Riuso del protocollo OpenAI chat-completions**: il client Rust esistente (`src-tauri/src/llm.rs`) parla
   già OpenAI chat-completions; un endpoint locale OpenAI-compatible si aggancia allo stesso client.
-- **Setup Unsloth = da chiarire** (deciso dall'utente, 2026-07-14): non è ancora chiaro se/come Unsloth
-  Studio esponga un endpoint HTTP. → primo ticket di ricerca.
+- **Setup Unsloth = CHIARITO** (Ticket 01, 2026-07-14). Unsloth Studio è un prodotto ufficiale (beta),
+  UI locale no-code per training **e inferenza**; espone un endpoint **OpenAI-compatible**
+  `/v1/chat/completions` (servito da `llama-server`), con **auth obbligatoria** (`Bearer sk-unsloth-…`) e
+  **porta non fissa** (leggere dall'istanza; tipicamente 8000/8888). Il supporto `json_schema` non è
+  documentato ma è ereditato da `llama-server` (con spigoli noti) e comunque coperto dalla ladder di
+  degradazione dell'app. Alternative locali OpenAI-compat su Windows: **LM Studio** (miglior `json_schema`,
+  porta 1234), **Ollama** (zero-config, 11434, ma ignora `response_format:json_schema` sul path `/v1`),
+  **llama-server** (8080). **Conclusione**: nessun cambio di protocollo — basta rendere **base-URL + key**
+  configurabili. Dettaglio + curl di verifica + fonti: [research-unsloth-serving.md](./research-unsloth-serving.md).
+  *Aperto*: round-trip curl live non eseguibile AFK → verifica demandata all'utente (§6/§7 del doc).
 
 ## Fatti di codebase rilevanti (grounding)
 
@@ -42,8 +50,7 @@ motore di traduzione esistente.
 
 ## Not Yet Specified
 
-- **Cos'è Unsloth Studio e come serve**: espone HTTP OpenAI-compatible? Formato modello (GGUF/vLLM/altro)?
-  Porta/auth? Come si avvia? → Ticket 01.
+- ~~Cos'è Unsloth Studio e come serve~~ → **RISOLTO dal Ticket 01** (vedi Decisions So Far).
 - **Astrazione di provider nell'app**: base-URL configurabile, selettore provider (OpenRouter | Locale),
   key opzionale per-provider, modello per-provider; dove si persiste (settings/keychain); UI. → Ticket 02.
 - **Tenuta del contratto percettore sul modello locale**: il modello locale onora `json_schema`? Se no, il
@@ -90,10 +97,10 @@ Cartella: `docs/tickets/local-llm-provider/`
 
 | # | Tipo | Titolo | Stato |
 |---|------|--------|-------|
-| 01 | research | Unsloth Studio: come serve un LLM locale (endpoint/protocollo/auth) | ready |
-| 02 | research | Astrazione di provider nell'app (base-URL/key/modello configurabili) | blocked by 01 |
-| 03 | prototype | Tenuta del contratto percettore su modello locale (json/fallback/qualità) | blocked by 01 |
-| 04 | grilling | Decisioni: modello/quant, hardware, default vs opt-in, offline | ready (gate) |
+| 01 | research | Unsloth Studio: come serve un LLM locale (endpoint/protocollo/auth) | ✅ done (`done/`) — [research](./research-unsloth-serving.md) |
+| 02 | research | Astrazione di provider nell'app (base-URL/key/modello configurabili) | ready (sbloccato da 01) |
+| 03 | prototype | Tenuta del contratto percettore su modello locale (json/fallback/qualità) | ⛔ blocked — richiede endpoint locale in esecuzione (non AFK) |
+| 04 | grilling | Decisioni: modello/quant, hardware, default vs opt-in, offline | ready (gate umano) |
 
 ## Next Review
 
