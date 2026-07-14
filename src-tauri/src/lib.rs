@@ -14,28 +14,28 @@ fn ping() -> String {
     "pong from Rust core".to_string()
 }
 
-/// Store (or overwrite) the OpenRouter API key in the OS credential store.
+/// Store (or overwrite) a provider's API key in the OS credential store.
 #[tauri::command]
-fn store_api_key(key: String) -> Result<(), String> {
-    secrets::set_api_key(&key).map_err(|e| e.to_string())
+fn store_api_key(provider_id: String, key: String) -> Result<(), String> {
+    secrets::set_api_key(&provider_id, &key).map_err(|e| e.to_string())
 }
 
-/// Load the OpenRouter API key. Returns `null` when none is stored.
+/// Load a provider's API key. Returns `null` when none is stored.
 #[tauri::command]
-fn load_api_key() -> Result<Option<String>, String> {
-    secrets::get_api_key().map_err(|e| e.to_string())
+fn load_api_key(provider_id: String) -> Result<Option<String>, String> {
+    secrets::get_api_key(&provider_id).map_err(|e| e.to_string())
 }
 
-/// Remove the stored OpenRouter API key (idempotent).
+/// Remove a provider's stored API key (idempotent).
 #[tauri::command]
-fn clear_api_key() -> Result<(), String> {
-    secrets::delete_api_key().map_err(|e| e.to_string())
+fn clear_api_key(provider_id: String) -> Result<(), String> {
+    secrets::delete_api_key(&provider_id).map_err(|e| e.to_string())
 }
 
-/// Whether an OpenRouter API key is stored, without exposing the secret.
+/// Whether a provider's API key is stored, without exposing the secret.
 #[tauri::command]
-fn has_api_key() -> Result<bool, String> {
-    secrets::has_api_key().map_err(|e| e.to_string())
+fn has_api_key(provider_id: String) -> Result<bool, String> {
+    secrets::has_api_key(&provider_id).map_err(|e| e.to_string())
 }
 
 /// Read a global setting by key. Returns `null` when unset.
@@ -249,7 +249,9 @@ async fn translate_page(
 ) -> Result<translate::TranslationResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let conn = open_db(&app)?;
-        let api_key = secrets::get_api_key()
+        // Behaviour unchanged: still the OpenRouter-scoped key. Provider
+        // selection (active provider) arrives in Ticket 07.
+        let api_key = secrets::get_api_key("openrouter")
             .map_err(|e| e.to_string())?
             .unwrap_or_default();
         let model = settings::get_model(&conn).map_err(|e| e.to_string())?;
