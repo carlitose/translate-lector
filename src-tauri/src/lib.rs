@@ -59,6 +59,38 @@ fn get_model(app: tauri::AppHandle) -> Result<String, String> {
     settings::get_model(&conn).map_err(|e| e.to_string())
 }
 
+/// Read the active provider id (D3: default "unsloth" when unset).
+#[tauri::command]
+fn get_active_provider(app: tauri::AppHandle) -> Result<String, String> {
+    let conn = open_db(&app)?;
+    settings::get_active_provider(&conn).map_err(|e| e.to_string())
+}
+
+/// Set the active provider id (one of the built-in preset ids).
+#[tauri::command]
+fn set_active_provider(app: tauri::AppHandle, provider_id: String) -> Result<(), String> {
+    let conn = open_db(&app)?;
+    settings::set_active_provider(&conn, &provider_id).map_err(|e| e.to_string())
+}
+
+/// Resolve one provider's effective config: preset defaults + stored overrides
+/// (openrouter falls back to the legacy `model` key).
+#[tauri::command]
+fn get_provider_config(
+    app: tauri::AppHandle,
+    provider_id: String,
+) -> Result<settings::ProviderConfig, String> {
+    let conn = open_db(&app)?;
+    settings::get_provider_config(&conn, &provider_id).map_err(|e| e.to_string())
+}
+
+/// List the built-in provider presets (id + label + default base_url/model) for
+/// the settings UI.
+#[tauri::command]
+fn list_providers() -> Vec<settings::ProviderConfig> {
+    settings::provider_presets()
+}
+
 /// Read the default target language for new documents (§3.5, D4), falling back
 /// to the default ("it") when unset.
 #[tauri::command]
@@ -249,18 +281,20 @@ async fn translate_page(
 ) -> Result<translate::TranslationResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let conn = open_db(&app)?;
-        // Behaviour unchanged: still the OpenRouter-scoped key. Provider
-        // selection (active provider) arrives in Ticket 07.
-        let api_key = secrets::get_api_key("openrouter")
+        // Risolvi il provider attivo (D3: default unsloth) e la sua config
+        // (base-URL + modello, con override e fallback legacy `model` per
+        // openrouter). La chiave è provider-scoped (Ticket 06).
+        let active_id = settings::get_active_provider(&conn).map_err(|e| e.to_string())?;
+        let cfg = settings::get_provider_config(&conn, &active_id).map_err(|e| e.to_string())?;
+        let api_key = secrets::get_api_key(&active_id)
             .map_err(|e| e.to_string())?
             .unwrap_or_default();
-        let model = settings::get_model(&conn).map_err(|e| e.to_string())?;
-        // Behaviour unchanged: still OpenRouter with the same endpoint, key and
-        // attribution headers. Provider selection arrives in later tickets.
+        // Costruisci il client sull'endpoint del provider attivo; le attribution
+        // header OpenRouter partono solo per openrouter (Ticket 05).
         let base = llm::ChatCompletionsClient::new(
-            llm::OPENROUTER_URL,
+            cfg.base_url,
             api_key,
-            /* send_openrouter_headers = */ true,
+            /* send_openrouter_headers = */ active_id == "openrouter",
         );
         // Retry transient failures (timeout/5xx/429/offline) with backoff (NFR06).
         let client = llm::RetryingChatClient::new(&base, llm::RetryPolicy::default());
@@ -269,7 +303,7 @@ async fn translate_page(
             page_number,
             target_language: &target_language,
             page_text: &page_text,
-            model: &model,
+            model: &cfg.model,
             update_context,
         };
         translate::translate_page(&conn, &client, &params).map_err(|e| e.user_message())
@@ -373,6 +407,10 @@ pub fn run() {
             get_setting,
             set_setting,
             get_model,
+            get_active_provider,
+            set_active_provider,
+            get_provider_config,
+            list_providers,
             get_default_target_language,
             clear_translations_cache,
             get_data_dir,

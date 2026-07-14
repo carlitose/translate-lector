@@ -5,6 +5,7 @@
 //! defaults on top.
 
 use rusqlite::{Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Settings key holding the OpenRouter model id.
@@ -108,6 +109,132 @@ pub fn get_prefetch_enabled(conn: &Connection) -> rusqlite::Result<bool> {
         Some(v) if v.eq_ignore_ascii_case("false") || v == "0" => false,
         Some(v) if !v.is_empty() => true,
         _ => DEFAULT_PREFETCH_ENABLED,
+    })
+}
+
+// --- Provider presets + active provider (design §2-3, §8) --------------------
+
+/// Settings key holding the id of the active provider.
+pub const ACTIVE_PROVIDER_KEY: &str = "active_provider";
+/// Default active provider when unset/blank. Decision D3: il default è locale
+/// (Unsloth), non il cloud.
+pub const DEFAULT_PROVIDER_ID: &str = "unsloth";
+
+/// A selectable LLM provider: identità + endpoint + modello. `base_url` e `model`
+/// hanno default built-in ma sono overridabili (persistiti in `settings`); per i
+/// provider locali `model` parte vuoto ed è scelto poi a mano (free-text).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderConfig {
+    /// Stable id: `openrouter` | `unsloth` | `lmstudio` | `ollama` | `llamaserver`.
+    pub id: String,
+    /// UI label (es. "OpenRouter (cloud)").
+    pub label: String,
+    /// Full `/v1/chat/completions` URL (default del preset o override utente).
+    pub base_url: String,
+    /// Model id per la richiesta (default del preset o override utente).
+    pub model: String,
+}
+
+/// Built-in provider presets (design §2, research §5/§Q3). Le base-URL locali
+/// sono default di partenza overridabili; Unsloth usa la porta reale dell'utente
+/// (8888, non fissa: research §Q2). Il `model` dei provider locali è vuoto: lo
+/// sceglie l'utente più tardi.
+pub fn provider_presets() -> Vec<ProviderConfig> {
+    vec![
+        ProviderConfig {
+            id: "openrouter".to_string(),
+            label: "OpenRouter (cloud)".to_string(),
+            base_url: crate::llm::OPENROUTER_URL.to_string(),
+            model: DEFAULT_MODEL.to_string(),
+        },
+        ProviderConfig {
+            id: "unsloth".to_string(),
+            label: "Unsloth Studio (locale)".to_string(),
+            base_url: "http://localhost:8888/v1/chat/completions".to_string(),
+            model: String::new(),
+        },
+        ProviderConfig {
+            id: "lmstudio".to_string(),
+            label: "LM Studio (locale)".to_string(),
+            base_url: "http://localhost:1234/v1/chat/completions".to_string(),
+            model: String::new(),
+        },
+        ProviderConfig {
+            id: "ollama".to_string(),
+            label: "Ollama (locale)".to_string(),
+            base_url: "http://localhost:11434/v1/chat/completions".to_string(),
+            model: String::new(),
+        },
+        ProviderConfig {
+            id: "llamaserver".to_string(),
+            label: "llama.cpp server (locale)".to_string(),
+            base_url: "http://127.0.0.1:8080/v1/chat/completions".to_string(),
+            model: String::new(),
+        },
+    ]
+}
+
+/// The built-in preset for `id`, or `None` when the id is not a known provider.
+pub fn provider_preset(id: &str) -> Option<ProviderConfig> {
+    provider_presets().into_iter().find(|p| p.id == id)
+}
+
+/// Settings key holding a provider's base-URL override: `provider.{id}.base_url`.
+pub fn provider_base_url_key(id: &str) -> String {
+    format!("provider.{id}.base_url")
+}
+
+/// Settings key holding a provider's model override: `provider.{id}.model`.
+pub fn provider_model_key(id: &str) -> String {
+    format!("provider.{id}.model")
+}
+
+/// Read the active provider id, falling back to [`DEFAULT_PROVIDER_ID`] (D3:
+/// unsloth) when unset or stored blank.
+pub fn get_active_provider(conn: &Connection) -> rusqlite::Result<String> {
+    let stored = get_setting(conn, ACTIVE_PROVIDER_KEY)?;
+    Ok(match stored {
+        Some(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => DEFAULT_PROVIDER_ID.to_string(),
+    })
+}
+
+/// Store the active provider id.
+pub fn set_active_provider(conn: &Connection, id: &str) -> rusqlite::Result<()> {
+    set_setting(conn, ACTIVE_PROVIDER_KEY, id)
+}
+
+/// Resolve a provider's effective [`ProviderConfig`]: preset defaults with any
+/// stored `base_url`/`model` overrides applied on top. For `openrouter`, when
+/// `provider.openrouter.model` is unset the model falls back to the legacy
+/// `model` setting via [`get_model`] (back-compat §8), so existing users keep
+/// their chosen model. An unknown id yields a bare config (id as label, empty
+/// endpoint) so manual overrides still apply.
+pub fn get_provider_config(conn: &Connection, id: &str) -> rusqlite::Result<ProviderConfig> {
+    let preset = provider_preset(id).unwrap_or_else(|| ProviderConfig {
+        id: id.to_string(),
+        label: id.to_string(),
+        base_url: String::new(),
+        model: String::new(),
+    });
+
+    let base_url = match get_setting(conn, &provider_base_url_key(id))? {
+        Some(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => preset.base_url,
+    };
+
+    let model = match get_setting(conn, &provider_model_key(id))? {
+        Some(v) if !v.trim().is_empty() => v.trim().to_string(),
+        // openrouter: cade sul valore legacy `model` (o DEFAULT_MODEL) via get_model.
+        _ if id == "openrouter" => get_model(conn)?,
+        _ => preset.model,
+    };
+
+    Ok(ProviderConfig {
+        id: preset.id,
+        label: preset.label,
+        base_url,
+        model,
     })
 }
 
@@ -249,5 +376,105 @@ mod tests {
             get_summary_token_limit(&c).unwrap(),
             DEFAULT_SUMMARY_TOKEN_LIMIT
         );
+    }
+
+    // --- Provider presets + active provider (ticket 07) ---------------------
+
+    #[test]
+    fn active_provider_defaults_to_unsloth_when_unset() {
+        // Decision D3: il provider attivo di default è locale (Unsloth).
+        let c = conn();
+        assert_eq!(get_active_provider(&c).unwrap(), "unsloth");
+        assert_eq!(get_active_provider(&c).unwrap(), DEFAULT_PROVIDER_ID);
+    }
+
+    #[test]
+    fn active_provider_roundtrips_when_set() {
+        let c = conn();
+        set_active_provider(&c, "openrouter").unwrap();
+        assert_eq!(get_active_provider(&c).unwrap(), "openrouter");
+        set_active_provider(&c, "lmstudio").unwrap();
+        assert_eq!(get_active_provider(&c).unwrap(), "lmstudio");
+    }
+
+    #[test]
+    fn active_provider_falls_back_when_stored_blank() {
+        let c = conn();
+        set_setting(&c, ACTIVE_PROVIDER_KEY, "   ").unwrap();
+        assert_eq!(get_active_provider(&c).unwrap(), DEFAULT_PROVIDER_ID);
+    }
+
+    #[test]
+    fn provider_presets_contains_the_five_expected_ids_and_base_urls() {
+        let presets = provider_presets();
+        let ids: Vec<&str> = presets.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, vec!["openrouter", "unsloth", "lmstudio", "ollama", "llamaserver"]);
+
+        let by = |id: &str| provider_preset(id).unwrap();
+        assert_eq!(by("openrouter").base_url, crate::llm::OPENROUTER_URL);
+        assert_eq!(by("unsloth").base_url, "http://localhost:8888/v1/chat/completions");
+        assert_eq!(by("lmstudio").base_url, "http://localhost:1234/v1/chat/completions");
+        assert_eq!(by("ollama").base_url, "http://localhost:11434/v1/chat/completions");
+        assert_eq!(by("llamaserver").base_url, "http://127.0.0.1:8080/v1/chat/completions");
+        // openrouter parte dal modello di default corrente (= DEFAULT_MODEL).
+        assert_eq!(by("openrouter").model, DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn provider_key_helpers_format_scoped_keys() {
+        assert_eq!(provider_base_url_key("unsloth"), "provider.unsloth.base_url");
+        assert_eq!(provider_model_key("ollama"), "provider.ollama.model");
+    }
+
+    #[test]
+    fn get_provider_config_returns_preset_defaults_when_no_overrides() {
+        let c = conn();
+        let cfg = get_provider_config(&c, "lmstudio").unwrap();
+        assert_eq!(cfg.id, "lmstudio");
+        assert_eq!(cfg.label, "LM Studio (locale)");
+        assert_eq!(cfg.base_url, "http://localhost:1234/v1/chat/completions");
+        assert_eq!(cfg.model, "");
+    }
+
+    #[test]
+    fn get_provider_config_applies_base_url_and_model_overrides() {
+        let c = conn();
+        set_setting(
+            &c,
+            &provider_base_url_key("unsloth"),
+            "http://localhost:9000/v1/chat/completions",
+        )
+        .unwrap();
+        set_setting(&c, &provider_model_key("unsloth"), "qwen2.5:7b").unwrap();
+        let cfg = get_provider_config(&c, "unsloth").unwrap();
+        assert_eq!(cfg.base_url, "http://localhost:9000/v1/chat/completions");
+        assert_eq!(cfg.model, "qwen2.5:7b");
+    }
+
+    #[test]
+    fn get_provider_config_openrouter_falls_back_to_legacy_model() {
+        // Nessun provider.openrouter.model, ma un `model` legacy impostato: deve
+        // vincere (back-compat §8) così gli utenti OpenRouter mantengono la scelta.
+        let c = conn();
+        set_setting(&c, MODEL_KEY, "openai/gpt-4o").unwrap();
+        let cfg = get_provider_config(&c, "openrouter").unwrap();
+        assert_eq!(cfg.base_url, crate::llm::OPENROUTER_URL);
+        assert_eq!(cfg.model, "openai/gpt-4o");
+    }
+
+    #[test]
+    fn get_provider_config_openrouter_defaults_to_default_model_without_legacy() {
+        let c = conn();
+        let cfg = get_provider_config(&c, "openrouter").unwrap();
+        assert_eq!(cfg.model, DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn get_provider_config_openrouter_model_override_beats_legacy() {
+        let c = conn();
+        set_setting(&c, MODEL_KEY, "openai/gpt-4o").unwrap();
+        set_setting(&c, &provider_model_key("openrouter"), "anthropic/claude-opus-4.8").unwrap();
+        let cfg = get_provider_config(&c, "openrouter").unwrap();
+        assert_eq!(cfg.model, "anthropic/claude-opus-4.8");
     }
 }
