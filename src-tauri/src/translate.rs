@@ -18,8 +18,9 @@
 
 use crate::glossary;
 use crate::llm::{
-    build_messages, build_request, calibrate_chars_per_token, needs_compression, ChatClient,
-    ChatMessage, ChatRequest, GlossaryTerm, LlmError, PerceptoreOutput, Usage, CORRECTION_PROMPT,
+    build_messages, build_request, calibrate_chars_per_token, complete_with_fallback,
+    needs_compression, ChatClient, ChatMessage, ChatRequest, GlossaryTerm, LlmError,
+    PerceptoreOutput, Usage, CORRECTION_PROMPT,
 };
 use crate::{documents, settings};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -129,31 +130,41 @@ fn cache_insert(
 }
 
 /// Call the client and parse the response with the layered fallback, including
-/// the single correction retry (layer c). Returns the parsed output plus the
+/// the single correction retry (layer c). Returns the parsed output, the
 /// provider `usage` when reported (used for cost telemetry and ratio
-/// calibration).
+/// calibration), and the **working request body** that actually succeeded
+/// (possibly degraded by the param-relaxation fallback) so the caller can reuse
+/// its shape for later chunks without re-probing the already-rejected params.
 fn complete_and_parse(
     client: &dyn ChatClient,
-    mut req: ChatRequest,
-) -> Result<(PerceptoreOutput, Option<Usage>), LlmError> {
-    let resp = client.complete(&req)?;
+    req: ChatRequest,
+) -> Result<(PerceptoreOutput, Option<Usage>, ChatRequest), LlmError> {
+    // `complete_with_fallback` adds the model-agnostic param-relaxation retry
+    // (research §2, bug #1) around the transport: a 404 "No endpoints found" or
+    // a 400 unsupported-parameter downgrades the body (drop provider →
+    // response_format → temperature) instead of failing outright. It returns the
+    // body that worked, so we never re-probe the rejected param below.
+    let (resp, working) = complete_with_fallback(client, &req)?;
     let content = resp.content()?.to_string();
     let usage = resp.usage.clone();
 
     match crate::llm::parse_content(&content) {
-        Ok(out) => Ok((out, usage)),
+        Ok(out) => Ok((out, usage, working)),
         Err(_) => {
             // (c) one correction retry: echo the bad answer, demand pure JSON.
-            req.messages.push(ChatMessage::assistant(content));
-            req.messages.push(ChatMessage::user(CORRECTION_PROMPT));
+            // Build it on the *working* (possibly degraded) body so the retry
+            // does not re-send the param the model already rejected.
+            let mut retry_req = working;
+            retry_req.messages.push(ChatMessage::assistant(content));
+            retry_req.messages.push(ChatMessage::user(CORRECTION_PROMPT));
 
-            let resp2 = client.complete(&req)?;
+            let (resp2, working2) = complete_with_fallback(client, &retry_req)?;
             let content2 = resp2.content()?.to_string();
             let usage2 = resp2.usage.clone();
 
             // (d) final error if the retry still isn't conformant.
             let out = crate::llm::parse_content(&content2).map_err(LlmError::ParseFailed)?;
-            Ok((out, usage2.or(usage)))
+            Ok((out, usage2.or(usage), working2))
         }
     }
 }
@@ -204,6 +215,11 @@ pub fn translate_page(
     let mut saw_usage = false;
     let mut prompt_chars_sum: usize = 0;
     let mut prompt_tokens_sum: i64 = 0;
+    // The request shape discovered to work for this page: once the fallback
+    // strips a param a model rejects, later chunks start already-degraded so
+    // they don't each pay the same failed 404 (bug #1 follow-up). `None` until
+    // the first chunk returns its working body.
+    let mut working_shape: Option<ChatRequest> = None;
 
     for chunk in &chunks {
         // Recompression is requested when the running summary is over the
@@ -220,8 +236,16 @@ pub fn translate_page(
         );
         prompt_chars_sum += messages.iter().map(|m| m.content.chars().count()).sum::<usize>();
 
-        let req = build_request(p.model, messages);
-        let (output, usage) = complete_and_parse(client, req)?;
+        let mut req = build_request(p.model, messages);
+        // Reuse the optional-param shape discovered on a previous chunk so we
+        // don't re-probe a param the model already rejected this page.
+        if let Some(shape) = &working_shape {
+            req.temperature = shape.temperature;
+            req.response_format = shape.response_format.clone();
+            req.provider = shape.provider.clone();
+        }
+        let (output, usage, working) = complete_and_parse(client, req)?;
+        working_shape = Some(working);
 
         translated_parts.push(output.translated_text);
         rolling_summary = output.updated_summary; // carry continuity to next chunk
@@ -495,6 +519,114 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM translations_cache", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    // --- Bug #1: model-agnostic 404 fallback through the service ------------
+
+    /// A 404 "No endpoints found" on the full body must trigger one downgraded
+    /// retry (research §2) that succeeds — the page still translates.
+    #[test]
+    fn unsupported_params_404_recovers_via_downgraded_retry() {
+        let c = conn();
+        seed_session(&c);
+        let client = MockClient::new(vec![
+            Err(LlmError::UnsupportedParams(
+                "404 Not Found: {\"error\":{\"message\":\"No endpoints found that can handle \
+                 the requested parameters.\",\"code\":404}}"
+                    .into(),
+            )),
+            Ok(resp(&valid_content(), 321)),
+        ]);
+
+        let out = translate_page(&c, &client, &params("Hello")).unwrap();
+        assert_eq!(out.translated_text, "Ciao mondo");
+        assert_eq!(out.total_tokens, Some(321));
+        assert_eq!(client.calls(), 2, "full body 404 then a downgraded retry that succeeds");
+
+        // The downgraded retry dropped `provider` first (it was already None in
+        // the default body) then `response_format`.
+        let reqs = client.requests.borrow();
+        assert!(reqs[0].response_format.is_some(), "first attempt sent response_format");
+        assert!(reqs[1].response_format.is_none(), "retry stripped response_format");
+    }
+
+    /// A non-degradable 404 (e.g. genuinely missing model) is surfaced, not
+    /// retried into oblivion.
+    #[test]
+    fn non_degradable_http_error_is_surfaced_without_param_relaxation() {
+        let c = conn();
+        seed_session(&c);
+        let client = MockClient::new(vec![Err(LlmError::Http("404 Not Found: model not found".into()))]);
+
+        let err = translate_page(&c, &client, &params("Hello")).unwrap_err();
+        assert!(matches!(err, LlmError::Http(_)));
+        assert_eq!(client.calls(), 1, "no param-relaxation retry for a plain HTTP 404");
+    }
+
+    /// After the fallback degrades the body on the first chunk, later chunks of
+    /// the SAME page must start already-degraded — no repeated 404 re-probe
+    /// (finding 2b). With the fix the second chunk succeeds in one call.
+    #[test]
+    fn degraded_shape_is_reused_by_later_chunks_no_reprobe() {
+        let c = conn();
+        seed_session(&c);
+        // ~12000 chars -> exactly two chunks at the 8000 threshold.
+        let big = "lorem ipsum ".repeat(1000);
+        assert_eq!(split_into_chunks(&big, CHUNK_CHAR_THRESHOLD).len(), 2, "precondition: two chunks");
+
+        let client = MockClient::new(vec![
+            // chunk 1: full body 404, then a downgraded retry succeeds.
+            Err(LlmError::UnsupportedParams("no endpoints found".into())),
+            Ok(resp(&content_with("PART0", "s0", &[]), 10)),
+            // chunk 2: must already be degraded -> ONE successful call, no 404.
+            Ok(resp(&content_with("PART1", "s1", &[]), 10)),
+        ]);
+
+        let out = translate_page(&c, &client, &params_page(&big)).unwrap();
+
+        assert_eq!(client.calls(), 3, "chunk1: 2 calls; chunk2: 1 call (no re-probe)");
+        assert!(out.translated_text.contains("PART0") && out.translated_text.contains("PART1"));
+
+        let reqs = client.requests.borrow();
+        assert!(reqs[0].response_format.is_some(), "chunk1 first attempt sent response_format");
+        assert!(reqs[1].response_format.is_none(), "chunk1 retry stripped response_format");
+        assert!(
+            reqs[2].response_format.is_none(),
+            "chunk2 starts already-degraded, no response_format re-probe"
+        );
+    }
+
+    /// The JSON-correction retry must be issued on the already-degraded body, so
+    /// it does not re-send the param the model rejected (finding 2a). Sequence:
+    /// full-body 404 -> degraded call returns malformed JSON -> correction retry
+    /// on the degraded body returns valid JSON. That is exactly 3 calls; a
+    /// re-probe would make 4.
+    #[test]
+    fn correction_retry_reuses_degraded_body_no_reprobe() {
+        let c = conn();
+        seed_session(&c);
+        let client = MockClient::new(vec![
+            Err(LlmError::UnsupportedParams("no endpoints found".into())),
+            Ok(resp("not json at all", 10)),
+            Ok(resp(&valid_content(), 55)),
+        ]);
+
+        let out = translate_page(&c, &client, &params("Hello")).unwrap();
+
+        assert_eq!(out.translated_text, "Ciao mondo");
+        assert_eq!(out.total_tokens, Some(55));
+        assert_eq!(client.calls(), 3, "404 + degraded malformed + degraded correction retry");
+
+        let reqs = client.requests.borrow();
+        assert!(reqs[1].response_format.is_none(), "degraded call stripped response_format");
+        assert!(
+            reqs[2].response_format.is_none(),
+            "correction retry reuses the degraded body (no re-probe)"
+        );
+        assert!(
+            reqs[2].messages.iter().any(|m| m.content.contains(crate::llm::CORRECTION_PROMPT)),
+            "correction retry carries the correction prompt"
+        );
     }
 
     // --- Missing API key (EC03) ---------------------------------------------
