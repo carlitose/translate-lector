@@ -40,6 +40,33 @@ Contesto: eredita l'epica provider locale
 - **Assunzione (esplicita)**: la pipeline chunked/budget-aware si attiva in base al **budget derivato dal
   context** (configurabile). I provider a contesto grande possono usare unità più grandi / il percorso
   attuale; i piccoli (4k locali) usano unità paragrafo + glossario selettivo. Da confermare nel grilling.
+- **Modello di budget token = DEFINITO** (Ticket 01, 2026-07-14; vedi sezione dedicata sotto).
+
+## Modello di budget token (Ticket 01)
+
+Parametri (tutti per-provider, riuso `ProviderConfig`/settings dei Ticket 07/08):
+- `n_ctx` — context window del provider (nuovo setting per-provider; default locale 4096; opz. letto da
+  `/props`/`/v1/models` del server). Per il cloud, molto grande → il budget non vincola.
+- `out_unit` — `max_tokens` **per-unità** dedicato al percorso chunked: piccolo (es. 512-768), perché
+  tradurre un paragrafo produce poco output. NB: **più piccolo** del `max_tokens` per-pagina odierno
+  (local 2048, Ticket 02 empty-content) → libera budget di input **e** riduce il rischio EC08.
+- `margine` — cuscinetto per l'imprecisione dell'euristica `chars/4` (`est_tokens`, `llm.rs:730`,
+  calibrabile via `calibrate_chars_per_token`): ~15%.
+
+Formula:
+```
+budget_input = floor( (n_ctx − out_unit) × (1 − margine) )
+budget_unit_text = budget_input − est(system_prompt) − est(summary_compatto) − est(glossario_selezionato)
+```
+`budget_unit_text` è la dimensione massima (in token) di un'unità di traduzione → parametro per il chunking
+(Ticket 02). Esempio n_ctx=4096, out_unit=640, margine=0.15 → budget_input ≈ (3456)×0.85 ≈ **2937**; tolti
+system (~250) + summary (~300) + glossario selezionato (~120) → **budget_unit_text ≈ 2260 token** per
+paragrafo — ampiamente sufficiente per un paragrafo, con margine.
+
+Aggancio codice: calcolare `budget_input`/`budget_unit_text` in `translate.rs` prima del loop di chunk,
+usando `est_tokens` per system/summary/glossario; sostituire la soglia fissa `CHUNK_CHAR_THRESHOLD`
+(`translate.rs:31`) con un limite derivato dal budget (in token, non char). Il summary resta sotto il suo
+limite (EC05); se il budget è stretto, ridurre prima il glossario selezionato (Ticket 03), poi il summary.
 
 ## Fatti di codebase rilevanti (grounding)
 
@@ -54,9 +81,7 @@ Contesto: eredita l'epica provider locale
 
 ## Not Yet Specified
 
-- **Modello di budget per-chiamata**: formula `budget_input = n_ctx − max_tokens(output) − margine`, e come
-  ripartirlo tra system + summary + glossario selezionato + testo unità. Dove n_ctx viene noto/configurato
-  (per-provider). → Ticket 01.
+- ~~Modello di budget per-chiamata~~ → **DEFINITO dal Ticket 01** (sezione "Modello di budget token").
 - **Chunking a livello paragrafo**: come dividere una pagina in unità (paragrafo/frase) entro il budget,
   riusando la ricostruzione di `src/lib/pdfExtract.ts` e `split_into_chunks`; riassemblaggio corretto. → Ticket 02.
 - **Selezione deterministica del glossario**: funzione (chunk + glossario) → sottoinsieme rilevante
@@ -100,7 +125,7 @@ Cartella: `docs/tickets/small-context-translation/`
 
 | # | Tipo | Titolo | Stato |
 |---|------|--------|-------|
-| 01 | research | Modello di budget token per-chiamata (da n_ctx) | ready |
+| 01 | research | Modello di budget token per-chiamata (da n_ctx) | ✅ done (`done/`) — sezione "Modello di budget token" |
 | 02 | prototype | Chunking a livello paragrafo entro budget | ready |
 | 03 | prototype | Selezione deterministica del glossario per unità | ready |
 | 04 | research | Percettore multi-chiamata + split contratto + cache per-unità | blocked by 01,02,03 |
