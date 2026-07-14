@@ -888,6 +888,136 @@ pub const CORRECTION_PROMPT: &str =
     "La tua risposta non era JSON valido conforme allo schema. Rispondi di nuovo con SOLO \
 l'oggetto JSON, senza testo aggiuntivo, senza markdown, senza code fence.";
 
+// --- Contratto translate-only per unità (STC-08, decisione D5) ---------------
+//
+// Sul percorso a budget la pagina è divisa in unità piccole (STC-02) tradotte una
+// per una con un prompt MINIMALE: niente schema JSON ricco del percettore, niente
+// riassunto/glossario da PRODURRE — solo la traduzione. Il grosso del contesto
+// (glossario intero, contratto ricco) resta fuori da queste chiamate, che così
+// stanno larghe dentro una finestra piccola e riducono il rischio EC08. Il
+// riassunto e i nuovi termini vengono ricavati una sola volta per pagina dalla
+// chiamata percettore separata (D6), che continua a usare `build_messages` +
+// `build_request` + `response_format` come prima.
+
+/// System prompt per una chiamata **translate-only** di una singola unità
+/// (STC-08, D5). Minimale di proposito: traduci fedelmente, rispetta in modo
+/// assoluto i termini bloccati, rispondi con il SOLO testo tradotto (nessun JSON,
+/// nessun riassunto, nessun glossario da generare).
+pub fn build_translate_only_system_prompt() -> String {
+    "Sei il motore di traduzione di translate-lector. Traduci fedelmente il testo fornito \
+verso la lingua di destinazione indicata, mantenendo tono, significato e formattazione.\n\n\
+Regole:\n\
+- Rispetta in modo ASSOLUTO le traduzioni dei termini marcati come BLOCCATI: usa sempre e \
+solo la traduzione indicata, senza eccezioni.\n\
+- Usa i termini suggeriti quando appropriato, per coerenza.\n\
+- Non riassumere, non omettere, non aggiungere commenti o spiegazioni.\n\
+- Rispondi con IL SOLO testo tradotto, senza virgolette, senza markdown, senza JSON."
+        .to_string()
+}
+
+/// User message per una chiamata **translate-only**: riassunto **read-only** come
+/// contesto, glossario **già selezionato** per l'unità (locked-first, STC-03) e
+/// il testo dell'unità da tradurre. Nessuna richiesta di aggiornare summary o
+/// glossario: quello è compito della chiamata percettore per-pagina (D6).
+pub fn build_translate_only_user_prompt(
+    target_language: &str,
+    unit_text: &str,
+    rolling_summary: &str,
+    locked_terms: &str,
+    unlocked_terms: &str,
+) -> String {
+    let summary = if rolling_summary.trim().is_empty() {
+        "(nessuno: e la prima pagina)"
+    } else {
+        rolling_summary
+    };
+    let locked = if locked_terms.trim().is_empty() { "(nessuno)" } else { locked_terms };
+    let unlocked = if unlocked_terms.trim().is_empty() { "(nessuno)" } else { unlocked_terms };
+
+    format!(
+        "LINGUA DI DESTINAZIONE: {target_language}\n\n\
+CONTESTO (riassunto delle pagine precedenti, solo lettura):\n{summary}\n\n\
+GLOSSARIO RILEVANTE PER QUESTO TESTO:\n\
+Termini BLOCCATI (vincolo assoluto - usa esattamente questa traduzione):\n{locked}\n\
+Termini suggeriti (coerenza consigliata, non vincolante):\n{unlocked}\n\n\
+TESTO DA TRADURRE:\n\"\"\"\n{unit_text}\n\"\"\"\n\n\
+Rispondi con il solo testo tradotto."
+    )
+}
+
+/// Coppia system+user per una chiamata translate-only di una singola unità.
+pub fn build_translate_only_messages(
+    target_language: &str,
+    unit_text: &str,
+    rolling_summary: &str,
+    locked_terms: &str,
+    unlocked_terms: &str,
+) -> Vec<ChatMessage> {
+    vec![
+        ChatMessage::system(build_translate_only_system_prompt()),
+        ChatMessage::user(build_translate_only_user_prompt(
+            target_language,
+            unit_text,
+            rolling_summary,
+            locked_terms,
+            unlocked_terms,
+        )),
+    ]
+}
+
+/// [`ChatRequest`] per una chiamata translate-only: come [`build_request`] ma
+/// **senza** il `response_format` ricco del percettore (D5). Il contratto è
+/// "solo testo", con fallback JSON minimo in [`parse_translation`]. `temperature`
+/// resta (0.2) ma è opzionale, così il fallback model-agnostico può rimuoverla se
+/// un modello la rifiuta. `max_tokens` è piccolo (out_unit) sul percorso a budget
+/// stretto — vedi `translate::translate_page`.
+pub fn build_translate_only_request(
+    model: &str,
+    messages: Vec<ChatMessage>,
+    max_tokens: u32,
+) -> ChatRequest {
+    ChatRequest {
+        model: model.to_string(),
+        messages,
+        temperature: Some(0.2),
+        max_tokens,
+        stream: false,
+        // Contratto minimo: niente schema JSON ricco su queste chiamate (D5).
+        response_format: None,
+        provider: None,
+    }
+}
+
+/// Contratto minimo di una risposta translate-only: solo il testo tradotto.
+/// I campi extra sono ignorati (nessun `deny_unknown_fields`), così anche una
+/// risposta che includa per errore l'intero JSON percettore viene estratta.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct TranslateUnitOutput {
+    translated_text: String,
+}
+
+/// Estrae la traduzione dalla risposta di una chiamata **translate-only** (D5).
+/// Contratto robusto e minimale: prova prima il JSON `{ "translated_text": ... }`
+/// (diretto o dentro il primo blocco bilanciato), poi ripiega sul **testo puro**
+/// (l'intero contenuto senza spazi di bordo). Riesce sempre finché il contenuto
+/// non è vuoto — l'assenza di contenuto (incl. EC08 `finish_reason == "length"`)
+/// è già intercettata a monte da [`ChatResponse::content`].
+pub fn parse_translation(content: &str) -> String {
+    let trimmed = content.trim();
+    // (a) JSON minimo diretto.
+    if let Ok(v) = serde_json::from_str::<TranslateUnitOutput>(trimmed) {
+        return v.translated_text;
+    }
+    // (b) primo blocco JSON bilanciato (strip di ```json / prosa attorno).
+    if let Some(block) = extract_first_json_block(content) {
+        if let Ok(v) = serde_json::from_str::<TranslateUnitOutput>(block) {
+            return v.translated_text;
+        }
+    }
+    // (c) testo puro: il contenuto è già la traduzione.
+    trimmed.to_string()
+}
+
 // --- Layered parsing (§4.4) --------------------------------------------------
 
 /// Parse the model `content` into [`PerceptoreOutput`] using layers (a) direct
@@ -1119,6 +1249,74 @@ mod tests {
         assert_eq!(local.max_tokens, 2048, "max_tokens is threaded from the caller");
         let cloud = build_request("openai/gpt-4o", build_messages("it", "x", "", "", "", false, 1000), 4096);
         assert_eq!(cloud.max_tokens, 4096, "a generous cloud value passes through unchanged");
+    }
+
+    // --- STC-08: translate-only contract (minimal prompt + parse) -----------
+
+    #[test]
+    fn translate_only_system_prompt_is_minimal_text_only_no_json_schema() {
+        let s = build_translate_only_system_prompt();
+        // Deve chiedere il SOLO testo tradotto e vietare il JSON (contratto minimo).
+        assert!(s.to_lowercase().contains("solo testo tradotto"));
+        assert!(s.contains("senza JSON"));
+        // Deve ribadire il vincolo assoluto sui termini bloccati (D5).
+        assert!(s.contains("BLOCCATI"));
+    }
+
+    #[test]
+    fn translate_only_user_prompt_carries_summary_selected_glossary_and_unit() {
+        let p = build_translate_only_user_prompt(
+            "italiano",
+            "The board met.",
+            "Riassunto delle pagine precedenti.",
+            "board => consiglio  [tecnico]",
+            "CEO => amministratrice delegata  [tecnico]",
+        );
+        assert!(p.contains("LINGUA DI DESTINAZIONE: italiano"));
+        assert!(p.contains("Riassunto delle pagine precedenti."), "summary read-only in prompt");
+        assert!(p.contains("Termini BLOCCATI (vincolo assoluto"));
+        assert!(p.contains("board => consiglio"));
+        assert!(p.contains("The board met."), "unit text present");
+        // Nessuna richiesta di produrre summary/glossario o JSON.
+        assert!(!p.contains("updated_summary"));
+        assert!(!p.contains("new_glossary_terms"));
+    }
+
+    #[test]
+    fn translate_only_request_omits_the_rich_response_format() {
+        // Contratto minimo (D5): nessuno schema JSON ricco sulle chiamate di unità.
+        let req = build_translate_only_request(
+            "m",
+            build_translate_only_messages("it", "x", "", "", ""),
+            768,
+        );
+        assert!(req.response_format.is_none(), "translate-only sends no rich JSON schema");
+        assert_eq!(req.max_tokens, 768, "small per-unit output cap threaded");
+        assert_eq!(req.temperature, Some(0.2), "temperature kept but optional");
+        // Non deve serializzare alcun response_format sul wire.
+        let wire = serde_json::to_value(&req).unwrap();
+        assert!(wire.get("response_format").is_none());
+    }
+
+    #[test]
+    fn parse_translation_reads_plain_text() {
+        assert_eq!(parse_translation("Ciao mondo"), "Ciao mondo");
+        assert_eq!(parse_translation("  Ciao mondo  "), "Ciao mondo", "trims edge whitespace");
+    }
+
+    #[test]
+    fn parse_translation_reads_tiny_json_and_ignores_extra_fields() {
+        // JSON minimo diretto.
+        assert_eq!(parse_translation(r#"{"translated_text":"Ciao mondo"}"#), "Ciao mondo");
+        // JSON dentro un code fence + prosa attorno.
+        assert_eq!(
+            parse_translation("Ecco:\n```json\n{\"translated_text\":\"Ciao\"}\n```\nfine"),
+            "Ciao"
+        );
+        // Un intero JSON percettore su una chiamata di unità: si estrae comunque
+        // il solo translated_text (campi extra ignorati).
+        let full = r#"{"translated_text":"Ciao","updated_summary":"s","new_glossary_terms":[]}"#;
+        assert_eq!(parse_translation(full), "Ciao");
     }
 
     // --- Bug #1: default body must not force provider routing --------------

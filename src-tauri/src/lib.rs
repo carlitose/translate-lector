@@ -307,6 +307,10 @@ async fn translate_page(
             // Tetto max_tokens del provider attivo (Ticket 02): cloud generoso,
             // locale con margine entro n_ctx per lasciare spazio all'output.
             max_tokens: cfg.max_tokens,
+            // Context window del provider attivo (Ticket 07): input della formula
+            // di budget (STC-08). Locale ~4096 → unità piccole; cloud grande →
+            // una sola unità = pagina intera (degradazione D2).
+            n_ctx: cfg.n_ctx,
             update_context,
         };
         translate::translate_page(&conn, &client, &params).map_err(|e| e.user_message())

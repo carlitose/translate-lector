@@ -118,9 +118,9 @@ pub fn render_locked_unlocked(entries: &[GlossaryEntry]) -> (String, String) {
 /// assoluto preservato). `unlocked_cap` limita opzionalmente il numero di
 /// termini **unlocked** restituiti (i primi, in ordine di `entries`); i locked
 /// non sono mai scartati dal cap. L'ordine di `entries` è preservato.
-// Prototipo (ticket 03): non ancora agganciato al flusso live (l'integrazione è
-// un ticket di build successivo), quindi dead_code finché non viene cablato.
-#[allow(dead_code)]
+///
+/// Cablata nel flusso live da STC-08 (`translate::translate_page`): ogni unità di
+/// traduzione riceve nel prompt solo il glossario selezionato per quell'unità.
 pub fn select_glossary(
     unit_text: &str,
     entries: &[GlossaryEntry],
@@ -151,7 +151,6 @@ pub fn select_glossary(
 /// Spezza `text` in parole minuscole (token alfanumerici Unicode); la
 /// punteggiatura e gli spazi fanno da separatore, garantendo il match su
 /// confine di parola.
-#[allow(dead_code)]
 fn tokenize(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|s| !s.is_empty())
@@ -162,7 +161,6 @@ fn tokenize(text: &str) -> Vec<String> {
 /// `true` se i token di `source_term` compaiono come sotto-sequenza contigua in
 /// `text_tokens`: tutte le parole devono coincidere esattamente, tranne
 /// l'ultima che tollera una variante di plurale ([`is_plural_variant`]).
-#[allow(dead_code)]
 fn term_matches(text_tokens: &[String], source_term: &str) -> bool {
     let term_tokens = tokenize(source_term);
     let n = term_tokens.len();
@@ -200,7 +198,6 @@ fn term_matches(text_tokens: &[String], source_term: &str) -> bool {
 /// vs il termine `case` per l'alternanza `-e/-i`): accettabile in un prototipo
 /// di selezione, dato che i termini scartati per errore restano rari e i locked
 /// non dipendono da questa euristica.
-#[allow(dead_code)]
 fn is_plural_variant(a: &str, b: &str) -> bool {
     if a == b {
         return true;

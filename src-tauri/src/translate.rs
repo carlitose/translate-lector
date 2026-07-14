@@ -18,17 +18,86 @@
 
 use crate::glossary;
 use crate::llm::{
-    build_messages, build_request, calibrate_chars_per_token, complete_with_fallback, est_tokens,
-    needs_compression, ChatClient, ChatMessage, ChatRequest, GlossaryTerm, LlmError,
-    PerceptoreOutput, Usage, CORRECTION_PROMPT,
+    build_messages, build_request, build_translate_only_messages, build_translate_only_request,
+    calibrate_chars_per_token, complete_with_fallback, est_tokens, needs_compression,
+    parse_translation, ChatClient, ChatMessage, ChatRequest, GlossaryTerm, LlmError,
+    PerceptoreOutput, Usage, DEFAULT_CHARS_PER_TOKEN, CORRECTION_PROMPT,
 };
 use crate::{documents, settings};
 use rusqlite::{params, Connection, OptionalExtension};
 
-/// Above this many characters a page is split into chunks (EC04): each chunk is
-/// translated in its own call, keeping every call well inside the model context
-/// budget, then the translated pieces are recomposed.
-pub const CHUNK_CHAR_THRESHOLD: usize = 8000;
+// --- Modello di budget token (STC-01/STC-08) ---------------------------------
+
+/// Tetto di output **per-unità** (token) sulle chiamate translate-only del
+/// percorso a budget stretto (STC-01/D5). Piccolo di proposito e molto minore del
+/// `max_tokens` per-pagina (che resta per la sola chiamata percettore): tradurre
+/// un paragrafo produce poco output, quindi ~768 basta, libera budget di input e
+/// riduce il rischio EC08 sui modelli locali. È anche la riserva di output nella
+/// formula del budget. NB: quando la pagina è UNA sola unità (degradazione cloud
+/// o pagina corta) si usa invece il `max_tokens` di pagina, così una pagina
+/// intera non viene troncata — vedi [`translate_page`].
+pub const OUT_UNIT_TOKENS: u32 = 768;
+
+/// Margine (frazione) che assorbe l'imprecisione dell'euristica `chars/token` nel
+/// dimensionamento del budget (STC-01, ~15%).
+const BUDGET_MARGIN: f64 = 0.15;
+
+/// Cap sui termini **unlocked** selezionati per unità (D4: word-boundary +
+/// morfologia, cap unlocked 10-20, locked uncapped).
+const UNLOCKED_GLOSSARY_CAP: usize = 16;
+
+/// Riserva di token per la porzione **unlocked** del glossario selezionato nella
+/// formula del budget (stima; i locked sono stimati a parte perché sempre inclusi
+/// in ogni prompt di unità).
+const GLOSSARY_UNLOCKED_RESERVE_TOKENS: u32 = 256;
+
+/// Dimensione minima (token) di un'unità di traduzione: evita che una formula di
+/// budget molto stretta produca un limite assurdo/degenere.
+const MIN_BUDGET_UNIT_TEXT: u32 = 256;
+
+/// Fattore prudente token-output per token-input di una unità: una traduzione può
+/// espandersi (es. EN→IT), quindi il tetto di output per unità sul percorso a
+/// budget cresce fino a ~2× l'input, mai sotto [`OUT_UNIT_TOKENS`]. Così un
+/// paragrafo grande (tipico sul cloud, dove l'headroom è ampio) non viene
+/// troncato, mentre i paragrafi piccoli restano a `out_unit`.
+const OUTPUT_TOKENS_PER_INPUT: u32 = 2;
+
+/// Cuscinetto di sicurezza (token) sottratto dalla finestra nel calcolo
+/// dell'headroom di output per unità, così `prompt + output ≤ n_ctx` (guardia EC08).
+const OUTPUT_HEADROOM_SAFETY_TOKENS: u32 = 64;
+
+/// Calcola `budget_unit_text` (token), la dimensione massima di un'unità di
+/// traduzione (STC-01). `budget_input = floor((n_ctx − out_unit) × (1 − margine))`,
+/// da cui si sottraggono le stime di system minimale, riassunto compatto e
+/// glossario selezionato. Con `n_ctx` grande (cloud) il risultato è enorme → una
+/// sola unità = pagina intera (degradazione D2). Non scende mai sotto
+/// [`MIN_BUDGET_UNIT_TEXT`]. Funzione pura, unit-testabile senza rete/DB.
+fn compute_budget_unit_text(
+    n_ctx: u32,
+    out_unit: u32,
+    system_est: u32,
+    summary_est: u32,
+    glossary_est: u32,
+    margin: f64,
+) -> u32 {
+    let after_out = n_ctx.saturating_sub(out_unit) as f64;
+    let budget_input = (after_out * (1.0 - margin)).floor().max(0.0) as u32;
+    budget_input
+        .saturating_sub(system_est)
+        .saturating_sub(summary_est)
+        .saturating_sub(glossary_est)
+        .max(MIN_BUDGET_UNIT_TEXT)
+}
+
+/// Separa un'unità nel corpo (senza spazi di coda) e nel separatore finale (gli
+/// spazi/newline di coda prodotti da [`split_into_units`]). Ricomponendo
+/// `corpo_tradotto + separatore` si preservano i confini di paragrafo nel
+/// riassemblaggio: il `concat` delle unità tradotte riproduce la struttura della
+/// pagina.
+fn split_unit_body_sep(unit: &str) -> (&str, &str) {
+    let body = unit.trim_end();
+    (body, &unit[body.len()..])
+}
 
 /// Inputs for a single page translation.
 pub struct TranslateParams<'a> {
@@ -42,6 +111,12 @@ pub struct TranslateParams<'a> {
     /// small `n_ctx` (default 2048); cloud keeps a generous value (4096) so long
     /// pages are not truncated. Never the whole context window.
     pub max_tokens: u32,
+    /// Context window (`n_ctx`) of the active provider (STC-07). Drives the
+    /// budget model (STC-08): a small `n_ctx` (local ~4096) yields several small
+    /// units with a selective glossary; a large `n_ctx` (cloud) makes the budget
+    /// non-binding so the page becomes a single unit (degrade to the previous
+    /// whole-page behaviour, D2).
+    pub n_ctx: u32,
     /// Whether this translation should advance the percettore context (ticket
     /// 09): `true` on real navigation — persists the rolling summary and inserts
     /// glossary terms; `false` on **prefetch** (ticket 12) — caches only the
@@ -65,43 +140,12 @@ pub struct TranslationResult {
     pub updated_summary: Option<String>,
 }
 
-/// Split `text` into chunks of at most `max_chars` characters, preferring to
-/// break at whitespace so words are not cut mid-way. Concatenating the chunks
-/// in order reproduces `text` exactly (no content lost, EC04). Text at or below
-/// the limit yields a single chunk.
-pub fn split_into_chunks(text: &str, max_chars: usize) -> Vec<String> {
-    let chars: Vec<char> = text.chars().collect();
-    if max_chars == 0 || chars.len() <= max_chars {
-        return vec![text.to_string()];
-    }
-
-    let mut chunks = Vec::new();
-    let mut start = 0usize;
-    while start < chars.len() {
-        let hard_end = (start + max_chars).min(chars.len());
-        let mut end = hard_end;
-        if hard_end < chars.len() {
-            // Break after the last whitespace in the window, if any past the start.
-            if let Some(pos) = chars[start..hard_end].iter().rposition(|c| c.is_whitespace()) {
-                if pos > 0 {
-                    end = start + pos + 1;
-                }
-            }
-        }
-        chunks.push(chars[start..end].iter().collect::<String>());
-        start = end;
-    }
-    chunks
-}
-
-// --- PROTOTYPE (Ticket 02, small-context-translation) ------------------------
+// --- Split a unità (STC-02, cablato nel flusso da STC-08) --------------------
 //
-// Splitting a page into *paragraph-level* translation units within a token
-// budget (`budget_unit_text` del Ticket 01). Riusa `est_tokens` per il
-// dimensionamento e la ricostruzione a righe di `src/lib/pdfExtract.ts`.
-// NB: PROTOTIPO — funzione pura, NON agganciata a `translate_page`;
-// l'integrazione è un ticket di build successivo. `split_into_chunks` resta
-// invariato.
+// Divide una pagina in unità di traduzione a livello di paragrafo entro un budget
+// di token (`budget_unit_text` di STC-01). Riusa `est_tokens` per il
+// dimensionamento e la ricostruzione a righe di `src/lib/pdfExtract.ts`. È il
+// sostituto del vecchio split a soglia-char nel flusso di `translate_page`.
 
 /// Split a page's reconstructed text into **paragraph-level units**, each within
 /// `budget_tokens` (il `budget_unit_text` del Ticket 01). Sizing riusa
@@ -121,10 +165,10 @@ pub fn split_into_chunks(text: &str, max_chars: usize) -> Vec<String> {
 /// paragrafo e vengono impacchettate; una singola frase più grande del budget
 /// resta un "atomo" non divisibile (unica eccezione al vincolo di budget).
 ///
-/// NB: PROTOTIPO — funzione pura, NON agganciata a `translate_page`. Finché
-/// l'integrazione (ticket di build) non la richiama nel flusso live, è usata
-/// solo dai test: `allow(dead_code)` evita il warning in questa fase.
-#[allow(dead_code)]
+/// Cablata nel flusso live da STC-08 (`translate_page`): sostituisce lo split a
+/// soglia-char (`split_into_chunks`) come unità di traduzione del percorso a
+/// budget. Con un budget ampio (cloud) restituisce una sola unità = pagina intera
+/// (degradazione D2).
 pub fn split_into_units(text: &str, budget_tokens: u32, ratio: f64) -> Vec<String> {
     // Pagina vuota / solo spazi: una sola unità che riproduce l'input.
     if text.trim().is_empty() {
@@ -155,7 +199,6 @@ pub fn split_into_units(text: &str, budget_tokens: u32, ratio: f64) -> Vec<Strin
 /// riga vuota (run di spazi con ≥2 `\n`). La concatenazione di tutti i
 /// `corpo + separatore` riproduce esattamente `text`. Whitespace non separatore
 /// (a capo singolo, spazi) resta dentro il corpo.
-#[allow(dead_code)]
 fn split_paragraphs(text: &str) -> Vec<(String, String)> {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len();
@@ -196,7 +239,6 @@ fn split_paragraphs(text: &str) -> Vec<(String, String)> {
 /// Impacchetta le frasi di `body` in unità entro `budget` token, riusando
 /// [`est_tokens`]. Una singola frase più grande del budget resta un'unità a sé
 /// (atomo non divisibile). `pack_sentences(b, ...).concat() == b`.
-#[allow(dead_code)]
 fn pack_sentences(body: &str, budget: u32, ratio: f64) -> Vec<String> {
     let mut units: Vec<String> = Vec::new();
     let mut cur = String::new();
@@ -221,7 +263,6 @@ fn pack_sentences(body: &str, budget: u32, ratio: f64) -> Vec<String> {
 /// fine testo, oppure un `\n` (righe/liste; `pdfExtract` unisce le righe a capo
 /// con `\n`). Gli spazi di coda sono assorbiti nella frase precedente così il
 /// confine non va perso.
-#[allow(dead_code)]
 fn split_sentences(text: &str) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len();
@@ -359,21 +400,62 @@ fn complete_and_parse(
     }
 }
 
+/// Call the client for a **translate-only** unit (STC-08, D5) and extract the
+/// translated text with the minimal, robust contract ([`parse_translation`]:
+/// tiny JSON `{translated_text}` or plain text). Keeps the model-agnostic
+/// param-relaxation fallback ([`complete_with_fallback`]) and surfaces EC08
+/// (`OutputBudgetExhausted`, via [`crate::llm::ChatResponse::content`]) and any
+/// other transport error unchanged. Returns the translation, the provider
+/// `usage` when reported, and the **working request body** that succeeded so
+/// later units of the same page start already-degraded (no repeated re-probe).
+///
+/// Unlike the percettore call there is **no** JSON-correction retry: the
+/// translate-only contract always parses (plain-text fallback), so a malformed
+/// answer becomes the literal translation rather than triggering a second call.
+fn complete_and_parse_translation(
+    client: &dyn ChatClient,
+    req: ChatRequest,
+) -> Result<(String, Option<Usage>, ChatRequest), LlmError> {
+    let (resp, working) = complete_with_fallback(client, &req)?;
+    // EC08 / empty content surfaces here before we ever try to parse.
+    let content = resp.content()?.to_string();
+    let usage = resp.usage.clone();
+    Ok((parse_translation(&content), usage, working))
+}
+
 /// Map a storage error into [`LlmError::Storage`].
 fn storage<E: std::fmt::Display>(e: E) -> LlmError {
     LlmError::Storage(e.to_string())
 }
 
-/// Translate a page with the full percettore (SPECIFICATION §3.3/§4.4, UC02).
+/// Translate a page with the **budget-aware multi-call pipeline** (STC-08,
+/// SPECIFICATION §3.2/§3.3/§4.4, UC02; decisions D1-D6).
 ///
 /// Flow: a cache hit returns the stored `translated_text` immediately and does
 /// **not** re-run the percettore (no summary/glossary rewrite for cached pages).
-/// On a miss the current `rolling_summary` and glossary (locked = absolute
-/// constraint, unlocked = suggestions) are loaded and fed to the model; the page
-/// is chunked when it exceeds [`CHUNK_CHAR_THRESHOLD`] (EC04) and each chunk is
-/// translated in sequence carrying the running summary forward. Afterwards the
-/// recomposed translation is cached, `sessions.rolling_summary` is updated once
-/// and the new glossary terms are inserted deduped (locked terms untouched).
+/// On a miss:
+/// 1. the current `rolling_summary` and glossary are loaded (read-only for the
+///    whole page, D6);
+/// 2. `budget_unit_text` is derived from the provider `n_ctx` and the per-unit
+///    output cap [`OUT_UNIT_TOKENS`] (STC-01) and the page is split into units
+///    with [`split_into_units`] (paragraph, sentence fallback; STC-02). A large
+///    `n_ctx` (cloud) makes the budget non-binding → **one unit = whole page**
+///    (degrade to the previous behaviour, D2);
+/// 3. each unit is translated with a **minimal translate-only call** — a tiny
+///    system prompt, the compact read-only summary and only the glossary
+///    **selected** for that unit ([`glossary::select_glossary`], locked-first,
+///    STC-03), requested with a small `max_tokens` (D5). The degrade ladder and
+///    EC08 handling stay in force per unit;
+/// 4. the translated units are reassembled **in order** (separators preserved);
+/// 5. only on real navigation (`update_context`), a single **perceptor-update**
+///    call per page (D6) reuses the existing rich per-page contract/prompt to
+///    produce the updated summary (EC05 compression) and the new glossary terms.
+///
+/// Afterwards the recomposed translation is cached (page-level, as before;
+/// per-unit cache is STC-09), `sessions.rolling_summary` is updated once and the
+/// new glossary terms are inserted deduped (locked terms untouched). On prefetch
+/// (`update_context == false`) the percettore step is skipped entirely (ticket
+/// 12): the page translation is cached and nothing else.
 pub fn translate_page(
     conn: &Connection,
     client: &dyn ChatClient,
@@ -397,57 +479,107 @@ pub fn translate_page(
         }
     }
 
-    // Load the percettore context (EC03 surfaces later, on the first call).
-    let summary_limit =
-        settings::get_summary_token_limit(conn).map_err(storage)?;
+    // Load the percettore context ONCE for the whole page (D6: the same summary
+    // version is passed read-only to every unit; it is advanced afterwards, once).
+    let summary_limit = settings::get_summary_token_limit(conn).map_err(storage)?;
     let mut rolling_summary = documents::get_rolling_summary(conn, p.document_id).map_err(storage)?;
     let entries = glossary::list_glossary(conn, p.document_id).map_err(storage)?;
-    let (locked, unlocked) = glossary::render_locked_unlocked(&entries);
+    // The full glossary blocks — used ONLY by the per-page perceptor call below
+    // (`render_locked_unlocked`); the per-unit translate calls use the SELECTED
+    // subset instead (STC-03).
+    let (locked_all, unlocked_all) = glossary::render_locked_unlocked(&entries);
 
-    // Chunk the page (EC04); one chunk when it fits.
-    let chunks = split_into_chunks(p.page_text, CHUNK_CHAR_THRESHOLD);
+    // --- Budget model (STC-01): size the translation units from n_ctx --------
+    // Ratio: the stable default heuristic (calibration is persisted for telemetry
+    // only), so the budget is deterministic and unit-testable. The ~15% margin
+    // absorbs the chars/token approximation.
+    let ratio = DEFAULT_CHARS_PER_TOKEN;
+    let out_unit = OUT_UNIT_TOKENS;
+    let system_est = est_tokens(&crate::llm::build_translate_only_system_prompt(), ratio);
+    let summary_est = est_tokens(&rolling_summary, ratio);
+    // Glossary reservation: the locked block is ALWAYS included in every unit
+    // prompt (estimated exactly), plus a fixed allowance for the capped unlocked
+    // selection (D4). Over-reserving only makes units smaller (safer), never
+    // larger than the context allows.
+    let glossary_est = est_tokens(&locked_all, ratio) + GLOSSARY_UNLOCKED_RESERVE_TOKENS;
+    let budget_unit_text =
+        compute_budget_unit_text(p.n_ctx, out_unit, system_est, summary_est, glossary_est, BUDGET_MARGIN);
 
-    let mut translated_parts: Vec<String> = Vec::with_capacity(chunks.len());
-    let mut new_terms: Vec<GlossaryTerm> = Vec::new();
+    // Split the page into budget-sized units (STC-02). `split_into_units` always
+    // splits blank-line paragraphs into separate units; the budget only forces
+    // further sentence-splitting of an oversized paragraph. With a single-
+    // paragraph page and a large n_ctx (cloud) this yields ONE unit = whole page
+    // → the previous whole-page behaviour (degrade, D2).
+    let units = split_into_units(p.page_text, budget_unit_text, ratio);
+
+    let mut translated_units: Vec<String> = Vec::with_capacity(units.len());
     let mut total_tokens_sum: i64 = 0;
     let mut saw_usage = false;
     let mut prompt_chars_sum: usize = 0;
     let mut prompt_tokens_sum: i64 = 0;
     // The request shape discovered to work for this page: once the fallback
-    // strips a param a model rejects, later chunks start already-degraded so
-    // they don't each pay the same failed 404 (bug #1 follow-up). `None` until
-    // the first chunk returns its working body.
+    // strips a param a model rejects, later units start already-degraded so they
+    // don't each pay the same failed 404 (bug #1 follow-up). `None` until the
+    // first unit returns its working body.
     let mut working_shape: Option<ChatRequest> = None;
 
-    for chunk in &chunks {
-        // Recompression is requested when the running summary is over the
-        // threshold (EC05); after the model compresses it, later chunks won't.
-        let compress = needs_compression(&rolling_summary, summary_limit);
-        let messages = build_messages(
+    for unit in &units {
+        // Preserve the paragraph separator across translation: translate the body
+        // and re-append the trailing separator so the reassembly keeps structure.
+        let (body, sep) = split_unit_body_sep(unit);
+        if body.trim().is_empty() {
+            // A whitespace-only unit (e.g. a blank page): no model call, keep it
+            // verbatim so the round-trip holds.
+            translated_units.push(unit.clone());
+            continue;
+        }
+
+        // Only the glossary SELECTED for this unit (D4/STC-03, locked-first): the
+        // whole glossary never reaches these prompts (≈98% fewer tokens).
+        let selected = glossary::select_glossary(body, &entries, Some(UNLOCKED_GLOSSARY_CAP));
+        let (locked, unlocked) = glossary::render_locked_unlocked(&selected);
+
+        let messages = build_translate_only_messages(
             p.target_language,
-            chunk,
+            body,
             &rolling_summary,
             &locked,
             &unlocked,
-            compress,
-            summary_limit,
         );
         prompt_chars_sum += messages.iter().map(|m| m.content.chars().count()).sum::<usize>();
 
-        let mut req = build_request(p.model, messages, p.max_tokens);
-        // Reuse the optional-param shape discovered on a previous chunk so we
-        // don't re-probe a param the model already rejected this page.
+        // Per-unit output cap. A SINGLE unit (cloud degrade / short page) keeps the
+        // page `max_tokens` for exact equivalence with the previous whole-page flow
+        // (D2, no cloud regression). On the multi-unit path the cap defaults to the
+        // small `out_unit`, grows for a large unit (translation may expand, e.g.
+        // EN→IT), and is always bounded by the remaining context window so
+        // `prompt + output ≤ n_ctx` (EC08 guard) — a large paragraph on cloud is
+        // NOT truncated (huge headroom), while local units stay small.
+        let per_unit_max_tokens = if units.len() == 1 {
+            p.max_tokens
+        } else {
+            let prompt_est: u32 = messages.iter().map(|m| est_tokens(&m.content, ratio)).sum();
+            let body_tokens = est_tokens(body, ratio);
+            let scaled = body_tokens.saturating_mul(OUTPUT_TOKENS_PER_INPUT).max(out_unit);
+            let headroom = p
+                .n_ctx
+                .saturating_sub(prompt_est.saturating_add(OUTPUT_HEADROOM_SAFETY_TOKENS))
+                .max(out_unit);
+            scaled.min(p.max_tokens).min(headroom)
+        };
+
+        let mut req = build_translate_only_request(p.model, messages, per_unit_max_tokens);
+        // Reuse the optional-param shape discovered on a previous unit so we don't
+        // re-probe a param the model already rejected this page.
         if let Some(shape) = &working_shape {
             req.temperature = shape.temperature;
             req.response_format = shape.response_format.clone();
             req.provider = shape.provider.clone();
         }
-        let (output, usage, working) = complete_and_parse(client, req)?;
+        let (translated, usage, working) = complete_and_parse_translation(client, req)?;
         working_shape = Some(working);
 
-        translated_parts.push(output.translated_text);
-        rolling_summary = output.updated_summary; // carry continuity to next chunk
-        new_terms.extend(output.new_glossary_terms);
+        translated_units.push(format!("{translated}{sep}"));
 
         if let Some(u) = usage {
             saw_usage = true;
@@ -456,12 +588,46 @@ pub fn translate_page(
         }
     }
 
-    let translated_text = translated_parts.join("\n\n");
+    // Reassemble the translated units in order (separators are carried on each
+    // unit, so `concat` reproduces the page structure).
+    let translated_text = translated_units.concat();
 
-    // Persist. The cache is written either way. The percettore context (summary
-    // + glossary) is advanced ONLY on real navigation (`update_context`): a
-    // prefetch of a later page must not mutate the running context out of order
-    // (ticket 12) — it warms the cache and nothing else.
+    // --- Perceptor-update: ONCE per page, real navigation only (D5/D6) -------
+    // Reuse the existing rich per-page contract/prompt to derive the updated
+    // summary (EC05 compression) and the new glossary terms. Skipped entirely on
+    // prefetch (ticket 12), exactly as before.
+    let mut new_terms: Vec<GlossaryTerm> = Vec::new();
+    if p.update_context {
+        let compress = needs_compression(&rolling_summary, summary_limit);
+        let messages = build_messages(
+            p.target_language,
+            p.page_text,
+            &rolling_summary,
+            &locked_all,
+            &unlocked_all,
+            compress,
+            summary_limit,
+        );
+        prompt_chars_sum += messages.iter().map(|m| m.content.chars().count()).sum::<usize>();
+
+        let req = build_request(p.model, messages, p.max_tokens);
+        let (output, usage, _working) = complete_and_parse(client, req)?;
+        // We only take the summary + glossary from the percettore; its own
+        // `translated_text` is ignored (the page translation came from the units).
+        rolling_summary = output.updated_summary;
+        new_terms = output.new_glossary_terms;
+
+        if let Some(u) = usage {
+            saw_usage = true;
+            total_tokens_sum += u.total_tokens;
+            prompt_tokens_sum += u.prompt_tokens;
+        }
+    }
+
+    // Persist. The cache is written either way (page-level, as before). The
+    // percettore context (summary + glossary) is advanced ONLY on real
+    // navigation: a prefetch must not mutate the running context out of order
+    // (ticket 12).
     cache_insert(conn, p, &translated_text)?;
     if p.update_context {
         documents::set_rolling_summary(conn, p.document_id, &rolling_summary).map_err(storage)?;
@@ -469,7 +635,8 @@ pub fn translate_page(
             .map_err(storage)?;
 
         // Calibrate the chars/token ratio from real usage (research §3) — stored
-        // for cost telemetry; `needs_compression` keeps the stable default ratio.
+        // for cost telemetry; the budget/`needs_compression` keep the stable
+        // default ratio.
         if let Some(ratio) = calibrate_chars_per_token(prompt_chars_sum, prompt_tokens_sum) {
             let _ =
                 settings::set_setting(conn, settings::CHARS_PER_TOKEN_KEY, &format!("{ratio:.4}"));
@@ -480,11 +647,11 @@ pub fn translate_page(
     if let Some(tokens) = total_tokens {
         // Cost telemetry (NFR04): logged rather than a schema column for the MVP.
         eprintln!(
-            "[usage] document_id={} page={} lang={} chunks={} prefetch={} total_tokens={}",
+            "[usage] document_id={} page={} lang={} units={} prefetch={} total_tokens={}",
             p.document_id,
             p.page_number,
             p.target_language,
-            chunks.len(),
+            units.len(),
             !p.update_context,
             tokens
         );
@@ -611,6 +778,10 @@ mod tests {
         crate::documents::open_or_create_session(c, 1).unwrap();
     }
 
+    /// Default params: a large `n_ctx` (cloud) so a single-paragraph page is ONE
+    /// unit — the budget-aware pipeline degrades to the previous whole-page flow
+    /// (D2). Most legacy tests use short single-paragraph pages → 1 translate
+    /// call + 1 perceptor call on real navigation.
     fn params<'a>(text: &'a str) -> TranslateParams<'a> {
         TranslateParams {
             document_id: 1,
@@ -619,17 +790,54 @@ mod tests {
             page_text: text,
             model: "openai/gpt-4o",
             max_tokens: 4096,
+            n_ctx: 128_000,
             update_context: true,
         }
     }
 
-    // --- Ticket 02: the provider's max_tokens reaches the request ------------
+    /// Params emulating a small local context (`n_ctx = 4096`): the budget binds,
+    /// so a multi-paragraph page splits into several translate-only units.
+    fn params_small(text: &str) -> TranslateParams<'_> {
+        TranslateParams {
+            document_id: 1,
+            page_number: 3,
+            target_language: "it",
+            page_text: text,
+            model: "local-model",
+            max_tokens: 2048,
+            n_ctx: 4096,
+            update_context: true,
+        }
+    }
+
+    /// A two-paragraph page (blank-line separated) → two units under any budget.
+    /// Each paragraph mentions a different glossary term so per-unit selection is
+    /// observable.
+    fn two_paragraphs() -> &'static str {
+        "The board met today.\n\nEvery shareholder was paid."
+    }
+
+    /// A response with empty content and `finish_reason == "length"` — the EC08
+    /// output-budget-exhausted case (a reasoning model that burned its budget).
+    fn resp_length() -> ChatResponse {
+        serde_json::from_value(serde_json::json!({
+            "choices": [{ "message": { "role": "assistant", "content": null }, "finish_reason": "length" }],
+            "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 }
+        }))
+        .unwrap()
+    }
+
+    // --- Ticket 02 / STC-08: the provider's max_tokens reaches the request ----
 
     #[test]
     fn translate_page_threads_the_provider_max_tokens_into_the_request() {
         let c = conn();
         seed_session(&c);
-        let client = MockClient::new(vec![Ok(resp(&valid_content(), 400))]);
+        // Single-paragraph page + large n_ctx → 1 translate unit + 1 perceptor.
+        let client = MockClient::new(vec![
+            Ok(resp("Ciao", 100)),               // translate-only unit
+            Ok(resp(&valid_content(), 400)),     // perceptor-update
+        ]);
         let p = TranslateParams {
             document_id: 1,
             page_number: 3,
@@ -637,11 +845,15 @@ mod tests {
             page_text: "Hello",
             model: "local-model",
             max_tokens: 2048, // a local provider reserving output headroom
+            n_ctx: 128_000,
             update_context: true,
         };
         translate_page(&c, &client, &p).unwrap();
         let sent = client.requests.borrow();
-        assert_eq!(sent[0].max_tokens, 2048, "the request carries the provider's max_tokens");
+        // Single unit (degrade) keeps the page max_tokens; the perceptor call
+        // always uses the page max_tokens.
+        assert_eq!(sent[0].max_tokens, 2048, "unit request carries the provider's max_tokens");
+        assert_eq!(sent[1].max_tokens, 2048, "perceptor request carries the provider's max_tokens");
     }
 
     // --- Cache hit -----------------------------------------------------------
@@ -681,13 +893,16 @@ mod tests {
         )
         .unwrap();
 
-        let client = MockClient::new(vec![Ok(resp(&valid_content(), 400))]);
+        let client = MockClient::new(vec![
+            Ok(resp("Ciao mondo", 200)),       // translate-only unit
+            Ok(resp(&valid_content(), 400)),   // perceptor-update
+        ]);
         // Request page 3 with its REAL text — source_text differs from the row.
         let out = translate_page(&c, &client, &params("Hello")).unwrap();
 
         assert!(!out.from_cache, "mismatched source_text must be a miss");
         assert_eq!(out.translated_text, "Ciao mondo", "re-translated, not the poisoned value");
-        assert_eq!(client.calls(), 1, "the model is called on a source mismatch");
+        assert_eq!(client.calls(), 2, "the model is called (unit + perceptor) on a source mismatch");
 
         // The poisoned row was OVERWRITTEN with the correct source + translation.
         let (stored, src): (String, String) = c
@@ -728,10 +943,10 @@ mod tests {
         )
         .unwrap();
 
-        let client = MockClient::new(vec![Ok(resp(
-            &content_with("Traduzione pagina 10", "s", &[]),
-            500,
-        ))]);
+        let client = MockClient::new(vec![
+            Ok(resp("Traduzione pagina 10", 300)),          // translate-only unit
+            Ok(resp(&content_with("ignored", "s", &[]), 200)), // perceptor-update
+        ]);
         let p = TranslateParams {
             document_id: 1,
             page_number: 10,
@@ -739,6 +954,7 @@ mod tests {
             page_text: "page 10 text",
             model: "openai/gpt-4o",
             max_tokens: 4096,
+            n_ctx: 128_000,
             update_context: true,
         };
 
@@ -747,13 +963,13 @@ mod tests {
         assert_ne!(out.translated_text, "Ignoranza", "must NOT serve the page-9 translation");
         assert_eq!(out.translated_text, "Traduzione pagina 10");
         assert!(!out.from_cache, "the mismatched row is not served as a cache hit");
-        assert_eq!(client.calls(), 1, "the page is re-translated");
+        assert_eq!(client.calls(), 2, "the page is re-translated (unit + perceptor)");
 
         // A subsequent visit with the SAME correct text is now a legitimate hit.
         let out2 = translate_page(&c, &client, &p).unwrap();
         assert!(out2.from_cache, "healed row is served on the next matching visit");
         assert_eq!(out2.translated_text, "Traduzione pagina 10");
-        assert_eq!(client.calls(), 1, "no extra model call once healed");
+        assert_eq!(client.calls(), 2, "no extra model call once healed");
     }
 
     // --- Cache miss ----------------------------------------------------------
@@ -761,14 +977,17 @@ mod tests {
     #[test]
     fn cache_miss_calls_client_saves_and_records_tokens() {
         let c = conn();
-        let client = MockClient::new(vec![Ok(resp(&valid_content(), 1801))]);
+        let client = MockClient::new(vec![
+            Ok(resp("Ciao mondo", 1000)),    // translate-only unit
+            Ok(resp(&valid_content(), 801)), // perceptor-update
+        ]);
 
         let out = translate_page(&c, &client, &params("Hello")).unwrap();
 
         assert_eq!(out.translated_text, "Ciao mondo");
         assert!(!out.from_cache);
-        assert_eq!(out.total_tokens, Some(1801), "usage.total_tokens recorded");
-        assert_eq!(client.calls(), 1);
+        assert_eq!(out.total_tokens, Some(1801), "usage.total_tokens summed across unit + perceptor");
+        assert_eq!(client.calls(), 2);
 
         // Persisted with the UNIQUE key and source text.
         let (stored, src): (String, String) = c
@@ -786,7 +1005,10 @@ mod tests {
     #[test]
     fn second_visit_reads_from_cache_no_second_call() {
         let c = conn();
-        let client = MockClient::new(vec![Ok(resp(&valid_content(), 500))]);
+        let client = MockClient::new(vec![
+            Ok(resp("Ciao mondo", 250)),     // translate-only unit
+            Ok(resp(&valid_content(), 250)), // perceptor-update
+        ]);
 
         let first = translate_page(&c, &client, &params("Hello")).unwrap();
         assert!(!first.from_cache);
@@ -794,38 +1016,46 @@ mod tests {
         let second = translate_page(&c, &client, &params("Hello")).unwrap();
         assert!(second.from_cache);
         assert_eq!(second.translated_text, "Ciao mondo");
-        assert_eq!(client.calls(), 1, "no second model call for a cached page");
+        assert_eq!(client.calls(), 2, "no extra model calls for a cached page");
     }
 
     // --- Layered parsing through the service --------------------------------
 
+    /// The JSON-correction retry lives on the PERCEPTOR call (the translate-only
+    /// contract needs no correction: plain text always parses). A malformed
+    /// perceptor answer followed by a valid one succeeds after one retry.
     #[test]
-    fn malformed_then_valid_succeeds_after_one_correction_retry() {
+    fn perceptor_malformed_then_valid_succeeds_after_one_correction_retry() {
         let c = conn();
+        seed_session(&c);
         let client = MockClient::new(vec![
-            Ok(resp("sorry, here is the translation…", 100)),
-            Ok(resp(&format!("```json\n{}\n```", valid_content()), 120)),
+            Ok(resp("Ciao mondo", 100)),                                  // translate-only unit
+            Ok(resp("sorry, here is the summary…", 100)),                 // perceptor malformed
+            Ok(resp(&format!("```json\n{}\n```", valid_content()), 120)), // perceptor correction
         ]);
 
         let out = translate_page(&c, &client, &params("Hello")).unwrap();
-        assert_eq!(out.translated_text, "Ciao mondo");
-        assert_eq!(out.total_tokens, Some(120));
-        assert_eq!(client.calls(), 2, "exactly one correction retry");
+        assert_eq!(out.translated_text, "Ciao mondo", "translation from the unit call");
+        assert_eq!(out.updated_summary.as_deref(), Some("riassunto"), "summary from the corrected perceptor");
+        assert_eq!(client.calls(), 3, "unit + perceptor malformed + one correction retry");
     }
 
     #[test]
-    fn malformed_twice_yields_parse_failed_error() {
+    fn perceptor_malformed_twice_yields_parse_failed_error() {
         let c = conn();
+        seed_session(&c);
         let client = MockClient::new(vec![
-            Ok(resp("not json", 10)),
-            Ok(resp("still not json", 10)),
+            Ok(resp("Ciao mondo", 10)), // translate-only unit (succeeds)
+            Ok(resp("not json", 10)),   // perceptor malformed
+            Ok(resp("still not json", 10)), // perceptor correction still malformed
         ]);
 
         let err = translate_page(&c, &client, &params("Hello")).unwrap_err();
         assert!(matches!(err, LlmError::ParseFailed(_)));
-        assert_eq!(client.calls(), 2, "only one retry, then give up");
+        assert_eq!(client.calls(), 3, "unit + perceptor + one retry, then give up");
 
-        // Nothing cached on failure.
+        // Nothing cached: the page is atomic — a perceptor failure discards the
+        // (otherwise successful) translation so the page re-translates cleanly.
         let count: i64 = c
             .query_row("SELECT COUNT(*) FROM translations_cache", [], |r| r.get(0))
             .unwrap();
@@ -834,31 +1064,34 @@ mod tests {
 
     // --- Bug #1: model-agnostic 404 fallback through the service ------------
 
-    /// A 404 "No endpoints found" on the full body must trigger one downgraded
-    /// retry (research §2) that succeeds — the page still translates.
+    /// A 404 "No endpoints found" on the PERCEPTOR body (which sends the rich
+    /// response_format) must trigger one downgraded retry (research §2) that
+    /// succeeds. The translate-only unit call already succeeded before it.
     #[test]
     fn unsupported_params_404_recovers_via_downgraded_retry() {
         let c = conn();
         seed_session(&c);
         let client = MockClient::new(vec![
+            Ok(resp("Ciao mondo", 100)), // translate-only unit (plain text)
             Err(LlmError::UnsupportedParams(
                 "404 Not Found: {\"error\":{\"message\":\"No endpoints found that can handle \
                  the requested parameters.\",\"code\":404}}"
                     .into(),
             )),
-            Ok(resp(&valid_content(), 321)),
+            Ok(resp(&valid_content(), 321)), // perceptor downgraded retry succeeds
         ]);
 
         let out = translate_page(&c, &client, &params("Hello")).unwrap();
-        assert_eq!(out.translated_text, "Ciao mondo");
-        assert_eq!(out.total_tokens, Some(321));
-        assert_eq!(client.calls(), 2, "full body 404 then a downgraded retry that succeeds");
+        assert_eq!(out.translated_text, "Ciao mondo", "translation from the unit call");
+        assert_eq!(out.updated_summary.as_deref(), Some("riassunto"));
+        assert_eq!(client.calls(), 3, "unit + perceptor 404 + downgraded perceptor retry");
 
-        // The downgraded retry dropped `provider` first (it was already None in
-        // the default body) then `response_format`.
         let reqs = client.requests.borrow();
-        assert!(reqs[0].response_format.is_some(), "first attempt sent response_format");
-        assert!(reqs[1].response_format.is_none(), "retry stripped response_format");
+        // The translate-only unit call never sends the rich response_format (D5).
+        assert!(reqs[0].response_format.is_none(), "translate-only sends no response_format");
+        // The perceptor's first attempt sent response_format; the retry stripped it.
+        assert!(reqs[1].response_format.is_some(), "perceptor first attempt sent response_format");
+        assert!(reqs[2].response_format.is_none(), "perceptor retry stripped response_format");
     }
 
     /// A non-degradable 404 (e.g. genuinely missing model) is surfaced, not
@@ -874,68 +1107,76 @@ mod tests {
         assert_eq!(client.calls(), 1, "no param-relaxation retry for a plain HTTP 404");
     }
 
-    /// After the fallback degrades the body on the first chunk, later chunks of
-    /// the SAME page must start already-degraded — no repeated 404 re-probe
-    /// (finding 2b). With the fix the second chunk succeeds in one call.
+    /// After the fallback degrades the body on the first unit, later units of the
+    /// SAME page must start already-degraded — no repeated re-probe (finding 2b).
+    /// Translate-only requests send no response_format, so the strippable param
+    /// here is `temperature`; the second unit then succeeds in one call.
     #[test]
-    fn degraded_shape_is_reused_by_later_chunks_no_reprobe() {
+    fn degraded_shape_is_reused_by_later_units_no_reprobe() {
         let c = conn();
         seed_session(&c);
-        // ~12000 chars -> exactly two chunks at the 8000 threshold.
-        let big = "lorem ipsum ".repeat(1000);
-        assert_eq!(split_into_chunks(&big, CHUNK_CHAR_THRESHOLD).len(), 2, "precondition: two chunks");
+        // Two paragraphs + small n_ctx -> two translate-only units.
+        let page = two_paragraphs();
+        assert!(
+            split_into_units(page, 4096, RATIO).len() >= 2,
+            "precondition: multiple units"
+        );
 
         let client = MockClient::new(vec![
-            // chunk 1: full body 404, then a downgraded retry succeeds.
+            // unit 1: full body rejected, then a downgraded retry succeeds.
             Err(LlmError::UnsupportedParams("no endpoints found".into())),
-            Ok(resp(&content_with("PART0", "s0", &[]), 10)),
-            // chunk 2: must already be degraded -> ONE successful call, no 404.
-            Ok(resp(&content_with("PART1", "s1", &[]), 10)),
+            Ok(resp("PART0", 10)),
+            // unit 2: must already be degraded -> ONE successful call, no re-probe.
+            Ok(resp("PART1", 10)),
+            // perceptor-update for the page.
+            Ok(resp(&content_with("ignored", "s", &[]), 10)),
         ]);
 
-        let out = translate_page(&c, &client, &params_page(&big)).unwrap();
+        let out = translate_page(&c, &client, &params_small(page)).unwrap();
 
-        assert_eq!(client.calls(), 3, "chunk1: 2 calls; chunk2: 1 call (no re-probe)");
+        assert_eq!(client.calls(), 4, "unit1: 2 calls; unit2: 1 call; perceptor: 1 call");
         assert!(out.translated_text.contains("PART0") && out.translated_text.contains("PART1"));
 
         let reqs = client.requests.borrow();
-        assert!(reqs[0].response_format.is_some(), "chunk1 first attempt sent response_format");
-        assert!(reqs[1].response_format.is_none(), "chunk1 retry stripped response_format");
+        assert!(reqs[0].response_format.is_none(), "translate-only sends no response_format");
+        assert!(reqs[0].temperature.is_some(), "unit1 first attempt sent temperature");
+        assert!(reqs[1].temperature.is_none(), "unit1 retry stripped temperature");
         assert!(
-            reqs[2].response_format.is_none(),
-            "chunk2 starts already-degraded, no response_format re-probe"
+            reqs[2].temperature.is_none(),
+            "unit2 starts already-degraded, no temperature re-probe"
         );
     }
 
-    /// The JSON-correction retry must be issued on the already-degraded body, so
-    /// it does not re-send the param the model rejected (finding 2a). Sequence:
-    /// full-body 404 -> degraded call returns malformed JSON -> correction retry
-    /// on the degraded body returns valid JSON. That is exactly 3 calls; a
-    /// re-probe would make 4.
+    /// The perceptor JSON-correction retry must be issued on the already-degraded
+    /// body, so it does not re-send the param the model rejected (finding 2a).
+    /// Sequence: unit ok -> perceptor 404 -> degraded perceptor returns malformed
+    /// JSON -> correction retry on the degraded body returns valid JSON. Four
+    /// calls total; a re-probe would make five.
     #[test]
     fn correction_retry_reuses_degraded_body_no_reprobe() {
         let c = conn();
         seed_session(&c);
         let client = MockClient::new(vec![
-            Err(LlmError::UnsupportedParams("no endpoints found".into())),
-            Ok(resp("not json at all", 10)),
-            Ok(resp(&valid_content(), 55)),
+            Ok(resp("Ciao mondo", 10)),                             // translate-only unit
+            Err(LlmError::UnsupportedParams("no endpoints found".into())), // perceptor 404
+            Ok(resp("not json at all", 10)),                        // degraded perceptor malformed
+            Ok(resp(&valid_content(), 55)),                         // degraded correction valid
         ]);
 
         let out = translate_page(&c, &client, &params("Hello")).unwrap();
 
         assert_eq!(out.translated_text, "Ciao mondo");
-        assert_eq!(out.total_tokens, Some(55));
-        assert_eq!(client.calls(), 3, "404 + degraded malformed + degraded correction retry");
+        assert_eq!(out.updated_summary.as_deref(), Some("riassunto"));
+        assert_eq!(client.calls(), 4, "unit + 404 + degraded malformed + degraded correction retry");
 
         let reqs = client.requests.borrow();
-        assert!(reqs[1].response_format.is_none(), "degraded call stripped response_format");
+        assert!(reqs[2].response_format.is_none(), "degraded perceptor call stripped response_format");
         assert!(
-            reqs[2].response_format.is_none(),
+            reqs[3].response_format.is_none(),
             "correction retry reuses the degraded body (no re-probe)"
         );
         assert!(
-            reqs[2].messages.iter().any(|m| m.content.contains(crate::llm::CORRECTION_PROMPT)),
+            reqs[3].messages.iter().any(|m| m.content.contains(crate::llm::CORRECTION_PROMPT)),
             "correction retry carries the correction prompt"
         );
     }
@@ -973,13 +1214,19 @@ mod tests {
         )
         .unwrap();
 
-        let client = MockClient::new(vec![Ok(resp(&valid_content(), 100))]);
+        let client = MockClient::new(vec![
+            Ok(resp("Il consiglio si e riunito.", 100)), // translate-only unit
+            Ok(resp(&valid_content(), 100)),             // perceptor-update
+        ]);
         translate_page(&c, &client, &params("The board met.")).unwrap();
 
+        // The unit's translate-only prompt carries the read-only summary and the
+        // locked term SELECTED for the unit (STC-03), rendered as an absolute
+        // constraint.
         let prompt = client.user_prompt(0);
         assert!(prompt.contains("Contesto delle pagine precedenti."), "summary in prompt");
         assert!(prompt.contains("Termini BLOCCATI (vincolo assoluto"), "absolute heading");
-        assert!(prompt.contains("board => consiglio"), "locked term rendered");
+        assert!(prompt.contains("board => consiglio"), "selected locked term rendered");
     }
 
     // --- Summary persistence (ticket 09) ------------------------------------
@@ -988,8 +1235,10 @@ mod tests {
     fn updated_summary_persisted_to_session_after_page() {
         let c = conn();
         seed_session(&c);
-        let client =
-            MockClient::new(vec![Ok(resp(&content_with("Tradotto", "Nuovo riassunto pag. 3.", &[]), 200))]);
+        let client = MockClient::new(vec![
+            Ok(resp("Tradotto", 100)), // translate-only unit
+            Ok(resp(&content_with("ignored", "Nuovo riassunto pag. 3.", &[]), 200)), // perceptor
+        ]);
 
         let out = translate_page(&c, &client, &params("Hello")).unwrap();
         assert_eq!(out.updated_summary.as_deref(), Some("Nuovo riassunto pag. 3."));
@@ -1016,10 +1265,13 @@ mod tests {
         )
         .unwrap();
 
-        let client = MockClient::new(vec![Ok(resp(
-            &content_with("t", "s", &[("board", "altra"), ("CEO", "ad")]),
-            100,
-        ))]);
+        let client = MockClient::new(vec![
+            Ok(resp("tradotto", 100)), // translate-only unit
+            Ok(resp(
+                &content_with("t", "s", &[("board", "altra"), ("CEO", "ad")]),
+                100,
+            )), // perceptor proposes terms
+        ]);
         translate_page(&c, &client, &params("x")).unwrap();
 
         let entries = crate::glossary::list_glossary(&c, 1).unwrap();
@@ -1048,14 +1300,18 @@ mod tests {
 
         // Model returns a short, recompressed summary.
         let short = "Riassunto compresso.";
-        let client = MockClient::new(vec![Ok(resp(&content_with("Tradotto", short, &[]), 500))]);
+        let client = MockClient::new(vec![
+            Ok(resp("Tradotto", 100)),                    // translate-only unit
+            Ok(resp(&content_with("ignored", short, &[]), 500)), // perceptor recompresses
+        ]);
 
         let out = translate_page(&c, &client, &params("Hello")).unwrap();
 
-        // The prompt for this page requested recompression.
+        // Recompression is requested on the PERCEPTOR prompt (the summary is
+        // owned by the once-per-page perceptor call, D6), not the unit prompt.
         assert!(
-            client.user_prompt(0).contains(crate::llm::COMPRESSION_INSTRUCTION),
-            "next-page prompt requests recompression"
+            client.user_prompt(1).contains(crate::llm::COMPRESSION_INSTRUCTION),
+            "perceptor prompt requests recompression"
         );
         // The resulting summary is back under the threshold.
         assert_eq!(out.updated_summary.as_deref(), Some(short));
@@ -1069,80 +1325,231 @@ mod tests {
         seed_session(&c);
         crate::documents::set_rolling_summary(&c, 1, "Breve riassunto.").unwrap();
 
-        let client = MockClient::new(vec![Ok(resp(&valid_content(), 100))]);
+        let client = MockClient::new(vec![
+            Ok(resp("Tradotto", 100)),       // translate-only unit
+            Ok(resp(&valid_content(), 100)), // perceptor-update
+        ]);
         translate_page(&c, &client, &params("Hello")).unwrap();
 
         assert!(
-            !client.user_prompt(0).contains(crate::llm::COMPRESSION_INSTRUCTION),
+            !client.user_prompt(1).contains(crate::llm::COMPRESSION_INSTRUCTION),
             "no recompression request under threshold"
         );
     }
 
-    // --- Chunking (EC04) -----------------------------------------------------
+    // --- STC-08: budget-aware multi-unit flow -------------------------------
 
+    /// The budget formula: a small n_ctx yields a modest (but usable) unit budget;
+    /// a large n_ctx (cloud) yields an enormous one so the page is never chunked.
     #[test]
-    fn split_into_chunks_preserves_content_and_respects_limit() {
-        let text = "lorem ipsum ".repeat(2000); // 24000 chars
-        let chunks = split_into_chunks(&text, CHUNK_CHAR_THRESHOLD);
-        assert!(chunks.len() > 1, "large text is split");
-        assert!(chunks.iter().all(|c| c.chars().count() <= CHUNK_CHAR_THRESHOLD));
-        assert_eq!(chunks.concat(), text, "no content lost, order preserved");
+    fn compute_budget_unit_text_small_vs_large_n_ctx() {
+        // Local: n_ctx 4096, out_unit 768, ~15% margin, minus system/summary/gloss.
+        let local = compute_budget_unit_text(4096, 768, 120, 0, 256, BUDGET_MARGIN);
+        assert!(local >= MIN_BUDGET_UNIT_TEXT, "never below the floor");
+        assert!(local < 4096, "a small window yields a bounded unit budget: {local}");
+        assert!(local > 1500, "still comfortably larger than a real paragraph: {local}");
 
-        // Small text stays a single chunk.
-        assert_eq!(split_into_chunks("short", CHUNK_CHAR_THRESHOLD), vec!["short".to_string()]);
+        // Cloud: a huge n_ctx makes the budget non-binding (≫ any real page).
+        let cloud = compute_budget_unit_text(128_000, 768, 120, 300, 256, BUDGET_MARGIN);
+        assert!(cloud > 100_000, "a large window barely constrains the unit budget: {cloud}");
+
+        // Degenerate window: never underflows, floored at the minimum.
+        assert_eq!(compute_budget_unit_text(100, 768, 50, 50, 50, BUDGET_MARGIN), MIN_BUDGET_UNIT_TEXT);
     }
 
+    /// Small context + a multi-paragraph page → several translate-only units, one
+    /// call each, plus a single perceptor call; the translated units recompose in
+    /// order (AC: split → translate → reassemble).
     #[test]
-    fn large_page_chunks_into_multiple_calls_and_recomposes() {
+    fn small_context_splits_page_into_units_and_recomposes() {
         let c = conn();
         seed_session(&c);
-        // ~24000 chars -> at least 3 chunks with the 8000 threshold.
-        let big = "lorem ipsum dolor ".repeat(1400);
-        let chunks = split_into_chunks(&big, CHUNK_CHAR_THRESHOLD);
-        let n = chunks.len();
-        assert!(n >= 2, "precondition: multiple chunks");
+        let page = "AAA primo paragrafo.\n\nBBB secondo paragrafo.\n\nCCC terzo paragrafo.";
+        let n = split_into_units(page, 4096, RATIO).len();
+        assert!(n >= 3, "precondition: three paragraph units, got {n}");
 
-        // One canned response per chunk, each with a distinct ordered marker.
-        let responses: Vec<_> = (0..n)
-            .map(|i| {
-                Ok(resp(
-                    &content_with(&format!("PART{i}"), &format!("riassunto dopo chunk {i}"), &[]),
-                    10,
-                ))
-            })
+        // One plain translation per unit + one perceptor-update for the page.
+        let mut responses: Vec<_> = (0..n)
+            .map(|i| Ok(resp(&format!("T{i}"), 10)))
             .collect();
+        responses.push(Ok(resp(&content_with("ignored", "riassunto finale", &[]), 7)));
         let client = MockClient::new(responses);
 
-        let out = translate_page(&c, &client, &params_page(&big)).unwrap();
+        let out = translate_page(&c, &client, &params_small(page)).unwrap();
 
-        assert_eq!(client.calls(), n, "one model call per chunk");
-        // Recomposed translation contains every part in order.
+        assert_eq!(client.calls(), n + 1, "one call per unit + one perceptor call");
         for i in 0..n {
-            assert!(out.translated_text.contains(&format!("PART{i}")), "PART{i} present");
+            assert!(out.translated_text.contains(&format!("T{i}")), "T{i} present");
         }
-        let pos_first = out.translated_text.find("PART0").unwrap();
-        let pos_last = out.translated_text.find(&format!("PART{}", n - 1)).unwrap();
-        assert!(pos_first < pos_last, "parts recomposed in order");
+        let first = out.translated_text.find("T0").unwrap();
+        let last = out.translated_text.find(&format!("T{}", n - 1)).unwrap();
+        assert!(first < last, "units recomposed in order");
 
-        // Summary updated exactly once, to the last chunk's summary.
+        // The perceptor advanced the summary exactly once for the page.
         assert_eq!(
             crate::documents::get_rolling_summary(&c, 1).unwrap(),
-            format!("riassunto dopo chunk {}", n - 1)
+            "riassunto finale"
         );
-        // Total tokens summed across chunk calls.
-        assert_eq!(out.total_tokens, Some(10 * n as i64));
+        // Total tokens summed across every unit call + the perceptor call.
+        assert_eq!(out.total_tokens, Some(10 * n as i64 + 7));
     }
 
-    fn params_page(text: &str) -> TranslateParams<'_> {
-        TranslateParams {
-            document_id: 1,
-            page_number: 3,
-            target_language: "it",
-            page_text: text,
-            model: "openai/gpt-4o",
-            max_tokens: 4096,
-            update_context: true,
+    /// Each translate-only unit carries ONLY the glossary selected for that unit
+    /// (STC-03) and a small per-unit `max_tokens` (out_unit) — never the whole
+    /// glossary, never the page `max_tokens`.
+    #[test]
+    fn units_carry_selected_glossary_and_small_max_tokens() {
+        let c = conn();
+        seed_session(&c);
+        // Three unlocked terms: one per paragraph, one that appears in neither.
+        for (t, tr) in [("board", "consiglio"), ("shareholder", "azionista"), ("dividend", "dividendo")] {
+            c.execute(
+                "INSERT INTO glossary
+                     (document_id, source_term, translation, type, locked, note, first_seen_page)
+                 VALUES (1, ?1, ?2, 'comune', 0, '', 1)",
+                params![t, tr],
+            )
+            .unwrap();
         }
+
+        let client = MockClient::new(vec![
+            Ok(resp("T uno", 10)),  // unit 0
+            Ok(resp("T due", 10)),  // unit 1
+            Ok(resp(&content_with("ignored", "s", &[]), 5)), // perceptor
+        ]);
+        translate_page(&c, &client, &params_small(two_paragraphs())).unwrap();
+
+        assert_eq!(client.calls(), 3, "two units + one perceptor");
+        let reqs = client.requests.borrow();
+        // Multi-unit path → the small out_unit cap on every unit request.
+        assert_eq!(reqs[0].max_tokens, OUT_UNIT_TOKENS, "unit 0 uses the small out_unit cap");
+        assert_eq!(reqs[1].max_tokens, OUT_UNIT_TOKENS, "unit 1 uses the small out_unit cap");
+        // The invariant that actually prevents EC08: prompt + output <= n_ctx.
+        for r in [&reqs[0], &reqs[1]] {
+            let prompt_est: u32 = r.messages.iter().map(|m| est_tokens(&m.content, RATIO)).sum();
+            assert!(prompt_est + r.max_tokens <= 4096, "unit request fits within n_ctx");
+        }
+
+        // Per-unit selection: unit 0 sees only "board", unit 1 only "shareholder";
+        // "dividend" (absent from both paragraphs) reaches neither prompt.
+        let p0 = client.user_prompt(0);
+        let p1 = client.user_prompt(1);
+        assert!(p0.contains("board => consiglio") && !p0.contains("shareholder"));
+        assert!(p1.contains("shareholder => azionista") && !p1.contains("board"));
+        assert!(!p0.contains("dividend") && !p1.contains("dividend"), "absent term never sent");
+    }
+
+    /// Large context (cloud) + a single-paragraph page → ONE unit = whole page,
+    /// using the page `max_tokens` (degrade to the previous behaviour, D2; no
+    /// cloud regression).
+    #[test]
+    fn large_context_degrades_to_a_single_unit_equivalent() {
+        let c = conn();
+        seed_session(&c);
+        let page = "This is a single paragraph page with several sentences. It has no blank \
+lines, so it stays a single translation unit even though it is not short.";
+        assert_eq!(split_into_units(page, 1_000_000, RATIO).len(), 1, "single paragraph → one unit");
+
+        let client = MockClient::new(vec![
+            Ok(resp("Traduzione intera della pagina.", 100)), // the single unit
+            Ok(resp(&valid_content(), 200)),                  // perceptor-update
+        ]);
+        let out = translate_page(&c, &client, &params(page)).unwrap();
+
+        assert_eq!(out.translated_text, "Traduzione intera della pagina.", "whole page from one call");
+        let reqs = client.requests.borrow();
+        // Exactly one translate-only unit call (response_format omitted), then the
+        // perceptor (response_format present).
+        let unit_calls = reqs.iter().filter(|r| r.response_format.is_none()).count();
+        assert_eq!(unit_calls, 1, "one unit = whole page");
+        assert_eq!(reqs[0].max_tokens, 4096, "single unit keeps the page max_tokens (no truncation)");
+    }
+
+    /// The perceptor-update runs exactly once per page on real navigation, and
+    /// never on prefetch (D5/D6).
+    #[test]
+    fn perceptor_runs_once_on_nav_and_never_on_prefetch() {
+        // Real navigation: several units, exactly one perceptor call.
+        let c = conn();
+        seed_session(&c);
+        let client = MockClient::new(vec![
+            Ok(resp("T uno", 10)),
+            Ok(resp("T due", 10)),
+            Ok(resp(&content_with("ignored", "s", &[]), 10)),
+        ]);
+        translate_page(&c, &client, &params_small(two_paragraphs())).unwrap();
+        let perceptor_calls = client
+            .requests
+            .borrow()
+            .iter()
+            .filter(|r| r.response_format.is_some())
+            .count();
+        assert_eq!(perceptor_calls, 1, "exactly one perceptor-update per page on nav");
+
+        // Prefetch of another page: units only, no perceptor call at all.
+        let c2 = conn();
+        seed_session(&c2);
+        let client2 = MockClient::new(vec![Ok(resp("T uno", 10)), Ok(resp("T due", 10))]);
+        let prefetch = TranslateParams {
+            document_id: 1,
+            page_number: 5,
+            target_language: "it",
+            page_text: two_paragraphs(),
+            model: "local-model",
+            max_tokens: 2048,
+            n_ctx: 4096,
+            update_context: false,
+        };
+        translate_page(&c2, &client2, &prefetch).unwrap();
+        assert_eq!(client2.calls(), 2, "prefetch = units only");
+        let perceptor_calls2 = client2
+            .requests
+            .borrow()
+            .iter()
+            .filter(|r| r.response_format.is_some())
+            .count();
+        assert_eq!(perceptor_calls2, 0, "prefetch never runs the perceptor");
+    }
+
+    /// D6: the SAME summary version is passed read-only to every unit of the page
+    /// (it is not advanced incrementally between units).
+    #[test]
+    fn same_summary_version_passed_to_every_unit() {
+        let c = conn();
+        seed_session(&c);
+        crate::documents::set_rolling_summary(&c, 1, "RIASSUNTO-VERSIONE-UNICA.").unwrap();
+
+        let client = MockClient::new(vec![
+            Ok(resp("T uno", 10)),
+            Ok(resp("T due", 10)),
+            // Perceptor advances the summary — this must NOT leak into the units.
+            Ok(resp(&content_with("ignored", "RIASSUNTO-AVANZATO.", &[]), 10)),
+        ]);
+        translate_page(&c, &client, &params_small(two_paragraphs())).unwrap();
+
+        let p0 = client.user_prompt(0);
+        let p1 = client.user_prompt(1);
+        assert!(p0.contains("RIASSUNTO-VERSIONE-UNICA."), "unit 0 sees the loaded summary");
+        assert!(p1.contains("RIASSUNTO-VERSIONE-UNICA."), "unit 1 sees the SAME summary version");
+        assert!(!p1.contains("RIASSUNTO-AVANZATO."), "the perceptor update never leaks into a unit");
+    }
+
+    /// EC08 (`OutputBudgetExhausted`) on a unit surfaces from the whole page and
+    /// leaves nothing cached.
+    #[test]
+    fn output_budget_exhausted_on_a_unit_surfaces_ec08() {
+        let c = conn();
+        seed_session(&c);
+        let client = MockClient::new(vec![Ok(resp_length())]); // first unit exhausts the budget
+
+        let err = translate_page(&c, &client, &params_small(two_paragraphs())).unwrap_err();
+        assert!(matches!(err, LlmError::OutputBudgetExhausted(_)), "EC08 surfaces per unit");
+        assert!(err.user_message().contains("EC08"));
+
+        let count: i64 = c
+            .query_row("SELECT COUNT(*) FROM translations_cache", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "a failed unit caches nothing");
     }
 
     // --- Prefetch: cache-only, no context mutation (ticket 12) --------------
@@ -1169,6 +1576,7 @@ mod tests {
             page_text: "Next page text.",
             model: "openai/gpt-4o",
             max_tokens: 4096,
+            n_ctx: 128_000,
             update_context: false,
         };
 
@@ -1223,6 +1631,7 @@ mod tests {
             page_text: "Next",
             model: "openai/gpt-4o",
             max_tokens: 4096,
+            n_ctx: 128_000,
             update_context: false,
         };
 
