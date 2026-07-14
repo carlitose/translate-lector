@@ -119,7 +119,14 @@ export function reconstructLines(items: TextItem[], pageWidth: number): Line[] {
  */
 export function linesToText(lineTexts: Line[]): string {
   const typical = typicalLineSpacing(lineTexts);
-  const paragraphFactor = 1.5; // gap beyond this * typical spacing => new paragraph
+  // Gap beyond this * typical spacing => new paragraph. Within a paragraph the
+  // line-to-line gaps cluster tightly around the median (wrapped lines share the
+  // same leading), so a real paragraph break only needs a modest increment above
+  // it. 1.5 was too conservative: paragraphs with slightly looser leading (~1.3x
+  // the typical spacing) were fused into oversized units. 1.25 gives a 25% margin
+  // over the typical line gap — wide enough to ignore wrapped-line jitter, tight
+  // enough to catch those modestly-spaced paragraph breaks. (See ticket 12.)
+  const paragraphFactor = 1.25;
   let text = '';
   for (let i = 0; i < lineTexts.length; i++) {
     const cur = lineTexts[i].text;

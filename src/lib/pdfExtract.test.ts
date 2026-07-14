@@ -63,12 +63,57 @@ describe('reconstruct — paragraph-aware separation', () => {
     );
   });
 
+  it('splits a paragraph whose gap is only moderately larger than the line spacing', () => {
+    // Typical line spacing is 20 (four gaps: 20, 20, 26, 20 -> median 20). The
+    // gap before "Second paragraph" is 26 = 1.3x the typical spacing: a real new
+    // paragraph with slightly looser leading. At the old 1.5x factor (threshold
+    // 30) it was NOT split and both paragraphs fused into one oversized unit.
+    const items: TextItem[] = [
+      item('First paragraph line one', 72, 700, 200),
+      item('first paragraph line two', 72, 680, 200),
+      item('first paragraph line three', 72, 660, 200),
+      item('Second paragraph line one', 72, 634, 200),
+      item('second paragraph line two', 72, 614, 200)
+    ];
+    const out = reconstruct(items, 600);
+    expect(out).toBe(
+      'First paragraph line one\n' +
+        'first paragraph line two\n' +
+        'first paragraph line three\n\n' +
+        'Second paragraph line one\n' +
+        'second paragraph line two'
+    );
+  });
+
   it('keeps closely-spaced lines in the same paragraph (no separator)', () => {
     const items: TextItem[] = [
       item('Line one of one paragraph', 72, 700, 200),
       item('line two of one paragraph', 72, 680, 200),
       item('line three of one paragraph', 72, 660, 200),
       item('line four of one paragraph', 72, 640, 200)
+    ];
+    const out = reconstruct(items, 600);
+    expect(out).not.toContain('\n\n');
+    expect(out).toBe(
+      [
+        'Line one of one paragraph',
+        'line two of one paragraph',
+        'line three of one paragraph',
+        'line four of one paragraph'
+      ].join('\n')
+    );
+  });
+
+  it('keeps a wrapped line whose gap is just under the threshold in the same paragraph', () => {
+    // Guards the band narrowed by lowering the factor to 1.25: a within-paragraph
+    // gap of 24 against a median of 20 is 1.2x typical (below the 1.25x = 25
+    // threshold) and must NOT be mistaken for a paragraph break. Gaps: 20, 24, 20
+    // -> median 20, threshold 25; the 24 gap stays merged.
+    const items: TextItem[] = [
+      item('Line one of one paragraph', 72, 700, 200),
+      item('line two of one paragraph', 72, 680, 200),
+      item('line three of one paragraph', 72, 656, 200),
+      item('line four of one paragraph', 72, 636, 200)
     ];
     const out = reconstruct(items, 600);
     expect(out).not.toContain('\n\n');
