@@ -37,6 +37,15 @@ export function isRateLimitError(err: unknown): boolean {
   return errorText(err).includes('EC07');
 }
 
+/**
+ * True when the error is the EC08 "output budget exhausted" case: the model
+ * returned empty content with `finish_reason: length` (a reasoning model that
+ * burned its completion budget in a small context window, ticket 03).
+ */
+export function isOutputBudgetError(err: unknown): boolean {
+  return errorText(err).includes('EC08');
+}
+
 /** User-facing hint shown when the key is missing (points at ⚙️). Provider-neutral:
  *  the active provider may be OpenRouter or a local server, and its key is stored
  *  per-provider, so the hint must not name a specific provider (ticket 11). */
@@ -52,15 +61,24 @@ export const OFFLINE_HINT =
 export const RATE_LIMIT_HINT =
   'Limite di richieste raggiunto (rate limit). Riprova tra poco.';
 
+/** EC08: the local model ran out of completion budget (reasoning in a small
+ *  context window). Actionable: switch to a non-reasoning model, shorten the
+ *  text, or raise the server's context (n_ctx). */
+export const OUTPUT_BUDGET_HINT =
+  'Il modello locale ha esaurito il budget di token (probabile reasoning entro una finestra piccola). ' +
+  'Usa un modello non-reasoning, riduci il testo, o aumenta il context (n_ctx) del server.';
+
 /**
  * Normalise a caught `invoke` error into a message for the right pane. The
  * edge cases get dedicated hints (EC03 → ⚙️, EC02 → offline, EC07 → rate
- * limit); anything else is passed through as text.
+ * limit, EC08 → output-budget exhausted); anything else is passed through as
+ * text.
  */
 export function translationErrorMessage(err: unknown): string {
   if (isMissingKeyError(err)) return MISSING_KEY_HINT;
   if (isOfflineError(err)) return OFFLINE_HINT;
   if (isRateLimitError(err)) return RATE_LIMIT_HINT;
+  if (isOutputBudgetError(err)) return OUTPUT_BUDGET_HINT;
   return errorText(err);
 }
 

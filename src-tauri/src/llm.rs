@@ -141,6 +141,14 @@ pub struct ResponseMessage {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Choice {
     pub message: ResponseMessage,
+    /// Why generation stopped (`stop` | `length` | …), when the provider reports
+    /// it. Optional (defaults to `None` if missing). `length` with empty/null
+    /// `content` means the model exhausted its completion budget — typically a
+    /// reasoning model in a small context window — and is surfaced as the
+    /// dedicated [`LlmError::OutputBudgetExhausted`] instead of the generic
+    /// empty-content error (local-llm-empty-content, ticket 03).
+    #[serde(default)]
+    pub finish_reason: Option<String>,
 }
 
 /// Response body (relevant fields, §4.4).
@@ -163,6 +171,21 @@ impl ChatResponse {
             .ok_or_else(|| LlmError::Http("risposta senza choices".into()))?;
         match choice.message.content.as_deref() {
             Some(c) if !c.trim().is_empty() => Ok(c),
+            // Empty/null content: distinguish the "ran out of output budget"
+            // case (finish_reason == "length", typical of a reasoning model in a
+            // small context window) from a plain empty response. The former gets
+            // a dedicated, actionable error (ticket 03); the latter keeps the
+            // generic message (bug #2 reasoning-null path is unaffected: no
+            // finish_reason == "length" there).
+            _ if matches!(
+                choice.finish_reason.as_deref(),
+                Some(r) if r.eq_ignore_ascii_case("length")
+            ) =>
+            {
+                Err(LlmError::OutputBudgetExhausted(
+                    choice.finish_reason.clone().unwrap_or_default(),
+                ))
+            }
             _ => Err(LlmError::Http(
                 "risposta senza contenuto testuale (content null/vuoto)".into(),
             )),
@@ -223,6 +246,20 @@ pub enum LlmError {
     ///
     /// [`Offline`]: LlmError::Offline
     Unreachable(String),
+    /// The response came back with empty/`null` `content` **and**
+    /// `finish_reason == "length"`: the model exhausted its completion-token
+    /// budget before emitting any text — typically a **reasoning** model whose
+    /// chain of thought fills a small context window (local-llm-empty-content
+    /// diagnosis, ticket 03). Distinct from the generic empty-content [`Http`]
+    /// error: it carries a dedicated, actionable message (EC08 — change model /
+    /// reduce text / raise `n_ctx`). **Permanent**: not transient (a retry with
+    /// the same budget would likely burn it again) and not param-degradable
+    /// (relaxing optional params does not add budget), so it surfaces
+    /// immediately for the user to act. The carried string is the reported
+    /// `finish_reason` (for diagnostics/logs).
+    ///
+    /// [`Http`]: LlmError::Http
+    OutputBudgetExhausted(String),
     /// The response could not be parsed even after the correction retry.
     ParseFailed(String),
     /// A local storage error while reading/writing the cache.
@@ -280,6 +317,12 @@ impl LlmError {
                     "Server locale non raggiungibile a {base_url}. \
                      Avvia il server (es. Unsloth Studio) o verifica l'indirizzo in ⚙️."
                 )
+            }
+            LlmError::OutputBudgetExhausted(_) => {
+                "EC08: il modello locale ha esaurito il budget di token \
+                 (probabile reasoning entro una finestra piccola). Usa un modello \
+                 non-reasoning, riduci il testo, o aumenta il context (n_ctx) del server."
+                    .into()
             }
             LlmError::ParseFailed(m) => {
                 format!("Risposta del modello non valida (JSON non conforme): {m}")
@@ -1258,6 +1301,64 @@ mod tests {
         )
         .unwrap();
         assert!(resp.content().is_err(), "blank content is treated as empty");
+    }
+
+    // --- Ticket 03: empty content + finish_reason == "length" ----------------
+
+    #[test]
+    fn empty_content_with_finish_reason_length_is_output_budget_exhausted() {
+        // A reasoning model burned the whole completion budget: the server
+        // returns finish_reason "length" with empty/null content. This is NOT
+        // the generic empty-content error — it gets a dedicated, actionable
+        // variant + message (change model / reduce text / raise n_ctx).
+        let resp: ChatResponse = serde_json::from_str(
+            r#"{"choices":[{"message":{"role":"assistant","content":null},"finish_reason":"length"}],"usage":{"completion_tokens":2048,"total_tokens":4096}}"#,
+        )
+        .expect("length+null content must deserialize");
+        let err = resp.content().unwrap_err();
+        assert!(
+            matches!(err, LlmError::OutputBudgetExhausted(_)),
+            "length + empty content -> dedicated variant, got {err:?}"
+        );
+        let msg = err.user_message();
+        assert!(msg.contains("EC08"), "carries the EC08 marker for the frontend");
+        assert!(msg.contains("budget"), "actionable: mentions the token budget");
+        assert!(msg.contains("n_ctx"), "actionable: suggests raising the context");
+    }
+
+    #[test]
+    fn empty_string_content_with_finish_reason_length_is_output_budget_exhausted() {
+        // Same case but with an empty string (not null) content.
+        let resp: ChatResponse = serde_json::from_str(
+            r#"{"choices":[{"message":{"role":"assistant","content":""},"finish_reason":"length"}]}"#,
+        )
+        .unwrap();
+        assert!(matches!(resp.content().unwrap_err(), LlmError::OutputBudgetExhausted(_)));
+    }
+
+    #[test]
+    fn empty_content_with_finish_reason_stop_keeps_the_generic_error() {
+        // finish_reason "stop" (or any non-length reason) with empty content is
+        // NOT a budget-exhaustion case: keep the existing generic Http error so
+        // we don't mislead the user with a budget message.
+        let resp: ChatResponse = serde_json::from_str(
+            r#"{"choices":[{"message":{"role":"assistant","content":null},"finish_reason":"stop"}]}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(resp.content().unwrap_err(), LlmError::Http(_)),
+            "stop + empty content stays a generic Http error"
+        );
+    }
+
+    #[test]
+    fn output_budget_exhausted_is_permanent_and_not_degradable() {
+        // A retry with the same budget would likely burn it again, and relaxing
+        // optional params does not add budget: surface immediately (no backoff
+        // retry, no param-relaxation fallback).
+        let e = LlmError::OutputBudgetExhausted("length".into());
+        assert!(!e.is_transient(), "no backoff retry: the budget won't grow on retry");
+        assert!(!e.is_param_unsupported(), "not a param relaxation case");
     }
 
     // --- Errors --------------------------------------------------------------

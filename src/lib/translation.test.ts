@@ -3,10 +3,12 @@ import {
   isMissingKeyError,
   isOfflineError,
   isRateLimitError,
+  isOutputBudgetError,
   translationErrorMessage,
   MISSING_KEY_HINT,
   OFFLINE_HINT,
   RATE_LIMIT_HINT,
+  OUTPUT_BUDGET_HINT,
   pageStatusLabel,
   resultStatus,
   requestKey,
@@ -40,6 +42,11 @@ describe('isOfflineError / isRateLimitError', () => {
     expect(isRateLimitError('EC07: rate limit')).toBe(true);
     expect(isRateLimitError('boom')).toBe(false);
   });
+
+  it('detects the EC08 output-budget marker', () => {
+    expect(isOutputBudgetError('EC08: il modello locale ha esaurito il budget')).toBe(true);
+    expect(isOutputBudgetError('EC02: nessuna connessione')).toBe(false);
+  });
 });
 
 describe('translationErrorMessage', () => {
@@ -53,6 +60,10 @@ describe('translationErrorMessage', () => {
 
   it('maps EC07 to the rate-limit hint', () => {
     expect(translationErrorMessage('EC07: 429')).toBe(RATE_LIMIT_HINT);
+  });
+
+  it('maps EC08 to the output-budget hint', () => {
+    expect(translationErrorMessage('EC08: budget esaurito')).toBe(OUTPUT_BUDGET_HINT);
   });
 
   it('passes through other error text unchanged', () => {
