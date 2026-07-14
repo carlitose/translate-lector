@@ -52,6 +52,17 @@ motore di traduzione esistente.
   (summary/glossario incostanti) → best-effort; per coerenza forte serve modello più grande. **Latenza
   ~38-42 s/pagina** sul Q4 in questo setup → lenta, mitigata da prefetch+cache; tenere il modello in GPU
   (D2). Dettaglio e tabella nel Ticket 03.
+- **Decisioni umane = CONFERMATE** (Ticket 04, gate risolto 2026-07-14; dettaglio
+  [decision-brief-local-llm-04.md](./decision-brief-local-llm-04.md)):
+  **D1** modello = *da decidere dopo*, resta configurabile;
+  **D2** hardware = GPU ~8GB → target **~7B Q4_K_M** in GPU;
+  **D3** provider locale = **DEFAULT all'avvio** (non opt-in) → serve onboarding/health-check al primo avvio;
+  **D4** server irraggiungibile = **errore chiaro, nessun fallback** automatico al cloud;
+  **D5** auth = **sempre una chiave (anche finta)** → *semplifica il design*: si elimina il ramo
+  key-opzionale/`requires_key=false`, `isValidKey` resta "non vuota", i server locali senza auth ricevono
+  una chiave dummy;
+  **D6** json_schema locale = **prova schema → fallback via ladder** (comportamento già esistente);
+  **D7** ciclo di vita server = **utente avvia a mano + health-check** (no orchestrazione in-app nell'MVP).
 
 ## Fatti di codebase rilevanti (grounding)
 
@@ -68,13 +79,15 @@ motore di traduzione esistente.
 
 ## Not Yet Specified
 
-- ~~Cos'è Unsloth Studio e come serve~~ → **RISOLTO dal Ticket 01** (vedi Decisions So Far).
-- ~~Astrazione di provider nell'app~~ → **PROGETTATO dal Ticket 02** (vedi Decisions So Far +
-  [design-provider-abstraction.md](./design-provider-abstraction.md)). Resta da *implementare* nelle build.
-- **Tenuta del contratto percettore sul modello locale**: il modello locale onora `json_schema`? Se no, il
-  fallback di parsing regge il JSON del percettore in modo affidabile? Qualità/latenza accettabili? → Ticket 03.
-- **Decisioni umane**: quale modello/quantizzazione target, vincoli hardware (GPU/RAM), locale come default o
-  opt-in, comportamento offline atteso. → Ticket 04.
+*(Vuoto — tutte le incognite bloccanti sono state risolte dai Ticket 01-04. Le nuove emergeranno durante le
+build verticali.)*
+
+- ~~Cos'è Unsloth Studio e come serve~~ → **RISOLTO dal Ticket 01**.
+- ~~Astrazione di provider nell'app~~ → **PROGETTATO dal Ticket 02** (da *implementare* nelle build; rivedere
+  alla luce di D5/D3).
+- ~~Tenuta del contratto percettore sul modello locale~~ → **VERIFICATO dal Ticket 03** (contratto 3/3;
+  Q4 buono; percettore best-effort su ~2B).
+- ~~Decisioni umane (modello/hardware/default/offline)~~ → **CONFERMATE dal Ticket 04** (D1-D7).
 
 ## Out of Scope
 
@@ -96,21 +109,20 @@ epiche restano compatibili.
 
 ## Frontier / Blocking Edges
 
-Aggiornato dall'autopilot 2026-07-14: **01 e 02 chiusi**; restano un gate umano (04) e una prova che
-richiede hardware/endpoint (03).
+Aggiornato 2026-07-14: **TUTTE le indagini (01-04) sono chiuse.** Nessun edge di ricerca/decisione residuo.
 
 1. ~~**Ticket 01** — Unsloth Studio: cosa serve e come~~ → ✅ **DONE** (research).
 2. ~~**Ticket 02** — Astrazione provider nell'app~~ → ✅ **DONE** (design pronto per `to-tickets`).
-3. **Ticket 03 (prototype) — Validazione contratto percettore in locale** → ⛔ **BLOCKED (non AFK)**:
-   richiede un endpoint locale in esecuzione. Harness pronto: `prototypes/local-llm/validate-perceptor-contract.mjs`;
-   l'utente lo lancia contro il suo server (~10 min) per produrre il verdetto.
-4. **Ticket 04 (grilling) — Decisioni umane** → ⛔ **GATE UMANO**: brief con raccomandazioni pronto
-   ([decision-brief-local-llm-04.md](./decision-brief-local-llm-04.md)); D1-D7 attendono conferma.
+3. ~~**Ticket 03** — Validazione contratto percettore in locale~~ → ✅ **DONE** (verdetto su endpoint reale).
+4. ~~**Ticket 04** — Decisioni umane~~ → ✅ **DONE** (D1-D7 confermate).
 
-**Frontiera immediata = due azioni umane**: (a) confermare D1-D7 nel decision brief; (b) lanciare l'harness
-del Ticket 03 contro un server locale. Fatte queste, la mappa è pronta per derivare i ticket di build
-verticali (selettore provider → chiamata a endpoint locale → traduzione pagina con percettore → cache) con
-`to-tickets`, usando le slice già elencate in [design-provider-abstraction.md](./design-provider-abstraction.md).
+**Frontiera immediata = derivare i ticket di BUILD verticali** con `to-tickets`, partendo dalle slice già
+elencate in [design-provider-abstraction.md](./design-provider-abstraction.md), aggiornate dalle decisioni:
+selettore provider (**locale default**, D3) → base-URL + chiavi provider-scoped (**chiave sempre presente**,
+D5) → chiamata a endpoint locale con `json_schema`+ladder (D6) → **health-check + errore chiaro** se
+irraggiungibile (D4/D7) → traduzione pagina con percettore (best-effort su modelli piccoli) → cache.
+Nota: rivedere il design del Ticket 02 alla luce di **D5** (rimuovere il ramo key-opzionale) e **D3**
+(default = locale, non openrouter).
 
 ## Ticket Plan
 
@@ -121,7 +133,7 @@ Cartella: `docs/tickets/local-llm-provider/`
 | 01 | research | Unsloth Studio: come serve un LLM locale (endpoint/protocollo/auth) | ✅ done (`done/`) — [research](./research-unsloth-serving.md) |
 | 02 | research | Astrazione di provider nell'app (base-URL/key/modello configurabili) | ✅ done (`done/`) — [design](./design-provider-abstraction.md) |
 | 03 | prototype | Tenuta del contratto percettore su modello locale (json/fallback/qualità) | ✅ done (`done/`) — verdetto: contratto 3/3; Q4 buono, percettore best-effort, ~40s/pag |
-| 04 | grilling | Decisioni: modello/quant, hardware, default vs opt-in, offline | ⛔ gate umano — brief pronto: [decision-brief](./decision-brief-local-llm-04.md) (D1-D7 attendono conferma) |
+| 04 | grilling | Decisioni: modello/quant, hardware, default vs opt-in, offline | ✅ done (`done/`) — D1-D7 confermate: [decision-brief](./decision-brief-local-llm-04.md) |
 
 ## Next Review
 

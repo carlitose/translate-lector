@@ -3,8 +3,26 @@
 **Ticket:** `docs/tickets/local-llm-provider/04-grilling-local-llm-decisions.md`
 **Parent spec:** `docs/specs/local-llm-provider-wayfinder.md`
 **Data:** 2026-07-14
-**Stato:** ⛔ **GATE UMANO** — prodotto AFK dall'autopilot; le decisioni D1-D7 attendono conferma dell'utente.
-Nessuna risposta è stata inventata; sotto ci sono **raccomandazioni** da confermare o correggere.
+**Stato:** ✅ **RISOLTO** — decisioni D1-D7 confermate dall'utente il 2026-07-14 (vedi riepilogo sotto).
+
+## Risposte registrate (2026-07-14)
+
+| D | Decisione dell'utente | Nota di impatto |
+|---|---|---|
+| **D1** Modello/quant | **Decido dopo** — modello resta parametro configurabile | Nessun default rigido; scelta rimandata (l'astrazione del Ticket 02 lo supporta già). |
+| **D2** Hardware | **GPU ~8GB VRAM** | Sweet spot **~7B Q4_K_M** interamente in GPU; evitare modelli che sforano in RAM. |
+| **D3** Default vs opt-in | **Locale come DEFAULT** all'avvio | `active_provider` default = locale (non openrouter). Serve onboarding/health-check: al primo avvio senza server → messaggio chiaro (lega con D4/D7). |
+| **D4** Server irraggiungibile | **Errore chiaro, nessun fallback** | Nessun passaggio automatico al cloud; messaggio NFR06. Eventuale azione manuale "passa a OpenRouter". |
+| **D5** Auth locale senza key | **Sempre una chiave (anche finta)** | **Semplifica il design (Ticket 02)**: si elimina il ramo key-opzionale/`requires_key=false`; `isValidKey` resta "non vuota"; i server locali senza auth ricevono una chiave dummy che ignorano. |
+| **D6** json_schema locale | **Prova schema → fallback via ladder** | Comportamento già esistente; validato dal Ticket 03 (schema utile sul Q4). |
+| **D7** Ciclo di vita server | **Utente avvia a mano + health-check** | L'app non gestisce il processo; fa solo health-check. Orchestrazione in-app resta fuori scope MVP. |
+
+---
+
+### Brief originale (raccomandazioni, mantenuto per tracciabilità)
+
+Le sezioni D1-D7 qui sotto sono il brief prodotto AFK; le caselle riflettono le raccomandazioni iniziali,
+mentre le decisioni effettive dell'utente sono nella tabella qui sopra (in alcuni casi divergono, es. D3 e D5).
 
 > Evidenza a supporto: [research-unsloth-serving.md](./research-unsloth-serving.md) (serving, hardware),
 > [design-provider-abstraction.md](./design-provider-abstraction.md) (astrazione, domande aperte).
