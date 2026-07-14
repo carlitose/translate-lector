@@ -92,6 +92,40 @@ limite (EC05); se il budget è stretto, ridurre prima il glossario selezionato (
 - Token: `est_tokens` (chars/4) e `calibrate_chars_per_token` esistono; il summary ha un limite con
   auto-compressione (EC05).
 
+## Design multi-chiamata + contratto + cache (Ticket 04)
+
+Sintesi di 01/02/03 in una pipeline per-pagina budget-aware:
+
+**Orchestrazione (per pagina):**
+1. `split_into_units(page_text, budget_unit_text, ratio)` (Ticket 02) → unità paragrafo (fallback frase).
+2. Per ogni unità **mancante in cache**, una chiamata **translate-only**: prompt = system minimale + summary
+   **read-only compatto** + `select_glossary(unit, entries, cap)` (Ticket 03, locked-first) + testo unità;
+   `max_tokens = out_unit` piccolo (Ticket 01). Output: **solo** il testo tradotto.
+3. Riassemblaggio delle unità in ordine → traduzione di pagina.
+4. **Una** chiamata **perceptor-update** per pagina (solo su navigazione reale, non prefetch): input =
+   testo pagina (o le unità) + summary corrente + glossario; output = `{ updated_summary, new_glossary_terms }`
+   con compressione EC05. Salta del tutto quando `update_context=false` (prefetch, come oggi).
+
+**Split del contratto** (vs l'attuale unico `{translated_text, updated_summary, new_glossary_terms}`):
+- `TranslateUnit` → `{ translated_text }` (JSON minimo o testo puro + fallback extraction). Prompt piccolo =
+  meno budget e meno rischio EC08.
+- `PerceptorUpdate` → `{ updated_summary, new_glossary_terms }`. Una sola volta per pagina.
+- Vantaggio: le N chiamate pesanti diventano N chiamate leggere + 1 percettore; il grosso del contesto
+  (glossario intero, contratto ricco) sparisce dalle chiamate di traduzione.
+
+**Cache (granularità unità):** estendere `translations_cache` (§4.3) con `unit_index` e un hash del
+`source_text` dell'unità (chiave `document_id, page_number, unit_index, target_language`), oppure nuova
+tabella `unit_translations`. Riassemblaggio per `unit_index`. Cache **parziale** ammessa: si traducono solo
+le unità mancanti (utile su errori/timeout a metà pagina). La cache per-pagina esistente può restare come
+vista derivata o essere sostituita — decisione di build.
+
+**Coerenza:** il summary è passato read-only a tutte le unità della pagina (stessa versione); l'update del
+summary avviene dopo le unità, una volta. Cross-pagina invariato (summary portato avanti).
+
+**Costo/latenza:** N chiamate piccole + 1 percettore vs 1 grande. Su modello locale lento il numero di
+round-trip cresce, ma ogni chiamata è breve e a basso rischio (niente EC08/timeout da prompt enorme); la
+cache per-unità riduce il rework. Streaming = follow-up per la percezione di velocità (fuori scope).
+
 ## Not Yet Specified
 
 - ~~Modello di budget per-chiamata~~ → **DEFINITO dal Ticket 01** (sezione "Modello di budget token").
@@ -99,10 +133,7 @@ limite (EC05); se il budget è stretto, ridurre prima il glossario selezionato (
   build*: far emettere i separatori di paragrafo in `pdfExtract.ts` (da y-gap).
 - ~~Selezione deterministica del glossario~~ → **PROTOTIPO OK dal Ticket 03** (98.2% riduzione). *Aperto per
   la build*: indice lemma/alias per ridurre i falsi negativi morfologici.
-- **Percettore con molte chiamate piccole**: come mantenere coerenza di summary/glossario senza esplodere
-  numero di chiamate/latenza; es. tradurre per-unità con contesto minimo e **aggiornare summary+glossario
-  una volta per pagina** (step separato e compatto) vs incrementale. Split del contratto (translate-only vs
-  perceptor-update). Granularità di cache (per-unità). → Ticket 04.
+- ~~Percettore con molte chiamate piccole~~ → **PROGETTATO dal Ticket 04** (sezione "Design multi-chiamata").
 - **Decisioni umane**: granularità unità (paragrafo/frase/finestra-N-token), default vs solo-provider-piccoli,
   tolleranza latenza per molte chiamate, severità/cap del match glossario, split delle chiamate. → Ticket 05.
 
@@ -140,8 +171,8 @@ Cartella: `docs/tickets/small-context-translation/`
 | 01 | research | Modello di budget token per-chiamata (da n_ctx) | ✅ done (`done/`) — sezione "Modello di budget token" |
 | 02 | prototype | Chunking a livello paragrafo entro budget | ✅ done (`done/`) — `split_into_units`, round-trip OK |
 | 03 | prototype | Selezione deterministica del glossario per unità | ✅ done (`done/`) — `select_glossary`, −98% token |
-| 04 | research | Percettore multi-chiamata + split contratto + cache per-unità | blocked by 01,02,03 |
-| 05 | grilling | Decisioni: granularità, default, latenza, match glossario | ready (gate) |
+| 04 | research | Percettore multi-chiamata + split contratto + cache per-unità | ✅ done (`done/`) — sezione "Design multi-chiamata" |
+| 05 | grilling | Decisioni: granularità, default, latenza, match glossario | ⛔ gate umano — brief pronto: [decision-brief-stc-05](./decision-brief-stc-05.md) |
 
 ## Next Review
 
