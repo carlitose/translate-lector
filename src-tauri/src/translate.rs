@@ -284,6 +284,43 @@ fn pack_sentences(body: &str, budget: u32, ratio: f64) -> Vec<String> {
     units
 }
 
+/// PROTOTIPO (local-translation-latency ticket 02, **NON cablato** nel flusso):
+/// impacchetta unità adiacenti prodotte da [`split_into_units`] in **finestre**
+/// entro `budget` token, greedy e deterministico. Motivazione (misure ticket 01):
+/// il costo dominante sul provider locale è il CoT del modello, pagato **per
+/// chiamata** (~500 token scartati); ridurre il numero di chiamate riduce la
+/// latenza quasi linearmente, mentre il prefill è prefix-cached e costa ~0.
+///
+/// Proprietà (stesse garanzie di [`split_into_units`]):
+/// - round-trip esatto: `pack_units(us, b, r).concat() == us.concat()`;
+/// - nessuna finestra oltre `budget`, salvo l'unità singola già oltre budget
+///   (atomo indivisibile, stessa eccezione dello split);
+/// - ordine preservato; i separatori di paragrafo restano dentro le finestre.
+///
+/// La stabilità della finestra dipende SOLO da `(unità, budget, ratio)`: a parità
+/// di budget il packing è riproducibile. Vedi i test `pack_*` per l'analisi dei
+/// cache-miss quando il budget cambia (input alla decisione L1 del grilling 03).
+pub fn pack_units(units: Vec<String>, budget: u32, ratio: f64) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur: Option<String> = None;
+    for u in units {
+        match cur.as_mut() {
+            None => cur = Some(u),
+            Some(acc) if est_tokens(format!("{acc}{u}").trim(), ratio) <= budget => {
+                acc.push_str(&u);
+            }
+            Some(_) => {
+                out.push(cur.take().expect("cur is Some in this branch"));
+                cur = Some(u);
+            }
+        }
+    }
+    if let Some(acc) = cur {
+        out.push(acc);
+    }
+    out
+}
+
 /// Spezza `text` in frasi preservando ogni carattere (`concat == text`). Un
 /// confine di frase è `.`/`!`/`?` (con eventuali chiusure) seguito da spazio o
 /// fine testo, oppure un `\n` (righe/liste; `pdfExtract` unisce le righe a capo
@@ -2217,6 +2254,147 @@ Terza frase per riempire il budget. Quarta frase conclusiva.";
                 assert!(!units.is_empty());
             }
         }
+    }
+
+    // --- Prototipo pack_units (local-translation-latency ticket 02) ---------
+
+    /// Pagina densa sintetica: 18 paragrafi da ~40 token l'uno (~700 token
+    /// totali), la forma che oggi produce 18 chiamate sequenziali.
+    fn sample_dense_page() -> String {
+        (1..=18)
+            .map(|i| {
+                format!(
+                    "Paragrafo {i}: la scienza procede per domande, non per risposte \
+definitive, e ogni esperimento ben costruito apre nuove incognite che nessun \
+manuale aveva previsto o catalogato prima."
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    #[test]
+    fn pack_units_roundtrip_reproduces_source_exactly() {
+        for text in [sample_prose(), sample_technical(), &sample_dense_page()] {
+            for budget in [64u32, 256, 512, 900] {
+                let units = split_into_units(text, budget, RATIO);
+                let packed = pack_units(units, budget, RATIO);
+                assert_eq!(
+                    packed.concat(),
+                    text,
+                    "packed round-trip must reproduce the source (budget={budget})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pack_units_windows_fit_the_budget() {
+        for text in [sample_prose(), sample_technical(), &sample_dense_page()] {
+            let budget = 256u32;
+            let packed = pack_units(split_into_units(text, budget, RATIO), budget, RATIO);
+            for w in &packed {
+                assert!(
+                    est_tokens(w.trim(), RATIO) <= budget,
+                    "window over budget ({} > {budget}): {:?}",
+                    est_tokens(w.trim(), RATIO),
+                    w
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pack_units_reduces_call_count_on_dense_page() {
+        let page = sample_dense_page();
+        let budget = 900u32; // budget_unit_text tipico locale (n_ctx 4096)
+        let units = split_into_units(&page, budget, RATIO);
+        assert!(units.len() >= 15, "precondition: many per-paragraph units");
+        let packed = pack_units(units.clone(), budget, RATIO);
+        assert!(
+            packed.len() * 4 <= units.len(),
+            "packing must cut calls at least 4x ({} -> {})",
+            units.len(),
+            packed.len()
+        );
+    }
+
+    #[test]
+    fn pack_units_keeps_oversized_atom_as_own_window() {
+        // Una singola frase-atomo oltre budget resta una finestra a sé e non
+        // ingloba l'unità successiva.
+        let atom = "parola ".repeat(200); // ~350 token, nessun confine di frase
+        let units = vec![atom.clone(), "Frase corta.".to_string()];
+        let packed = pack_units(units, 64, RATIO);
+        assert_eq!(packed.len(), 2, "atom stays alone, short unit follows");
+        assert_eq!(packed[0], atom);
+    }
+
+    #[test]
+    fn pack_units_preserves_degenerate_inputs() {
+        assert_eq!(pack_units(vec!["".to_string()], 512, RATIO), vec!["".to_string()]);
+        assert_eq!(pack_units(Vec::new(), 512, RATIO), Vec::<String>::new());
+        assert_eq!(
+            pack_units(vec!["   \n\n".to_string()], 512, RATIO),
+            vec!["   \n\n".to_string()]
+        );
+    }
+
+    /// Analisi cache-miss (acceptance ticket 02): con la chiave attuale
+    /// `(unit_index, source_hash)`, quante finestre sopravvivono a un repack con
+    /// budget diverso (±200 token, es. summary/glossario cambiati)? Confronta le
+    /// tre semantiche candidate per L1. Run con `--nocapture` per i numeri.
+    #[test]
+    fn measure_pack_repack_cache_stability() {
+        let page = sample_dense_page();
+        let (budget_a, budget_b) = (900u32, 700u32);
+
+        // Semantica 1 — per-paragrafo (oggi): lo split non dipende dal budget
+        // finché i paragrafi restano sotto entrambi i budget → cache stabile.
+        let para_a = split_into_units(&page, budget_a, RATIO);
+        let para_b = split_into_units(&page, budget_b, RATIO);
+        let para_stable = para_a
+            .iter()
+            .zip(&para_b)
+            .filter(|(a, b)| source_hash(a) == source_hash(b))
+            .count();
+        assert_eq!(para_stable, para_a.len(), "per-paragraph units are budget-stable");
+
+        // Semantica 2 — finestre col budget dinamico: budget diverso → finestre
+        // diverse → MISS su (index, hash) e anche su hash-only.
+        let win_a = pack_units(para_a.clone(), budget_a, RATIO);
+        let win_b = pack_units(para_b.clone(), budget_b, RATIO);
+        let by_index = win_a
+            .iter()
+            .zip(&win_b)
+            .filter(|(a, b)| source_hash(a) == source_hash(b))
+            .count();
+        let hashes_b: std::collections::HashSet<String> =
+            win_b.iter().map(|w| source_hash(w)).collect();
+        let by_hash_only = win_a.iter().filter(|w| hashes_b.contains(&source_hash(w))).count();
+
+        // Semantica 3 — finestre a taglia FISSA (costante, indipendente dal
+        // budget dinamico): repack identico per costruzione.
+        let fixed = 512u32;
+        let fix_a = pack_units(para_a.clone(), fixed, RATIO);
+        let fix_b = pack_units(para_b.clone(), fixed, RATIO);
+        let fixed_stable = fix_a
+            .iter()
+            .zip(&fix_b)
+            .filter(|(a, b)| source_hash(a) == source_hash(b))
+            .count();
+        assert_eq!(fixed_stable, fix_a.len(), "fixed-size windows are budget-stable");
+
+        eprintln!(
+            "[measure] repack {budget_a}->{budget_b}: per-paragraph stable={para_stable}/{}; \
+dynamic windows: a={} b={} stable_by_index={by_index} stable_by_hash={by_hash_only}; \
+fixed({fixed}) windows: a={} b={} stable={fixed_stable}",
+            para_a.len(),
+            win_a.len(),
+            win_b.len(),
+            fix_a.len(),
+            fix_b.len()
+        );
     }
 
     // --- STC-09: per-unit resume cache --------------------------------------
