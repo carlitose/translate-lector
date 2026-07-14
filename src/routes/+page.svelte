@@ -539,10 +539,14 @@
       </h2>
       {#if translationError}
         <p class="notice notice-error">{translationError}</p>
-      {:else if translating && !translatedText}
+      {:else if translating}
+        <!-- During a translation, show only the placeholder — never the previous
+             page's (or otherwise stale) translation, regardless of what is still
+             held in `translatedText`. -->
         <p class="notice">Traduzione in corso…</p>
+      {:else}
+        <textarea class="reconstructed" readonly value={translatedText}></textarea>
       {/if}
-      <textarea class="reconstructed" readonly value={translatedText}></textarea>
     </div>
   </section>
 
