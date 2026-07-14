@@ -87,18 +87,21 @@ epiche restano compatibili.
 
 ## Frontier / Blocking Edges
 
-1. **Ticket 01 (research) — Unsloth Studio: cosa serve e come** *(ready, primo edge)*: senza sapere come
-   Unsloth espone il modello (endpoint/protocollo/auth) non si può progettare l'integrazione né validare il
-   contratto.
-2. **Ticket 02 (research/design) — Astrazione provider nell'app** *(dipende da 01 per auth/endpoint)*:
-   rende base-URL/key/modello configurabili per-provider e definisce il selettore + persistenza.
-3. **Ticket 03 (prototype) — Validazione contratto percettore in locale** *(dipende da 01)*: prova che il
-   modello locale produce il JSON del percettore (via json_schema o via fallback) con qualità/latenza usabili.
-4. **Ticket 04 (grilling) — Decisioni umane** *(parallelo a 03; gate prima delle build)*: modello/quant,
-   hardware, default vs opt-in, offline.
+Aggiornato dall'autopilot 2026-07-14: **01 e 02 chiusi**; restano un gate umano (04) e una prova che
+richiede hardware/endpoint (03).
 
-Dopo 01-04: **rivedere la mappa** e derivare i ticket di build verticali (selettore provider → chiamata a
-endpoint locale → traduzione pagina con percettore → cache) con `to-tickets`.
+1. ~~**Ticket 01** — Unsloth Studio: cosa serve e come~~ → ✅ **DONE** (research).
+2. ~~**Ticket 02** — Astrazione provider nell'app~~ → ✅ **DONE** (design pronto per `to-tickets`).
+3. **Ticket 03 (prototype) — Validazione contratto percettore in locale** → ⛔ **BLOCKED (non AFK)**:
+   richiede un endpoint locale in esecuzione. Harness pronto: `prototypes/local-llm/validate-perceptor-contract.mjs`;
+   l'utente lo lancia contro il suo server (~10 min) per produrre il verdetto.
+4. **Ticket 04 (grilling) — Decisioni umane** → ⛔ **GATE UMANO**: brief con raccomandazioni pronto
+   ([decision-brief-local-llm-04.md](./decision-brief-local-llm-04.md)); D1-D7 attendono conferma.
+
+**Frontiera immediata = due azioni umane**: (a) confermare D1-D7 nel decision brief; (b) lanciare l'harness
+del Ticket 03 contro un server locale. Fatte queste, la mappa è pronta per derivare i ticket di build
+verticali (selettore provider → chiamata a endpoint locale → traduzione pagina con percettore → cache) con
+`to-tickets`, usando le slice già elencate in [design-provider-abstraction.md](./design-provider-abstraction.md).
 
 ## Ticket Plan
 
@@ -109,7 +112,7 @@ Cartella: `docs/tickets/local-llm-provider/`
 | 01 | research | Unsloth Studio: come serve un LLM locale (endpoint/protocollo/auth) | ✅ done (`done/`) — [research](./research-unsloth-serving.md) |
 | 02 | research | Astrazione di provider nell'app (base-URL/key/modello configurabili) | ✅ done (`done/`) — [design](./design-provider-abstraction.md) |
 | 03 | prototype | Tenuta del contratto percettore su modello locale (json/fallback/qualità) | ⛔ blocked — richiede endpoint locale in esecuzione (non AFK) |
-| 04 | grilling | Decisioni: modello/quant, hardware, default vs opt-in, offline | ready (gate umano) |
+| 04 | grilling | Decisioni: modello/quant, hardware, default vs opt-in, offline | ⛔ gate umano — brief pronto: [decision-brief](./decision-brief-local-llm-04.md) (D1-D7 attendono conferma) |
 
 ## Next Review
 

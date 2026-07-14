@@ -56,3 +56,25 @@ verdetto, non sappiamo se il provider locale è utile in pratica o solo teoricam
 
 - Design dell'astrazione provider (Ticket 02).
 - Implementazione nell'app (build verticali).
+
+---
+
+## Progress note (autopilot, 2026-07-14) — ⛔ BLOCKED: richiede endpoint locale in esecuzione
+
+Questo ticket **non è completabile AFK**: il verdetto richiede un LLM locale servito su un endpoint
+OpenAI-compatible IN ESECUZIONE (Unsloth Studio / LM Studio / Ollama / llama-server), che non può essere
+avviato in ambiente autonomo. Nessun risultato di QA è stato inventato.
+
+**Deliverable AFK prodotto** (la parte fattibile senza server):
+- Harness di validazione pronto all'uso: `prototypes/local-llm/validate-perceptor-contract.mjs`
+  (syntax-check OK con `node --check`). Replica il contratto del percettore (§4.4), invia 3 pagine
+  consecutive, misura: contratto JSON rispettato N/3, latenza media, coerenza summary/glossario, e prova
+  sia il percorso **con `json_schema`** (`--schema`) sia il **fallback** di estrazione JSON.
+
+**Per chiudere il ticket** (passi umani, ~10 min):
+1. Avvia un server locale (vedi [research-unsloth-serving.md](../../specs/research-unsloth-serving.md) §6).
+2. `node prototypes/local-llm/validate-perceptor-contract.mjs --base <URL> --model <ID> [--key <k>] [--schema]`
+3. Ripeti con e senza `--schema`; annota N/3, latenza, qualità, e la nota di compatibilità col contratto
+   strutturato OCR nel parent spec, poi sposta il ticket in `done/`.
+
+**Blocca:** nulla a valle strettamente, ma il verdetto informa D1/D6 del [decision-brief Ticket 04](../../specs/decision-brief-local-llm-04.md).
