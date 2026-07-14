@@ -34,6 +34,15 @@ motore di traduzione esistente.
   **llama-server** (8080). **Conclusione**: nessun cambio di protocollo — basta rendere **base-URL + key**
   configurabili. Dettaglio + curl di verifica + fonti: [research-unsloth-serving.md](./research-unsloth-serving.md).
   *Aperto*: round-trip curl live non eseguibile AFK → verifica demandata all'utente (§6/§7 del doc).
+- **Astrazione provider = PROGETTATA** (Ticket 02, 2026-07-14). Design chiuso e grounded nel codice:
+  client rinominato `ChatCompletionsClient` con `base_url` + `requires_key` + key opzionale; provider
+  built-in come preset in codice (openrouter | lmstudio | ollama | llama-server | unsloth), `base_url`/
+  `model` sovrascrivibili e persistiti nella **tabella `settings` esistente** (nessuna nuova tabella);
+  keychain **provider-scoped** con schema `"{provider_id}-api-key"` che rende `openrouter` →
+  `openrouter-api-key` = account odierno (**zero migrazione**); guardia EC03 condizionale a `requires_key`;
+  ladder di degradazione e fallback JSON invariati. Dettaglio + change-point (file:func) + slice di build:
+  [design-provider-abstraction.md](./design-provider-abstraction.md). *Domande aperte per il gate umano*
+  ripiegate nel Ticket 04.
 
 ## Fatti di codebase rilevanti (grounding)
 
@@ -51,8 +60,8 @@ motore di traduzione esistente.
 ## Not Yet Specified
 
 - ~~Cos'è Unsloth Studio e come serve~~ → **RISOLTO dal Ticket 01** (vedi Decisions So Far).
-- **Astrazione di provider nell'app**: base-URL configurabile, selettore provider (OpenRouter | Locale),
-  key opzionale per-provider, modello per-provider; dove si persiste (settings/keychain); UI. → Ticket 02.
+- ~~Astrazione di provider nell'app~~ → **PROGETTATO dal Ticket 02** (vedi Decisions So Far +
+  [design-provider-abstraction.md](./design-provider-abstraction.md)). Resta da *implementare* nelle build.
 - **Tenuta del contratto percettore sul modello locale**: il modello locale onora `json_schema`? Se no, il
   fallback di parsing regge il JSON del percettore in modo affidabile? Qualità/latenza accettabili? → Ticket 03.
 - **Decisioni umane**: quale modello/quantizzazione target, vincoli hardware (GPU/RAM), locale come default o
@@ -98,7 +107,7 @@ Cartella: `docs/tickets/local-llm-provider/`
 | # | Tipo | Titolo | Stato |
 |---|------|--------|-------|
 | 01 | research | Unsloth Studio: come serve un LLM locale (endpoint/protocollo/auth) | ✅ done (`done/`) — [research](./research-unsloth-serving.md) |
-| 02 | research | Astrazione di provider nell'app (base-URL/key/modello configurabili) | ready (sbloccato da 01) |
+| 02 | research | Astrazione di provider nell'app (base-URL/key/modello configurabili) | ✅ done (`done/`) — [design](./design-provider-abstraction.md) |
 | 03 | prototype | Tenuta del contratto percettore su modello locale (json/fallback/qualità) | ⛔ blocked — richiede endpoint locale in esecuzione (non AFK) |
 | 04 | grilling | Decisioni: modello/quant, hardware, default vs opt-in, offline | ready (gate umano) |
 
