@@ -37,9 +37,11 @@ export function isRateLimitError(err: unknown): boolean {
   return errorText(err).includes('EC07');
 }
 
-/** User-facing hint shown when the key is missing (points at ⚙️). */
+/** User-facing hint shown when the key is missing (points at ⚙️). Provider-neutral:
+ *  the active provider may be OpenRouter or a local server, and its key is stored
+ *  per-provider, so the hint must not name a specific provider (ticket 11). */
 export const MISSING_KEY_HINT =
-  'API key OpenRouter mancante o non valida. Aprila con ⚙️ (in alto a destra) e configurala.';
+  'API key mancante o non valida per il provider selezionato. Configurala in ⚙️ (in alto a destra).';
 
 /** EC02: offline — cached pages stay readable, new ones can't be translated. */
 export const OFFLINE_HINT =
