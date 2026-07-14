@@ -363,7 +363,14 @@ impl LlmError {
                 "Il modello selezionato non supporta i parametri richiesti \
                  (nessun endpoint compatibile). {m}"
             ),
-            LlmError::Timeout(m) => format!("Errore di rete/servizio LLM (timeout): {m}"),
+            // The message is built in full (including any generic prefix) at
+            // construction time in `classify_send_error` — same precedent as
+            // `Unreachable` below — so it's owned as-is here. This avoids
+            // double-prefixing the already-actionable local-timeout copy
+            // (ticket 13 review) while the remote/generic copy still carries
+            // its "Errore di rete/servizio LLM (timeout): " prefix, just
+            // added at the source instead of here.
+            LlmError::Timeout(m) => m.clone(),
             LlmError::ServerError(m) => format!("Errore del servizio LLM: {m}"),
             LlmError::RateLimited(m) => {
                 format!("EC07: limite di richieste raggiunto (rate limit). Riprova tra poco. {m}")
@@ -408,17 +415,29 @@ impl LlmError {
 /// Bounded retry policy for transient transport failures. Backoff is
 /// exponential: `base_delay * 2^attempt`. Tests use [`RetryPolicy::no_delay`]
 /// so no wall-clock time is spent.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryPolicy {
     /// Total attempts (including the first). Clamped to at least 1.
     pub max_attempts: u32,
     /// Delay before the first retry; doubles each subsequent retry.
     pub base_delay: std::time::Duration,
+    /// Whether a [`LlmError::Timeout`] is retried with backoff like other
+    /// transient errors (default `true`, preserving today's behaviour for
+    /// OpenRouter/cloud). Ticket 13 / decision L4: for a systematically slow
+    /// local server a timeout signals a real problem — retrying just triples
+    /// the wait without helping — so local providers set this to `false`.
+    /// Other transient errors (`ServerError`, `RateLimited`, `Offline`) are
+    /// unaffected by this flag and keep retrying up to `max_attempts`.
+    pub retry_on_timeout: bool,
 }
 
 impl Default for RetryPolicy {
     fn default() -> Self {
-        Self { max_attempts: 3, base_delay: std::time::Duration::from_millis(500) }
+        Self {
+            max_attempts: 3,
+            base_delay: std::time::Duration::from_millis(500),
+            retry_on_timeout: true,
+        }
     }
 }
 
@@ -426,7 +445,24 @@ impl RetryPolicy {
     /// A policy with no backoff delay, for fast unit tests.
     #[cfg(test)]
     pub fn no_delay(max_attempts: u32) -> Self {
-        Self { max_attempts, base_delay: std::time::Duration::ZERO }
+        Self { max_attempts, base_delay: std::time::Duration::ZERO, retry_on_timeout: true }
+    }
+
+    /// The retry policy to use for a given provider `base_url` (ticket 13,
+    /// decision L4): a **local** endpoint does not retry on timeout — a
+    /// systematically slow local server signals a real problem, and retrying
+    /// just triples the wait without helping; a **remote**/cloud endpoint
+    /// keeps the default (retries everything transient, including timeouts).
+    ///
+    /// Kept here next to [`is_local_url`] rather than inline at each call
+    /// site so a future second caller (e.g. ticket 06 prefetch) reuses the
+    /// same rule instead of re-deriving (and potentially dropping) it.
+    pub fn for_base_url(base_url: &str) -> Self {
+        if is_local_url(base_url) {
+            Self { retry_on_timeout: false, ..Self::default() }
+        } else {
+            Self::default()
+        }
     }
 
     /// Backoff delay before the retry that follows the given zero-based failed
@@ -461,8 +497,13 @@ impl ChatClient for RetryingChatClient<'_> {
                 Ok(resp) => return Ok(resp),
                 Err(e) => {
                     attempt += 1;
-                    // Give up on the last attempt or on a permanent error.
-                    if attempt >= max || !e.is_transient() {
+                    // Give up on the last attempt, on a permanent error, or
+                    // (ticket 13 / decision L4) on a Timeout when the policy
+                    // has retry_on_timeout disabled (local providers) — other
+                    // transient errors are untouched by that flag.
+                    let give_up_on_timeout =
+                        matches!(e, LlmError::Timeout(_)) && !self.policy.retry_on_timeout;
+                    if attempt >= max || !e.is_transient() || give_up_on_timeout {
                         return Err(e);
                     }
                     std::thread::sleep(self.policy.backoff(attempt - 1));
@@ -529,17 +570,21 @@ pub struct ChatCompletionsClient {
 }
 
 impl ChatCompletionsClient {
+    /// `timeout_secs` bounds the whole request (connect + send + receive body),
+    /// per-provider (ticket 13): explicit rather than relying on reqwest's
+    /// undocumented-in-app 30s default. Falls back to an untimed client (never
+    /// panics) if the builder were to fail, mirroring [`probe_reachable`]'s style.
     pub fn new(
         base_url: impl Into<String>,
         api_key: impl Into<String>,
         send_openrouter_headers: bool,
+        timeout_secs: u32,
     ) -> Self {
-        Self {
-            base_url: base_url.into(),
-            api_key: api_key.into(),
-            send_openrouter_headers,
-            http: reqwest::blocking::Client::new(),
-        }
+        let http = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs.into()))
+            .build()
+            .unwrap_or_else(|_| reqwest::blocking::Client::new());
+        Self { base_url: base_url.into(), api_key: api_key.into(), send_openrouter_headers, http }
     }
 }
 
@@ -679,7 +724,24 @@ pub fn classify_send_error(
     msg: String,
 ) -> LlmError {
     if is_timeout {
-        LlmError::Timeout(msg)
+        if is_local_url(base_url) {
+            // Ticket 13: a timeout against a LOCAL endpoint is actionable —
+            // point the user at the configurable per-provider timeout, a
+            // faster model, or a smaller n_ctx, instead of the generic copy.
+            // The message is complete as-is (no generic prefix added later by
+            // `user_message`, to avoid double-prefixing — ticket 13 review).
+            LlmError::Timeout(
+                "Il server locale è troppo lento o ha chiuso la connessione. \
+                 Aumenta il timeout in ⚙️ (Impostazioni provider), usa un modello \
+                 più veloce, o riduci n_ctx del server."
+                    .to_string(),
+            )
+        } else {
+            // Remote/generic case: build the full user-facing message here
+            // (including the prefix) so `user_message` can own every variant
+            // uniformly, same as `Unreachable`.
+            LlmError::Timeout(format!("Errore di rete/servizio LLM (timeout): {msg}"))
+        }
     } else if is_connect {
         if is_local_url(base_url) {
             LlmError::Unreachable(base_url.to_string())
@@ -2225,14 +2287,51 @@ E così, senza fretta, l'argomentazione si chiude.";
 
     #[test]
     fn timeout_and_generic_send_errors_are_classified_independently_of_host() {
-        assert_eq!(
+        // A timeout is always classified as Timeout regardless of host (the
+        // *message* is what differs by host — ticket 13, see the dedicated
+        // tests below); a non-timeout/non-connect failure stays Http either way.
+        assert!(matches!(
             classify_send_error(true, false, "http://localhost:8888/v1/chat/completions", "t".into()),
-            LlmError::Timeout("t".into())
+            LlmError::Timeout(_)
+        ));
+        // The generic/remote branch now owns its final message (including the
+        // prefix) at construction time too, same as the local branch — so
+        // `user_message` never has to guess whether a prefix is still needed
+        // (ticket 13 review: avoids double-prefixing the local message).
+        assert_eq!(
+            classify_send_error(true, false, OPENROUTER_URL, "t".into()),
+            LlmError::Timeout("Errore di rete/servizio LLM (timeout): t".into())
         );
         assert_eq!(
             classify_send_error(false, false, "http://localhost:8888/v1/chat/completions", "x".into()),
             LlmError::Http("x".into())
         );
+    }
+
+    #[test]
+    fn timeout_on_a_local_url_gets_an_actionable_local_message() {
+        // Ticket 13: a timeout against a local server means the local inference
+        // is too slow (or the server dropped the connection) — the message must
+        // point the user at raising the timeout / a faster model / smaller
+        // n_ctx, not the generic cloud-y copy.
+        let err = classify_send_error(true, false, "http://localhost:8888/v1/chat/completions", "t".into());
+        let msg = err.user_message();
+        assert!(
+            msg.contains("server locale") || msg.contains("Server locale"),
+            "names the local server: {msg}"
+        );
+        assert!(msg.contains("⚙️"), "points at settings to raise the timeout: {msg}");
+        assert!(
+            !msg.contains("Errore di rete/servizio LLM (timeout): Il server locale"),
+            "must not double-prefix the already-actionable local message: {msg}"
+        );
+    }
+
+    #[test]
+    fn timeout_on_a_remote_url_keeps_the_generic_message() {
+        let err = classify_send_error(true, false, OPENROUTER_URL, "t".into());
+        let msg = err.user_message();
+        assert_eq!(msg, "Errore di rete/servizio LLM (timeout): t");
     }
 
     #[test]
@@ -2278,6 +2377,21 @@ E così, senza fretta, l'argomentazione si chiude.";
         assert!(!is_local_url(OPENROUTER_URL));
         assert!(!is_local_url("https://api.example.com/v1/chat/completions"));
         assert!(!is_local_url("http://192.168.1.10:8888/v1")); // LAN IP, not loopback
+    }
+
+    #[test]
+    fn retry_policy_for_base_url_disables_timeout_retry_only_for_local() {
+        // Ticket 13 review: the L4 rule (no retry-on-timeout for a local
+        // provider) now lives next to RetryPolicy/is_local_url so a future
+        // second call site (e.g. ticket 06 prefetch) can reuse it instead of
+        // re-deriving the if/else and risking dropping the rule.
+        let local = RetryPolicy::for_base_url("http://localhost:8888/v1/chat/completions");
+        assert!(!local.retry_on_timeout, "local providers must not retry on timeout");
+        assert_eq!(local.max_attempts, RetryPolicy::default().max_attempts);
+        assert_eq!(local.base_delay, RetryPolicy::default().base_delay);
+
+        let remote = RetryPolicy::for_base_url(OPENROUTER_URL);
+        assert_eq!(remote, RetryPolicy::default());
     }
 
     #[test]
@@ -2333,7 +2447,11 @@ E così, senza fretta, l'argomentazione si chiude.";
 
     #[test]
     fn backoff_is_exponential_from_the_base_delay() {
-        let p = RetryPolicy { max_attempts: 4, base_delay: Duration::from_millis(100) };
+        let p = RetryPolicy {
+            max_attempts: 4,
+            base_delay: Duration::from_millis(100),
+            retry_on_timeout: true,
+        };
         assert_eq!(p.backoff(0), Duration::from_millis(100));
         assert_eq!(p.backoff(1), Duration::from_millis(200));
         assert_eq!(p.backoff(2), Duration::from_millis(400));
@@ -2403,6 +2521,31 @@ E così, senza fretta, l'argomentazione si chiude.";
     }
 
     #[test]
+    fn retry_on_timeout_false_gives_up_immediately_on_timeout_but_not_on_other_transients() {
+        // Ticket 13 / decision L4: a local provider disables retry-on-timeout.
+        // A Timeout must NOT be retried (1 call only)...
+        let inner = SeqClient::new(vec![Err(LlmError::Timeout("t1".into()))]);
+        let policy = RetryPolicy { retry_on_timeout: false, ..RetryPolicy::no_delay(3) };
+        let client = RetryingChatClient::new(&inner, policy);
+        let err = client.complete(&a_request()).unwrap_err();
+        assert!(matches!(err, LlmError::Timeout(_)));
+        assert_eq!(inner.calls.get(), 1, "timeout is not retried when retry_on_timeout is false");
+
+        // ...but ServerError/RateLimited/Offline still retry up to max_attempts
+        // with the very same policy.
+        let inner = SeqClient::new(vec![
+            Err(LlmError::ServerError("500".into())),
+            Err(LlmError::RateLimited("429".into())),
+            Err(LlmError::Offline("net".into())),
+        ]);
+        let policy = RetryPolicy { retry_on_timeout: false, ..RetryPolicy::no_delay(3) };
+        let client = RetryingChatClient::new(&inner, policy);
+        let err = client.complete(&a_request()).unwrap_err();
+        assert!(matches!(err, LlmError::Offline(_)));
+        assert_eq!(inner.calls.get(), 3, "other transient errors keep retrying to max_attempts");
+    }
+
+    #[test]
     fn retry_does_not_retry_permanent_errors_ec03() {
         let inner = SeqClient::new(vec![Err(LlmError::MissingApiKey)]);
         let client = RetryingChatClient::new(&inner, RetryPolicy::no_delay(5));
@@ -2422,9 +2565,48 @@ E così, senza fretta, l'argomentazione si chiude.";
             "http://127.0.0.1:9/v1/chat/completions",
             "   ",
             /* send_openrouter_headers = */ true,
+            30,
         );
         let req = build_request("openai/gpt-4o", build_messages("it", "x", "", "", "", false, 1000), 4096);
         assert_eq!(client.complete(&req), Err(LlmError::MissingApiKey));
+    }
+
+    #[test]
+    fn chat_completions_client_honors_the_configured_timeout() {
+        // Ticket 13: prove the configured timeout is *actually* applied by the
+        // built reqwest client, not just plumbed through unused. A TcpListener
+        // that accepts the connection but never writes a response simulates a
+        // hung/very-slow local server (same style as probe_reachable's tests).
+        // With timeout_secs=1 this must fail fast with LlmError::Timeout, not
+        // hang for reqwest's 30s implicit default.
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = std::thread::spawn(move || {
+            // Accept and hold the connection open without ever responding.
+            // Binding the stream (not `let _ = ...`) matters: dropping it
+            // immediately would close/reset the connection right away instead
+            // of leaving the client waiting on a silent, still-open socket.
+            let (_stream, _addr) = listener.accept().unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        });
+
+        let base_url = format!("http://{addr}/v1/chat/completions");
+        let client = ChatCompletionsClient::new(base_url, "test-key", false, 1);
+        let req = build_request("openai/gpt-4o", build_messages("it", "x", "", "", "", false, 1000), 4096);
+
+        let start = std::time::Instant::now();
+        let err = client.complete(&req).unwrap_err();
+        let elapsed = start.elapsed();
+
+        assert!(matches!(err, LlmError::Timeout(_)), "expected a Timeout, got {err:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "timed out at ~1s, not reqwest's 30s implicit default (elapsed={elapsed:?})"
+        );
+        // Don't join the spawned thread: it sleeps 5s regardless of the test's
+        // own ~1s timeout, and joining would make this test as slow as it.
     }
 
     // --- Base-URL routing + attribution-header gating (loopback, no internet) -
@@ -2460,7 +2642,7 @@ E così, senza fretta, l'argomentazione si chiude.";
         });
 
         let base_url = format!("http://{addr}/v1/chat/completions");
-        let client = ChatCompletionsClient::new(base_url, "test-key", send_openrouter_headers);
+        let client = ChatCompletionsClient::new(base_url, "test-key", send_openrouter_headers, 30);
         let req = build_request("openai/gpt-4o", build_messages("it", "x", "", "", "", false, 1000), 4096);
         let _ = client.complete(&req);
         let captured = rx.recv().unwrap();

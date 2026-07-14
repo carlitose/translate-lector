@@ -15,20 +15,33 @@ chiude la connessione lenta, non dall'app (che oggi non ha timeout → anche un 
 
 ## Acceptance Criteria
 
-- [ ] Confermata la sorgente del timeout (app vs server/proxy) con una prova: una richiesta lenta reale al
-      server locale, osservando dopo quanto e da chi la connessione cade.
-- [ ] Il client chat ha un **timeout esplicito e generoso**, **configurabile per-provider** (riusare il
-      pattern `ProviderConfig`/settings dei Ticket 07-08; default locale alto, es. 180s; OpenRouter invariato).
-      Elimina il rischio di hang infinito e accoglie l'inferenza locale lenta quando il server tiene aperta
-      la connessione.
-- [ ] Messaggio d'errore timeout **azionabile per il caso locale** (es.: "Il server locale è troppo lento o
-      ha chiuso la connessione. Aumenta il timeout del server/proxy (Unsloth Studio/llama-server), usa un
-      modello più veloce o riduci `n_ctx`."), distinto dal timeout cloud.
-- [ ] Rivalutare la policy di **retry su timeout**: oggi `Timeout` è transient e viene ritentato con backoff
-      (`is_transient`, `llm.rs`); per una richiesta locale sistematicamente lenta il retry raddoppia l'attesa
-      senza aiutare. Decidere se per i provider locali limitare/annullare il retry su timeout, o mantenerlo.
-- [ ] `cargo test` verde (test sul timeout configurato / classificazione / messaggio); `npm run check` +
-      `vitest` se si tocca la UI/mapping errori.
+- [x] Confermata la sorgente del timeout (app vs server/proxy) con una prova: una richiesta lenta reale al
+      server locale, osservando dopo quanto e da chi la connessione cade. **Confermato senza dover ripetere
+      la prova dal vivo**: `docs/tickets/local-translation-latency/done/01-research-latency-baseline.md`
+      (§3, punto 3) documenta con evidenza da docs.rs (`blocking/client.rs`) che
+      `reqwest::blocking::Client::new()` ha un **timeout di default di 30s** — mai reso esplicito dall'app.
+      Una chiamata reale misurata durava 29.7s, al pelo del limite. Non è il proxy/Unsloth Studio a tagliare
+      (come ipotizzato inizialmente qui): è il default del client stesso.
+- [x] Il client chat ha un **timeout esplicito e generoso**, **configurabile per-provider** (riuso esatto del
+      pattern `ProviderConfig`/settings dei Ticket 07-08: `DEFAULT_TIMEOUT_SECS_CLOUD = 30` / `..._LOCAL =
+      180`, chiave `provider.{id}.timeout_secs`, risoluzione in `get_provider_config`). Il campo `timeout_secs`
+      è passato a `ChatCompletionsClient::new`, che ora costruisce il `reqwest::blocking::Client` con
+      `.timeout(Duration::from_secs(timeout_secs))` (fallback sicuro, non-panicking, se il builder fallisse).
+      Verificato end-to-end con un test che apre un `TcpListener` che accetta ma non risponde mai: con
+      `timeout_secs=1` la chiamata fallisce con `LlmError::Timeout` in ~1s, non nei 30s impliciti di prima.
+- [x] Messaggio d'errore timeout **azionabile per il caso locale**, distinto dal timeout cloud: riusa
+      `is_local_url(base_url)` dentro `classify_send_error` per differenziare il testo portato da
+      `LlmError::Timeout(msg)` (nessuna nuova variante); il messaggio remoto resta quello generico invariato.
+- [x] Policy di **retry su timeout** rivalutata e decisa: **decisione L4** (vedi
+      `docs/specs/decision-brief-latency-03.md` §L4) — **0 retry** sul timeout per i provider locali (un
+      timeout locale segnala un problema reale; ritentare triplica l'attesa senza aiutare), retry invariato
+      (×3 con backoff) per OpenRouter/cloud e per gli altri errori transient (`ServerError`/`RateLimited`/
+      `Offline`) anche in locale. Implementato con `RetryPolicy.retry_on_timeout: bool` (default `true`,
+      preserva il comportamento esistente/i test esistenti); `lib.rs` sceglie `retry_on_timeout: false` quando
+      `llm::is_local_url(&cfg.base_url)`.
+- [x] `cargo test` verde (test sul timeout configurato / classificazione / messaggio). Non toccata la UI/
+      mapping errori frontend (fuori scope per questo ticket, vedi sotto) → `npm run check`/`vitest` non
+      necessari.
 
 ## Blocked By
 

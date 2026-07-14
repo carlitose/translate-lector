@@ -144,6 +144,18 @@ pub const DEFAULT_N_CTX_CLOUD: u32 = 128_000;
 /// Overridabile per-provider (`provider.<id>.n_ctx`).
 pub const DEFAULT_N_CTX_LOCAL: u32 = 4096;
 
+/// Default request timeout (secondi) per il provider cloud (OpenRouter).
+/// Ticket 13: coincide col default implicito di `reqwest::blocking::Client::new()`
+/// (docs.rs `blocking/client.rs`: `Timeout(Some(Duration::from_secs(30)))`,
+/// confermato in `docs/tickets/local-translation-latency/done/01-research-latency-baseline.md`),
+/// quindi renderlo esplicito non cambia il comportamento OpenRouter.
+pub const DEFAULT_TIMEOUT_SECS_CLOUD: u32 = 30;
+/// Default request timeout (secondi) per i provider locali
+/// (unsloth/lmstudio/ollama/llamaserver). Generoso: l'inferenza locale su
+/// pagine dense può richiedere minuti (ticket 13). Overridabile per-provider
+/// (`provider.<id>.timeout_secs`).
+pub const DEFAULT_TIMEOUT_SECS_LOCAL: u32 = 180;
+
 /// A selectable LLM provider: identità + endpoint + modello. `base_url` e `model`
 /// hanno default built-in ma sono overridabili (persistiti in `settings`); per i
 /// provider locali `model` parte vuoto ed è scelto poi a mano (free-text).
@@ -164,6 +176,11 @@ pub struct ProviderConfig {
     /// Ticket 07: input della formula di budget (locale ~4096, cloud molto
     /// grande così il budget non vincola).
     pub n_ctx: u32,
+    /// Timeout della richiesta HTTP in secondi (default del preset o override
+    /// utente). Ticket 13: esplicito e configurabile per-provider (cloud 30s
+    /// = default implicito reqwest invariato; locale 180s, generoso per
+    /// l'inferenza lenta).
+    pub timeout_secs: u32,
 }
 
 /// Built-in provider presets (design §2, research §5/§Q3). Le base-URL locali
@@ -179,6 +196,7 @@ pub fn provider_presets() -> Vec<ProviderConfig> {
             model: DEFAULT_MODEL.to_string(),
             max_tokens: DEFAULT_MAX_TOKENS_CLOUD,
             n_ctx: DEFAULT_N_CTX_CLOUD,
+            timeout_secs: DEFAULT_TIMEOUT_SECS_CLOUD,
         },
         ProviderConfig {
             id: "unsloth".to_string(),
@@ -187,6 +205,7 @@ pub fn provider_presets() -> Vec<ProviderConfig> {
             model: String::new(),
             max_tokens: DEFAULT_MAX_TOKENS_LOCAL,
             n_ctx: DEFAULT_N_CTX_LOCAL,
+            timeout_secs: DEFAULT_TIMEOUT_SECS_LOCAL,
         },
         ProviderConfig {
             id: "lmstudio".to_string(),
@@ -195,6 +214,7 @@ pub fn provider_presets() -> Vec<ProviderConfig> {
             model: String::new(),
             max_tokens: DEFAULT_MAX_TOKENS_LOCAL,
             n_ctx: DEFAULT_N_CTX_LOCAL,
+            timeout_secs: DEFAULT_TIMEOUT_SECS_LOCAL,
         },
         ProviderConfig {
             id: "ollama".to_string(),
@@ -203,6 +223,7 @@ pub fn provider_presets() -> Vec<ProviderConfig> {
             model: String::new(),
             max_tokens: DEFAULT_MAX_TOKENS_LOCAL,
             n_ctx: DEFAULT_N_CTX_LOCAL,
+            timeout_secs: DEFAULT_TIMEOUT_SECS_LOCAL,
         },
         ProviderConfig {
             id: "llamaserver".to_string(),
@@ -211,6 +232,7 @@ pub fn provider_presets() -> Vec<ProviderConfig> {
             model: String::new(),
             max_tokens: DEFAULT_MAX_TOKENS_LOCAL,
             n_ctx: DEFAULT_N_CTX_LOCAL,
+            timeout_secs: DEFAULT_TIMEOUT_SECS_LOCAL,
         },
     ]
 }
@@ -242,6 +264,12 @@ pub fn provider_nctx_key(id: &str) -> String {
     format!("provider.{id}.n_ctx")
 }
 
+/// Settings key holding a provider's request-timeout override:
+/// `provider.{id}.timeout_secs` (ticket 13).
+pub fn provider_timeout_key(id: &str) -> String {
+    format!("provider.{id}.timeout_secs")
+}
+
 /// Read the active provider id, falling back to [`DEFAULT_PROVIDER_ID`] (D3:
 /// unsloth) when unset or stored blank.
 pub fn get_active_provider(conn: &Connection) -> rusqlite::Result<String> {
@@ -263,6 +291,20 @@ pub fn set_active_provider(conn: &Connection, id: &str) -> rusqlite::Result<()> 
 /// `model` setting via [`get_model`] (back-compat §8), so existing users keep
 /// their chosen model. An unknown id yields a bare config (id as label, empty
 /// endpoint) so manual overrides still apply.
+/// Resolve a per-provider `u32` override stored under `key`, falling back to
+/// `default` when the setting is absent, blank, unparsable, or not a strictly
+/// positive integer. Shared by `max_tokens`, `n_ctx`, and `timeout_secs` in
+/// [`get_provider_config`], which previously duplicated this get → trim →
+/// parse → validate chain three times (maintainability review, ticket 13).
+fn resolve_u32_override(conn: &Connection, key: &str, default: u32) -> rusqlite::Result<u32> {
+    Ok(
+        match get_setting(conn, key)?.as_deref().map(str::trim).map(str::parse::<u32>) {
+            Some(Ok(n)) if n > 0 => n,
+            _ => default,
+        },
+    )
+}
+
 pub fn get_provider_config(conn: &Connection, id: &str) -> rusqlite::Result<ProviderConfig> {
     let preset = provider_preset(id).unwrap_or_else(|| ProviderConfig {
         id: id.to_string(),
@@ -275,6 +317,9 @@ pub fn get_provider_config(conn: &Connection, id: &str) -> rusqlite::Result<Prov
         // Idem per il context window: una finestra piccola è più prudente per
         // il budget che sovrastimare lo spazio disponibile.
         n_ctx: DEFAULT_N_CTX_LOCAL,
+        // Idem per il timeout: un id sconosciuto è trattato come locale, quindi
+        // generoso invece del breve default cloud.
+        timeout_secs: DEFAULT_TIMEOUT_SECS_LOCAL,
     });
 
     let base_url = match get_setting(conn, &provider_base_url_key(id))? {
@@ -291,26 +336,17 @@ pub fn get_provider_config(conn: &Connection, id: &str) -> rusqlite::Result<Prov
 
     // max_tokens override: intero positivo, altrimenti il default del preset
     // (cloud generoso / locale con margine). Un valore invalido o 0 è ignorato.
-    let max_tokens = match get_setting(conn, &provider_max_tokens_key(id))?
-        .as_deref()
-        .map(str::trim)
-        .map(str::parse::<u32>)
-    {
-        Some(Ok(n)) if n > 0 => n,
-        _ => preset.max_tokens,
-    };
+    let max_tokens = resolve_u32_override(conn, &provider_max_tokens_key(id), preset.max_tokens)?;
 
     // n_ctx override (ticket 07): intero positivo, altrimenti il default del
     // preset (locale ~4096 / cloud molto grande). Un valore invalido o 0 è
     // ignorato, così il budget non parte mai da una finestra assurda.
-    let n_ctx = match get_setting(conn, &provider_nctx_key(id))?
-        .as_deref()
-        .map(str::trim)
-        .map(str::parse::<u32>)
-    {
-        Some(Ok(n)) if n > 0 => n,
-        _ => preset.n_ctx,
-    };
+    let n_ctx = resolve_u32_override(conn, &provider_nctx_key(id), preset.n_ctx)?;
+
+    // timeout_secs override (ticket 13): intero positivo, altrimenti il default
+    // del preset (cloud 30s = default reqwest invariato / locale 180s generoso).
+    // Un valore invalido o 0 è ignorato.
+    let timeout_secs = resolve_u32_override(conn, &provider_timeout_key(id), preset.timeout_secs)?;
 
     Ok(ProviderConfig {
         id: preset.id,
@@ -319,6 +355,7 @@ pub fn get_provider_config(conn: &Connection, id: &str) -> rusqlite::Result<Prov
         model,
         max_tokens,
         n_ctx,
+        timeout_secs,
     })
 }
 
@@ -707,6 +744,86 @@ mod tests {
         assert_eq!(
             get_provider_config(&c, "mystery").unwrap().n_ctx,
             DEFAULT_N_CTX_LOCAL
+        );
+    }
+
+    // --- Ticket 13: per-provider timeout_secs (inferenza locale lenta) -------
+
+    #[test]
+    fn provider_timeout_key_formats_scoped_key() {
+        assert_eq!(provider_timeout_key("unsloth"), "provider.unsloth.timeout_secs");
+        assert_eq!(provider_timeout_key("openrouter"), "provider.openrouter.timeout_secs");
+    }
+
+    #[test]
+    fn openrouter_preset_keeps_the_reqwest_default_timeout() {
+        // Cloud invariato: 30s coincide col default implicito di
+        // reqwest::blocking::Client::new() (confermato nel research del ticket
+        // local-translation-latency/01), quindi renderlo esplicito non cambia
+        // il comportamento OpenRouter.
+        assert_eq!(provider_preset("openrouter").unwrap().timeout_secs, DEFAULT_TIMEOUT_SECS_CLOUD);
+        assert_eq!(DEFAULT_TIMEOUT_SECS_CLOUD, 30);
+    }
+
+    #[test]
+    fn local_presets_default_to_a_generous_timeout() {
+        // I modelli locali possono impiegare minuti su pagine dense (ticket 13):
+        // ogni preset locale usa il default generoso.
+        for id in ["unsloth", "lmstudio", "ollama", "llamaserver"] {
+            let t = provider_preset(id).unwrap().timeout_secs;
+            assert_eq!(t, DEFAULT_TIMEOUT_SECS_LOCAL, "{id} defaults to the local timeout");
+        }
+        assert_eq!(DEFAULT_TIMEOUT_SECS_LOCAL, 180);
+    }
+
+    #[test]
+    fn local_default_timeout_is_larger_than_cloud() {
+        assert!(DEFAULT_TIMEOUT_SECS_LOCAL > DEFAULT_TIMEOUT_SECS_CLOUD);
+    }
+
+    #[test]
+    fn get_provider_config_returns_the_preset_timeout_by_default() {
+        let c = conn();
+        assert_eq!(
+            get_provider_config(&c, "openrouter").unwrap().timeout_secs,
+            DEFAULT_TIMEOUT_SECS_CLOUD
+        );
+        assert_eq!(
+            get_provider_config(&c, "unsloth").unwrap().timeout_secs,
+            DEFAULT_TIMEOUT_SECS_LOCAL
+        );
+    }
+
+    #[test]
+    fn get_provider_config_honors_a_timeout_override() {
+        let c = conn();
+        set_setting(&c, &provider_timeout_key("unsloth"), "60").unwrap();
+        assert_eq!(get_provider_config(&c, "unsloth").unwrap().timeout_secs, 60);
+    }
+
+    #[test]
+    fn get_provider_config_ignores_an_invalid_or_zero_timeout_override() {
+        let c = conn();
+        set_setting(&c, &provider_timeout_key("unsloth"), "abc").unwrap();
+        assert_eq!(
+            get_provider_config(&c, "unsloth").unwrap().timeout_secs,
+            DEFAULT_TIMEOUT_SECS_LOCAL
+        );
+        set_setting(&c, &provider_timeout_key("unsloth"), "0").unwrap();
+        assert_eq!(
+            get_provider_config(&c, "unsloth").unwrap().timeout_secs,
+            DEFAULT_TIMEOUT_SECS_LOCAL
+        );
+    }
+
+    #[test]
+    fn get_provider_config_unknown_id_uses_conservative_local_timeout() {
+        // Idem per il timeout: un id sconosciuto è trattato come locale,
+        // quindi generoso invece del breve default cloud.
+        let c = conn();
+        assert_eq!(
+            get_provider_config(&c, "mystery").unwrap().timeout_secs,
+            DEFAULT_TIMEOUT_SECS_LOCAL
         );
     }
 }

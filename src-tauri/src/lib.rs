@@ -292,12 +292,19 @@ async fn translate_page(
         // Costruisci il client sull'endpoint del provider attivo; le attribution
         // header OpenRouter partono solo per openrouter (Ticket 05).
         let base = llm::ChatCompletionsClient::new(
-            cfg.base_url,
+            cfg.base_url.clone(),
             api_key,
             /* send_openrouter_headers = */ active_id == "openrouter",
+            cfg.timeout_secs,
         );
-        // Retry transient failures (timeout/5xx/429/offline) with backoff (NFR06).
-        let client = llm::RetryingChatClient::new(&base, llm::RetryPolicy::default());
+        // Retry transient failures (5xx/429/offline) with backoff (NFR06). A
+        // Timeout is retried too on cloud (unchanged), but NOT on a local
+        // provider (ticket 13 / decision L4): a systematically slow local
+        // server signals a real problem, so retrying just triples the wait.
+        // The local/remote distinction lives next to `RetryPolicy` itself
+        // (`llm::RetryPolicy::for_base_url`) so other call sites reuse it.
+        let retry_policy = llm::RetryPolicy::for_base_url(&cfg.base_url);
+        let client = llm::RetryingChatClient::new(&base, retry_policy);
         let params = translate::TranslateParams {
             document_id,
             page_number,
