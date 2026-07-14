@@ -616,6 +616,14 @@
         {pageStatusLabel(pageStatus)}
       </span>
     {/if}
+    {#if session && pageStatus === 'error'}
+      <!-- Retry the current page after a failed translation (ticket 12). Reuses
+           translateCurrentPage(); nothing is cached after an error, so this
+           performs a real re-translate once the user has fixed the cause. -->
+      <button class="retry-btn" onclick={() => void translateCurrentPage()}>
+        ↻ Riprova traduzione
+      </button>
+    {/if}
   </footer>
 
   <GlossaryPanel bind:open={glossaryOpen} documentId={session?.document_id ?? null} />
