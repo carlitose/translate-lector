@@ -22,9 +22,22 @@ describe('resolveModel', () => {
     expect(resolveModel(' openai/gpt-4o ')).toBe('openai/gpt-4o');
   });
 
-  it('default is the D5 model and is in the common list', () => {
-    expect(DEFAULT_MODEL).toBe('anthropic/claude-sonnet-5');
+  it('default is the current (July 2026) model and is in the common list', () => {
+    expect(DEFAULT_MODEL).toBe('anthropic/claude-sonnet-4.6');
     expect(isCommonModel(DEFAULT_MODEL)).toBe(true);
+  });
+
+  it('common models are the refreshed July-2026 catalog (ticket 14)', () => {
+    expect(COMMON_MODELS.map((m) => m.id)).toEqual([
+      'anthropic/claude-opus-4.8',
+      'anthropic/claude-sonnet-4.6',
+      'anthropic/claude-haiku-4.5',
+      'google/gemini-3.5-flash',
+      'google/gemini-3.1-pro-preview',
+      'openai/gpt-4.1'
+    ]);
+    // The old reasoning sonnet-5 default (bug #1) is gone.
+    expect(isCommonModel('anthropic/claude-sonnet-5')).toBe(false);
   });
 });
 

@@ -9,8 +9,11 @@ use std::path::{Path, PathBuf};
 
 /// Settings key holding the OpenRouter model id.
 pub const MODEL_KEY: &str = "model";
-/// Default OpenRouter model when none has been chosen (decision D5).
-pub const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-5";
+/// Default OpenRouter model when none has been chosen (decision D5). Updated
+/// (July 2026) to a current model that supports both `temperature` and
+/// `structured_outputs`, so the default translation call is never rejected by
+/// the router for an unsupported parameter (bug #1, ticket 14).
+pub const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4.6";
 
 /// Settings key holding the default target language for new documents (§3.5, D4).
 pub const DEFAULT_TARGET_LANGUAGE_KEY: &str = "default_target_language";
@@ -139,6 +142,13 @@ mod tests {
     fn get_model_defaults_when_unset() {
         let c = conn();
         assert_eq!(get_model(&c).unwrap(), DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn default_model_is_the_july_2026_sonnet() {
+        // Bug #1 / ticket 14: default must be a current model that supports
+        // temperature + structured_outputs (not the reasoning sonnet-5).
+        assert_eq!(DEFAULT_MODEL, "anthropic/claude-sonnet-4.6");
     }
 
     #[test]

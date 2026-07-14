@@ -49,7 +49,9 @@ pub struct PerceptoreOutput {
 
 // --- Chat-completions envelope ----------------------------------------------
 
-/// One chat message (`role` + `content`).
+/// One chat message (`role` + `content`) sent in a **request**. The response
+/// envelope uses the separate [`ResponseMessage`] (whose `content` is optional)
+/// because some models return `choices[0].message.content: null`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
@@ -69,17 +71,46 @@ impl ChatMessage {
 }
 
 /// Request body for `POST /chat/completions` (relevant MVP fields, §4.4).
+///
+/// `temperature`, `response_format` and `provider` are all optional and omitted
+/// from the wire when `None` (`skip_serializing_if`). This lets the
+/// model-agnostic fallback (§2, [`ChatRequest::degrade`]) strip the parameters a
+/// given model may not advertise, avoiding the OpenRouter routing 404
+/// ("No endpoints found that can handle the requested parameters").
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
-    pub temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
     pub max_tokens: u32,
     pub stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<serde_json::Value>,
+}
+
+impl ChatRequest {
+    /// Strip the next offending optional parameter for the model-agnostic
+    /// fallback (research §2), in order: `provider` → `response_format` →
+    /// `temperature`. Returns `true` when a field was removed (a retry is worth
+    /// trying), `false` once nothing optional is left to relax. Bounds the
+    /// fallback loop to at most three downgraded retries.
+    pub fn degrade(&mut self) -> bool {
+        if self.provider.is_some() {
+            self.provider = None;
+            true
+        } else if self.response_format.is_some() {
+            self.response_format = None;
+            true
+        } else if self.temperature.is_some() {
+            self.temperature = None;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Token accounting from the provider (`usage.total_tokens` persisted for
@@ -94,9 +125,21 @@ pub struct Usage {
     pub total_tokens: i64,
 }
 
+/// The assistant message inside a **response** choice. Distinct from the
+/// request-side [`ChatMessage`]: `content` is optional because reasoning (and
+/// some other) models return `choices[0].message.content: null` or omit it
+/// entirely (the text may live under `reasoning`); it defaults so a
+/// missing/`null` value never fails deserialization (bug #2). `role` is ignored
+/// (serde drops unknown fields) — we only ever read the content.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ResponseMessage {
+    #[serde(default)]
+    pub content: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Choice {
-    pub message: ChatMessage,
+    pub message: ResponseMessage,
 }
 
 /// Response body (relevant fields, §4.4).
@@ -108,12 +151,21 @@ pub struct ChatResponse {
 }
 
 impl ChatResponse {
-    /// The assistant text of the first choice, or an error if none is present.
+    /// The assistant text of the first choice. Returns a clear error (never a
+    /// decode panic) when there is no choice, or when `content` is `null`,
+    /// missing or blank — the caller can then surface it or trigger the
+    /// model-agnostic fallback (bug #2).
     pub fn content(&self) -> Result<&str, LlmError> {
-        self.choices
+        let choice = self
+            .choices
             .first()
-            .map(|c| c.message.content.as_str())
-            .ok_or_else(|| LlmError::Http("risposta senza choices".into()))
+            .ok_or_else(|| LlmError::Http("risposta senza choices".into()))?;
+        match choice.message.content.as_deref() {
+            Some(c) if !c.trim().is_empty() => Ok(c),
+            _ => Err(LlmError::Http(
+                "risposta senza contenuto testuale (content null/vuoto)".into(),
+            )),
+        }
     }
 }
 
@@ -142,6 +194,13 @@ pub enum LlmError {
     MissingApiKey,
     /// Generic transport/HTTP failure that is not worth retrying (e.g. 400).
     Http(String),
+    /// OpenRouter rejected the request because the chosen model/provider does
+    /// not support one of the optional parameters we sent — a 404
+    /// "No endpoints found that can handle the requested parameters" or a 400
+    /// unsupported-parameter (research §2). Not transient, but **degradable**:
+    /// the fallback strips the offending optional param and retries once
+    /// ([`complete_with_fallback`], [`ChatRequest::degrade`]).
+    UnsupportedParams(String),
     /// The request timed out. Transient (NFR06).
     Timeout(String),
     /// The provider returned a 5xx server error. Transient (NFR06).
@@ -172,6 +231,13 @@ impl LlmError {
         )
     }
 
+    /// Whether this failure is an unsupported-parameter rejection that the
+    /// model-agnostic fallback can recover from by relaxing the request body
+    /// (research §2). See [`complete_with_fallback`].
+    pub fn is_param_unsupported(&self) -> bool {
+        matches!(self, LlmError::UnsupportedParams(_))
+    }
+
     /// A clear, Italian, user-facing message. EC03 points the user at ⚙️;
     /// EC02/EC07 carry their code so the frontend can show a dedicated hint.
     pub fn user_message(&self) -> String {
@@ -182,6 +248,10 @@ impl LlmError {
                     .into()
             }
             LlmError::Http(m) => format!("Errore di rete/OpenRouter: {m}"),
+            LlmError::UnsupportedParams(m) => format!(
+                "Il modello selezionato non supporta i parametri richiesti \
+                 (nessun endpoint compatibile). {m}"
+            ),
             LlmError::Timeout(m) => format!("Errore di rete/OpenRouter (timeout): {m}"),
             LlmError::ServerError(m) => format!("Errore del servizio OpenRouter: {m}"),
             LlmError::RateLimited(m) => {
@@ -279,6 +349,41 @@ pub trait ChatClient {
     fn complete(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError>;
 }
 
+/// Call `client.complete`, and on an unsupported-parameter rejection (research
+/// §2) retry with the offending optional params progressively stripped
+/// (`provider` → `response_format` → `temperature`, via
+/// [`ChatRequest::degrade`]), relying on the prompt's "JSON only" rules plus the
+/// layered [`parse_content`]. Bounded: [`ChatRequest::degrade`] returns `false`
+/// once nothing is left to relax, so this makes at most four attempts (full
+/// body + three downgraded retries) — never an infinite loop. Any other error
+/// (including a genuine, non-degradable 404) is returned immediately.
+///
+/// Returns the [`ChatResponse`] **and the request body that actually worked**
+/// (possibly degraded). Callers reuse that working body — for the JSON
+/// correction retry and for later chunks of the same page — instead of
+/// re-probing the already-rejected params, saving one failed round-trip per
+/// reuse. On the happy path (no degradation) the returned request equals the
+/// input.
+pub fn complete_with_fallback(
+    client: &dyn ChatClient,
+    req: &ChatRequest,
+) -> Result<(ChatResponse, ChatRequest), LlmError> {
+    let mut current = req.clone();
+    loop {
+        match client.complete(&current) {
+            Ok(resp) => return Ok((resp, current)),
+            Err(e) if e.is_param_unsupported() => {
+                // Relax one more optional param; give up (surface the error) if
+                // there is nothing left to strip.
+                if !current.degrade() {
+                    return Err(e);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Real OpenRouter client backed by a blocking `reqwest` client.
 pub struct OpenRouterClient {
     api_key: String,
@@ -340,11 +445,83 @@ impl ChatClient for OpenRouterClient {
         }
         if !status.is_success() {
             let body = resp.text().unwrap_or_default();
+            // Model-agnostic fallback (research §2): a 404 "No endpoints found"
+            // or a 400 unsupported-parameter is not terminal — classify it so
+            // the fallback can strip the offending optional param and retry.
+            if is_unsupported_params_error(status.as_u16(), &body) {
+                return Err(LlmError::UnsupportedParams(format!("{status}: {body}")));
+            }
             return Err(LlmError::Http(format!("{status}: {body}")));
         }
 
-        resp.json::<ChatResponse>()
-            .map_err(|e| LlmError::Http(format!("risposta non deserializzabile: {e}")))
+        // Read the raw body then deserialize, so a strict/`null` `content`
+        // yields a diagnosable error instead of an opaque reqwest decode error
+        // (bug #2). The layered `content()`/`parse_content` handle the rest.
+        let text = resp
+            .text()
+            .map_err(|e| LlmError::Http(format!("lettura risposta fallita: {e}")))?;
+        serde_json::from_str::<ChatResponse>(&text).map_err(|e| {
+            let snippet: String = text.chars().take(500).collect();
+            LlmError::Http(format!("risposta non deserializzabile: {e}: {snippet}"))
+        })
+    }
+}
+
+/// Whether an unsuccessful OpenRouter response is an unsupported-*parameter*
+/// rejection the fallback can recover from (research §2). Precise classification
+/// so we neither waste downgrade retries on genuinely terminal 4xx (content
+/// policy, invalid model, media type…) nor miss real parameter rejections:
+///
+/// - **404** → degradable ONLY when the message contains "no endpoints found",
+///   the OpenRouter routing signature for an unsatisfiable parameter set.
+/// - **400** → degradable ONLY when the message points at a *parameter* (a param
+///   cue such as `parameter`/`temperature`/`response_format`/`provider`/
+///   `require_parameters`/`structured_outputs`) AND signals rejection
+///   (`unsupported`, `not supported`/`not a supported`, `does not support`,
+///   `isn't supported`, `not accept`…).
+/// - anything else (any other status, a bare 400/404, content policy, invalid
+///   model) → NOT degradable (surfaced as a plain [`LlmError::Http`]).
+///
+/// Prefers the structured `error.message` when the body is JSON, falling back to
+/// the raw body otherwise. Pure and unit-testable without the network.
+pub fn is_unsupported_params_error(status: u16, body: &str) -> bool {
+    if status != 404 && status != 400 {
+        return false;
+    }
+    let message = error_message(body).unwrap_or_else(|| body.to_string());
+    let m = message.to_lowercase();
+
+    if status == 404 {
+        return m.contains("no endpoints found");
+    }
+
+    // status == 400: only an unsupported/unaccepted *parameter* is degradable.
+    let param_cue = m.contains("parameter")
+        || m.contains("temperature")
+        || m.contains("response_format")
+        || m.contains("provider")
+        || m.contains("require_parameters")
+        || m.contains("structured_outputs");
+    // Rejection: "unsupported" is explicit; the negated-"support"/"accept" check
+    // catches "not supported"/"not a supported"/"does not support"/"isn't
+    // supported"/"doesn't accept"/"does not accept" without enumerating every
+    // phrasing.
+    let negated = m.contains("not ") || m.contains("n't");
+    let rejection_cue =
+        m.contains("unsupported") || ((m.contains("support") || m.contains("accept")) && negated);
+    param_cue && rejection_cue
+}
+
+/// Extract a human-readable error string from an OpenRouter error body. Handles
+/// `{"error":{"message":"…"}}` (the common shape), `{"error":"…"}` and a
+/// top-level `{"message":"…"}`. Returns `None` when the body is not JSON or has
+/// no such field, so the caller can fall back to matching the raw body.
+fn error_message(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    match v.get("error") {
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(obj) => obj.get("message").and_then(|m| m.as_str()).map(str::to_string),
+        None => v.get("message").and_then(|m| m.as_str()).map(str::to_string),
     }
 }
 
@@ -520,16 +697,24 @@ pub fn build_messages(
 }
 
 /// Assemble a `ChatRequest` for the given model and messages, with the §4.4
-/// `response_format` and `provider.require_parameters` set.
+/// `response_format` and a low `temperature` for quality.
+///
+/// Deliberately does **not** send `provider.require_parameters` (bug #1): with
+/// it, OpenRouter routes only to endpoints supporting *every* parameter in the
+/// body, so a model that does not advertise `temperature` (e.g. a reasoning
+/// model) gets a 404 "No endpoints found". Without it the router silently
+/// ignores parameters the model does not support. `temperature` is kept (0.2)
+/// for deterministic translations but is optional, so the model-agnostic
+/// fallback ([`complete_with_fallback`]) can drop it if a model still rejects it.
 pub fn build_request(model: &str, messages: Vec<ChatMessage>) -> ChatRequest {
     ChatRequest {
         model: model.to_string(),
         messages,
-        temperature: 0.2,
+        temperature: Some(0.2),
         max_tokens: 4096,
         stream: false,
         response_format: Some(response_format()),
-        provider: Some(serde_json::json!({ "require_parameters": true })),
+        provider: None,
     }
 }
 
@@ -748,14 +933,196 @@ mod tests {
     }
 
     #[test]
-    fn build_request_sets_response_format_and_provider() {
+    fn build_request_sets_response_format_and_low_temperature() {
         let req = build_request("openai/gpt-4o", build_messages("it", "x", "", "", "", false, 1000));
         assert_eq!(req.model, "openai/gpt-4o");
         assert!(!req.stream);
-        let rf = req.response_format.unwrap();
+        let rf = req.response_format.clone().unwrap();
         assert_eq!(rf["type"], "json_schema");
         assert_eq!(rf["json_schema"]["strict"], true);
-        assert_eq!(req.provider.unwrap()["require_parameters"], true);
+        assert_eq!(req.temperature, Some(0.2), "low temperature kept for quality");
+    }
+
+    // --- Bug #1: default body must not force provider routing --------------
+
+    #[test]
+    fn build_request_default_body_has_no_require_parameters() {
+        let req = build_request("openai/gpt-4o", build_messages("it", "x", "", "", "", false, 1000));
+        // The default body must not send provider.require_parameters, which
+        // would 404 on models that don't advertise `temperature` (bug #1).
+        assert!(req.provider.is_none(), "no provider block by default");
+        let wire = serde_json::to_value(&req).unwrap();
+        assert!(wire.get("provider").is_none(), "provider omitted from the wire");
+        assert!(
+            wire.to_string().find("require_parameters").is_none(),
+            "serialized body must not contain require_parameters"
+        );
+    }
+
+    // --- Bug #1: unsupported-param classification + request degradation -----
+
+    #[test]
+    fn unsupported_params_error_matches_no_endpoints_404_and_bad_param_400() {
+        assert!(is_unsupported_params_error(
+            404,
+            r#"{"error":{"message":"No endpoints found that can handle the requested parameters."}}"#
+        ));
+        assert!(is_unsupported_params_error(400, "Parameter temperature is not supported"));
+        assert!(is_unsupported_params_error(400, "unsupported parameter: response_format"));
+        // Unrelated statuses / bodies are not degradable.
+        assert!(!is_unsupported_params_error(404, "model not found"));
+        assert!(!is_unsupported_params_error(500, "no endpoints found"));
+        assert!(!is_unsupported_params_error(429, "rate limited"));
+    }
+
+    #[test]
+    fn unsupported_params_error_rejects_non_parameter_400s() {
+        // Content-policy 400 mentions "unsupported" but has no parameter cue: a
+        // downgrade retry would be wasted, and the message would mislead. NOT
+        // degradable.
+        assert!(!is_unsupported_params_error(
+            400,
+            r#"{"error":{"message":"Content policy violation: this prompt contains unsupported content."}}"#
+        ));
+        // "unsupported media type" — no parameter cue.
+        assert!(!is_unsupported_params_error(400, "unsupported media type"));
+        // Invalid model is terminal, not a parameter relaxation.
+        assert!(!is_unsupported_params_error(
+            400,
+            r#"{"error":{"message":"not a valid model"}}"#
+        ));
+        // A 404 that is not the routing signature is terminal.
+        assert!(!is_unsupported_params_error(
+            404,
+            r#"{"error":{"message":"model not found"}}"#
+        ));
+    }
+
+    #[test]
+    fn unsupported_params_error_catches_previously_missed_parameter_phrasing() {
+        // Previously a false negative: real phrasing "is not a supported
+        // parameter" must now classify as a degradable parameter rejection.
+        assert!(is_unsupported_params_error(
+            400,
+            r#"{"error":{"message":"temperature is not a supported parameter for this model"}}"#
+        ));
+        // Other genuine phrasings the fallback should recover from.
+        assert!(is_unsupported_params_error(
+            400,
+            r#"{"error":{"message":"provider does not support structured_outputs"}}"#
+        ));
+        assert!(is_unsupported_params_error(
+            400,
+            r#"{"error":{"message":"this model doesn't accept the response_format parameter"}}"#
+        ));
+    }
+
+    #[test]
+    fn degrade_strips_provider_then_response_format_then_temperature_then_stops() {
+        let mut req = build_request("m", build_messages("it", "x", "", "", "", false, 1000));
+        req.provider = Some(serde_json::json!({ "require_parameters": true }));
+        // provider first
+        assert!(req.degrade());
+        assert!(req.provider.is_none());
+        assert!(req.response_format.is_some());
+        // then response_format
+        assert!(req.degrade());
+        assert!(req.response_format.is_none());
+        assert!(req.temperature.is_some());
+        // then temperature
+        assert!(req.degrade());
+        assert!(req.temperature.is_none());
+        // nothing left to relax -> bounded
+        assert!(!req.degrade());
+    }
+
+    #[test]
+    fn complete_with_fallback_recovers_after_a_downgraded_retry() {
+        let inner = SeqClient::new(vec![
+            Err(LlmError::UnsupportedParams(
+                "404 Not Found: No endpoints found that can handle the requested parameters".into(),
+            )),
+            Ok(ok_resp()),
+        ]);
+        let (resp, working) = complete_with_fallback(&inner, &a_request()).unwrap();
+        assert_eq!(resp.content().unwrap(), "ok");
+        assert_eq!(inner.calls.get(), 2, "one full attempt + one downgraded retry");
+        // The returned working body is the degraded one (response_format was the
+        // first strippable param, provider being None by default).
+        assert!(
+            working.response_format.is_none(),
+            "working body reflects the degradation that succeeded"
+        );
+    }
+
+    #[test]
+    fn complete_with_fallback_returns_the_unchanged_request_on_the_happy_path() {
+        let inner = SeqClient::new(vec![Ok(ok_resp())]);
+        let req = a_request();
+        let (_resp, working) = complete_with_fallback(&inner, &req).unwrap();
+        assert_eq!(inner.calls.get(), 1, "no degradation on the happy path");
+        // Identical body: same optional params as the input.
+        assert_eq!(working.response_format.is_some(), req.response_format.is_some());
+        assert_eq!(working.temperature, req.temperature);
+        assert!(working.provider.is_none());
+    }
+
+    #[test]
+    fn complete_with_fallback_is_bounded_and_does_not_loop_forever() {
+        // Always degradable: it must stop after the full body + 3 strips.
+        let inner = SeqClient::new(vec![
+            Err(LlmError::UnsupportedParams("no endpoints found".into())),
+            Err(LlmError::UnsupportedParams("no endpoints found".into())),
+            Err(LlmError::UnsupportedParams("no endpoints found".into())),
+            Err(LlmError::UnsupportedParams("no endpoints found".into())),
+        ]);
+        // A body carrying all three optional params exercises every strip.
+        let mut req = a_request();
+        req.provider = Some(serde_json::json!({ "require_parameters": true }));
+        let err = complete_with_fallback(&inner, &req).unwrap_err();
+        assert!(err.is_param_unsupported());
+        assert_eq!(inner.calls.get(), 4, "full body + 3 degraded retries, then stop");
+    }
+
+    #[test]
+    fn complete_with_fallback_passes_through_non_degradable_errors() {
+        let inner = SeqClient::new(vec![Err(LlmError::MissingApiKey)]);
+        let err = complete_with_fallback(&inner, &a_request()).unwrap_err();
+        assert_eq!(err, LlmError::MissingApiKey);
+        assert_eq!(inner.calls.get(), 1, "no retry on a non-degradable error");
+    }
+
+    // --- Bug #2: reasoning-style response with null/absent content ----------
+
+    #[test]
+    fn response_with_null_content_deserializes_and_is_handled_gracefully() {
+        // Reasoning-style: content is null. Must NOT fail deserialization.
+        let resp: ChatResponse = serde_json::from_str(
+            r#"{"choices":[{"message":{"role":"assistant","content":null}}],"usage":{"total_tokens":10}}"#,
+        )
+        .expect("null content must deserialize");
+        // content() returns a clear error, not a panic/decode failure.
+        let err = resp.content().unwrap_err();
+        assert!(matches!(err, LlmError::Http(_)));
+        assert_eq!(resp.usage.unwrap().total_tokens, 10);
+    }
+
+    #[test]
+    fn response_omitting_content_deserializes_and_is_handled_gracefully() {
+        let resp: ChatResponse = serde_json::from_str(
+            r#"{"choices":[{"message":{"role":"assistant"}}]}"#,
+        )
+        .expect("absent content must deserialize");
+        assert!(resp.content().is_err(), "missing content is a clear error");
+    }
+
+    #[test]
+    fn response_blank_content_is_a_clear_error() {
+        let resp: ChatResponse = serde_json::from_str(
+            r#"{"choices":[{"message":{"role":"assistant","content":"   "}}]}"#,
+        )
+        .unwrap();
+        assert!(resp.content().is_err(), "blank content is treated as empty");
     }
 
     // --- Errors --------------------------------------------------------------
@@ -780,6 +1147,11 @@ mod tests {
         assert!(!LlmError::Http("400".into()).is_transient());
         assert!(!LlmError::ParseFailed("x".into()).is_transient());
         assert!(!LlmError::Storage("x".into()).is_transient());
+        // Degradable, but not transient: no backoff retry, a param-relaxation
+        // retry instead.
+        assert!(!LlmError::UnsupportedParams("404".into()).is_transient());
+        assert!(LlmError::UnsupportedParams("404".into()).is_param_unsupported());
+        assert!(!LlmError::Http("404".into()).is_param_unsupported());
     }
 
     #[test]
