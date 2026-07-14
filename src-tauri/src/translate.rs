@@ -18,7 +18,7 @@
 
 use crate::glossary;
 use crate::llm::{
-    build_messages, build_request, calibrate_chars_per_token, complete_with_fallback,
+    build_messages, build_request, calibrate_chars_per_token, complete_with_fallback, est_tokens,
     needs_compression, ChatClient, ChatMessage, ChatRequest, GlossaryTerm, LlmError,
     PerceptoreOutput, Usage, CORRECTION_PROMPT,
 };
@@ -92,6 +92,181 @@ pub fn split_into_chunks(text: &str, max_chars: usize) -> Vec<String> {
         start = end;
     }
     chunks
+}
+
+// --- PROTOTYPE (Ticket 02, small-context-translation) ------------------------
+//
+// Splitting a page into *paragraph-level* translation units within a token
+// budget (`budget_unit_text` del Ticket 01). Riusa `est_tokens` per il
+// dimensionamento e la ricostruzione a righe di `src/lib/pdfExtract.ts`.
+// NB: PROTOTIPO — funzione pura, NON agganciata a `translate_page`;
+// l'integrazione è un ticket di build successivo. `split_into_chunks` resta
+// invariato.
+
+/// Split a page's reconstructed text into **paragraph-level units**, each within
+/// `budget_tokens` (il `budget_unit_text` del Ticket 01). Sizing riusa
+/// [`est_tokens`] con `ratio` (chars/token, default
+/// [`crate::llm::DEFAULT_CHARS_PER_TOKEN`]).
+///
+/// Un *paragrafo* è un blocco delimitato da una **riga vuota** (una sequenza di
+/// spazi bianchi che contiene due o più `\n`), coerente con la ricostruzione di
+/// `src/lib/pdfExtract.ts`. Un paragrafo che sta nel budget diventa una singola
+/// unità; un paragrafo che lo eccede ripiega su uno **split a livello di frase**
+/// (frasi/righe impacchettate fino al budget). Ogni unità porta con sé il proprio
+/// separatore di paragrafo, quindi `split_into_units(t, b, r).concat() == t`
+/// esattamente: nessun testo perso, ordine preservato.
+///
+/// Casi limite: input vuoto/whitespace → una sola unità uguale all'input; liste
+/// e righe (unite da `\n` singolo come fa `pdfExtract`) restano nello stesso
+/// paragrafo e vengono impacchettate; una singola frase più grande del budget
+/// resta un "atomo" non divisibile (unica eccezione al vincolo di budget).
+///
+/// NB: PROTOTIPO — funzione pura, NON agganciata a `translate_page`. Finché
+/// l'integrazione (ticket di build) non la richiama nel flusso live, è usata
+/// solo dai test: `allow(dead_code)` evita il warning in questa fase.
+#[allow(dead_code)]
+pub fn split_into_units(text: &str, budget_tokens: u32, ratio: f64) -> Vec<String> {
+    // Pagina vuota / solo spazi: una sola unità che riproduce l'input.
+    if text.trim().is_empty() {
+        return vec![text.to_string()];
+    }
+
+    let mut units: Vec<String> = Vec::new();
+    for (body, sep) in split_paragraphs(text) {
+        if est_tokens(&body, ratio) <= budget_tokens {
+            // Il paragrafo sta nel budget: una sola unità (corpo + separatore).
+            units.push(format!("{body}{sep}"));
+        } else {
+            // Paragrafo troppo grande: ripiega su frasi/righe impacchettate fino
+            // al budget. Il separatore di coda viaggia sull'ultima unità così il
+            // round-trip resta esatto.
+            let mut pieces = pack_sentences(&body, budget_tokens, ratio);
+            match pieces.last_mut() {
+                Some(last) => last.push_str(&sep),
+                None => pieces.push(sep),
+            }
+            units.extend(pieces);
+        }
+    }
+    units
+}
+
+/// Suddivide `text` in coppie `(corpo, separatore)`, dove il separatore è una
+/// riga vuota (run di spazi con ≥2 `\n`). La concatenazione di tutti i
+/// `corpo + separatore` riproduce esattamente `text`. Whitespace non separatore
+/// (a capo singolo, spazi) resta dentro il corpo.
+#[allow(dead_code)]
+fn split_paragraphs(text: &str) -> Vec<(String, String)> {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut body_start = 0usize;
+    let mut i = 0usize;
+    while i < n {
+        if chars[i].is_whitespace() {
+            // Estende il run di spazi e conta i newline.
+            let ws_start = i;
+            let mut newlines = 0usize;
+            let mut j = i;
+            while j < n && chars[j].is_whitespace() {
+                if chars[j] == '\n' {
+                    newlines += 1;
+                }
+                j += 1;
+            }
+            if newlines >= 2 {
+                // Riga vuota → confine di paragrafo.
+                let body: String = chars[body_start..ws_start].iter().collect();
+                let sep: String = chars[ws_start..j].iter().collect();
+                out.push((body, sep));
+                body_start = j;
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    if body_start < n {
+        let body: String = chars[body_start..n].iter().collect();
+        out.push((body, String::new()));
+    }
+    out
+}
+
+/// Impacchetta le frasi di `body` in unità entro `budget` token, riusando
+/// [`est_tokens`]. Una singola frase più grande del budget resta un'unità a sé
+/// (atomo non divisibile). `pack_sentences(b, ...).concat() == b`.
+#[allow(dead_code)]
+fn pack_sentences(body: &str, budget: u32, ratio: f64) -> Vec<String> {
+    let mut units: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for piece in split_sentences(body) {
+        if cur.is_empty() {
+            cur = piece;
+        } else if est_tokens(&format!("{cur}{piece}"), ratio) <= budget {
+            cur.push_str(&piece);
+        } else {
+            units.push(std::mem::take(&mut cur));
+            cur = piece;
+        }
+    }
+    if !cur.is_empty() {
+        units.push(cur);
+    }
+    units
+}
+
+/// Spezza `text` in frasi preservando ogni carattere (`concat == text`). Un
+/// confine di frase è `.`/`!`/`?` (con eventuali chiusure) seguito da spazio o
+/// fine testo, oppure un `\n` (righe/liste; `pdfExtract` unisce le righe a capo
+/// con `\n`). Gli spazi di coda sono assorbiti nella frase precedente così il
+/// confine non va perso.
+#[allow(dead_code)]
+fn split_sentences(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut out: Vec<String> = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < n {
+        let c = chars[i];
+        if c == '.' || c == '!' || c == '?' {
+            // Assorbe punteggiatura terminale e caratteri di chiusura ripetuti.
+            let mut j = i + 1;
+            while j < n
+                && matches!(
+                    chars[j],
+                    '.' | '!' | '?' | '"' | '\'' | ')' | ']' | '»' | '”' | '’'
+                )
+            {
+                j += 1;
+            }
+            // Confine reale solo se seguito da spazio o fine (evita "3.14").
+            if j >= n || chars[j].is_whitespace() {
+                while j < n && chars[j].is_whitespace() {
+                    j += 1;
+                }
+                out.push(chars[start..j].iter().collect());
+                start = j;
+                i = j;
+                continue;
+            }
+            i = j;
+            continue;
+        }
+        if c == '\n' {
+            // A capo forzato: confine (liste, poesia, righe di pdfExtract).
+            out.push(chars[start..=i].iter().collect());
+            start = i + 1;
+            i += 1;
+            continue;
+        }
+        i += 1;
+    }
+    if start < n {
+        out.push(chars[start..n].iter().collect());
+    }
+    out
 }
 
 /// Read a cached translation, if present. Returns the stored `translated_text`
@@ -1059,5 +1234,144 @@ mod tests {
             crate::documents::get_rolling_summary(&c, 1).unwrap(),
             "Riassunto originale."
         );
+    }
+
+    // --- PROTOTYPE Ticket 02: paragraph-level unit splitting ----------------
+
+    use crate::llm::DEFAULT_CHARS_PER_TOKEN as RATIO;
+
+    /// A realistic multi-paragraph page: paragraphs are separated by blank lines
+    /// (as a reconstruction that preserves paragraph breaks would emit).
+    fn sample_prose() -> &'static str {
+        "La luce del mattino filtrava tra le persiane della vecchia biblioteca. \
+Marta sfogliava con cura un volume ingiallito, cercando un passaggio che ricordava \
+solo a metà. Il silenzio era rotto soltanto dal fruscio delle pagine.\n\n\
+Fuori, la città cominciava a svegliarsi. I primi tram passavano rumorosi lungo il \
+viale, e il profumo del caffè saliva dai bar appena aperti. Marta alzò lo sguardo \
+un istante, poi tornò al suo libro.\n\n\
+Trovò finalmente la frase che cercava. La rilesse tre volte, come per imprimersela \
+nella memoria, e sorrise. Era esattamente ciò di cui aveva bisogno per il suo saggio."
+    }
+
+    /// A technical multi-paragraph passage resembling the "Build a Large Language
+    /// Model (From Scratch)" book — the kind of page we must chunk within budget.
+    fn sample_technical() -> &'static str {
+        "Large language models (LLMs) are deep neural networks trained on massive \
+amounts of text data. The transformer architecture, introduced in 2017, is the \
+backbone of nearly all modern LLMs. It relies on a mechanism called self-attention, \
+which lets the model weigh the relevance of every token to every other token in the \
+sequence.\n\n\
+Before text can be fed to the model it must be tokenized. A tokenizer splits raw \
+text into smaller units called tokens, then maps each token to an integer ID. These \
+IDs are looked up in an embedding matrix to produce dense vectors. Positional \
+information is added so the model knows the order of the tokens.\n\n\
+Training proceeds by next-token prediction. Given a sequence of tokens, the model \
+predicts the probability distribution of the following token, and the cross-entropy \
+loss between the prediction and the true next token is minimized with gradient \
+descent. Repeated over billions of tokens, this simple objective yields surprisingly \
+capable models."
+    }
+
+    #[test]
+    fn units_roundtrip_reproduces_source_exactly() {
+        for text in [
+            sample_prose(),
+            sample_technical(),
+            "un solo paragrafo senza interruzioni di riga.",
+            "riga uno\nriga due\nriga tre", // single-\n joined lines (pdfExtract)
+            "- primo\n- secondo\n- terzo\n\nUn paragrafo dopo la lista.",
+        ] {
+            for budget in [64u32, 256, 512, 1024] {
+                let units = split_into_units(text, budget, RATIO);
+                assert_eq!(
+                    units.concat(),
+                    text,
+                    "round-trip must reproduce the source (budget={budget})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn each_unit_fits_the_budget_when_sentences_are_splittable() {
+        let budget = 64u32;
+        for text in [sample_prose(), sample_technical()] {
+            let units = split_into_units(text, budget, RATIO);
+            for u in &units {
+                assert!(
+                    est_tokens(u.trim(), RATIO) <= budget,
+                    "unit over budget ({} > {budget}): {:?}",
+                    est_tokens(u.trim(), RATIO),
+                    u
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_paragraph_splits_at_sentence_boundaries() {
+        // One paragraph (no blank line) of several sentences, budget too small to
+        // hold it whole -> must break into >1 unit, each ending at a sentence
+        // boundary.
+        let para = "Prima frase molto chiara. Seconda frase altrettanto chiara. \
+Terza frase per riempire il budget. Quarta frase conclusiva.";
+        let budget = 8u32; // ~32 chars: forces per-sentence splitting
+        let units = split_into_units(para, budget, RATIO);
+        assert!(units.len() > 1, "an oversized paragraph must be split");
+        assert_eq!(units.concat(), para, "no text lost when sentence-splitting");
+        for u in &units {
+            let t = u.trim_end();
+            assert!(
+                t.ends_with('.') || t.ends_with('!') || t.ends_with('?'),
+                "each sentence-level unit ends at a sentence boundary: {u:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn order_is_preserved() {
+        let text = "AAA primo paragrafo.\n\nBBB secondo paragrafo.\n\nCCC terzo paragrafo.";
+        let units = split_into_units(text, 512, RATIO);
+        let joined = units.concat();
+        let a = joined.find("AAA").unwrap();
+        let b = joined.find("BBB").unwrap();
+        let c = joined.find("CCC").unwrap();
+        assert!(a < b && b < c, "paragraph order preserved");
+    }
+
+    #[test]
+    fn empty_and_whitespace_input_round_trip() {
+        for text in ["", "   ", "\n\n", "  \n\t  \n "] {
+            let units = split_into_units(text, 512, RATIO);
+            assert_eq!(units.concat(), text, "whitespace-only input round-trips");
+        }
+        assert_eq!(split_into_units("", 512, RATIO), vec!["".to_string()]);
+    }
+
+    #[test]
+    fn small_paragraphs_become_one_unit_each() {
+        // Each paragraph fits the budget -> exactly one unit per paragraph.
+        let units = split_into_units(sample_prose(), 512, RATIO);
+        assert_eq!(units.len(), 3, "three paragraphs -> three units");
+    }
+
+    /// Measurement (acceptance): report the token size of every unit produced on
+    /// the two realistic inputs at budgets in the 512-1024 range. Run with
+    /// `cargo test -- --nocapture` to see the printed distribution.
+    #[test]
+    fn measure_unit_token_sizes_on_realistic_pages() {
+        for (name, text) in [("prose", sample_prose()), ("technical", sample_technical())] {
+            for budget in [512u32, 1024] {
+                let units = split_into_units(text, budget, RATIO);
+                let sizes: Vec<u32> = units.iter().map(|u| est_tokens(u.trim(), RATIO)).collect();
+                let total: u32 = sizes.iter().sum();
+                eprintln!(
+                    "[measure] page={name} budget={budget} units={} sizes={sizes:?} total_tokens~={total}",
+                    units.len()
+                );
+                assert_eq!(units.concat(), text, "measurement round-trip holds");
+                assert!(!units.is_empty());
+            }
+        }
     }
 }

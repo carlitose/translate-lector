@@ -97,6 +97,132 @@ pub fn render_locked_unlocked(entries: &[GlossaryEntry]) -> (String, String) {
     (render_terms(&locked), render_terms(&unlocked))
 }
 
+// --- Selezione deterministica del glossario (ticket 03) ----------------------
+
+/// Selezione **deterministica** (nessun LLM) dei termini di glossario rilevanti
+/// per una singola unità di traduzione (SPECIFICATION / wayfinder
+/// small-context, idea-chiave utente). Restituisce solo le `entries` il cui
+/// `source_term` compare in `unit_text`, tagliando drasticamente il prompt-
+/// glossario rispetto a "invia tutto il glossario".
+///
+/// Regole di match (case-insensitive, su **confini di parola**):
+/// - il testo e i termini sono tokenizzati in parole (sequenze di caratteri
+///   alfanumerici Unicode); un termine **multiword** matcha come sotto-sequenza
+///   contigua di token, così "art" NON matcha dentro "start" né "consiglio di
+///   amministrazione" matcha "consiglio comunale";
+/// - **tolleranza morfologica semplice** applicata SOLO all'ultima parola del
+///   termine (vedi [`is_plural_variant`]): plurale inglese in `-s`/`-es` e
+///   alternanze di vocale finale italiane `-o/-i`, `-a/-e`, `-e/-i`.
+///
+/// Vincoli: i termini **locked** che matchano sono SEMPRE inclusi (vincolo
+/// assoluto preservato). `unlocked_cap` limita opzionalmente il numero di
+/// termini **unlocked** restituiti (i primi, in ordine di `entries`); i locked
+/// non sono mai scartati dal cap. L'ordine di `entries` è preservato.
+// Prototipo (ticket 03): non ancora agganciato al flusso live (l'integrazione è
+// un ticket di build successivo), quindi dead_code finché non viene cablato.
+#[allow(dead_code)]
+pub fn select_glossary(
+    unit_text: &str,
+    entries: &[GlossaryEntry],
+    unlocked_cap: Option<usize>,
+) -> Vec<GlossaryEntry> {
+    let text_tokens = tokenize(unit_text);
+    let mut unlocked_kept = 0usize;
+    let mut selected = Vec::new();
+    for e in entries {
+        if !term_matches(&text_tokens, &e.source_term) {
+            continue;
+        }
+        if e.locked {
+            selected.push(e.clone()); // vincolo assoluto: mai scartato dal cap
+        } else {
+            if let Some(cap) = unlocked_cap {
+                if unlocked_kept >= cap {
+                    continue;
+                }
+            }
+            unlocked_kept += 1;
+            selected.push(e.clone());
+        }
+    }
+    selected
+}
+
+/// Spezza `text` in parole minuscole (token alfanumerici Unicode); la
+/// punteggiatura e gli spazi fanno da separatore, garantendo il match su
+/// confine di parola.
+#[allow(dead_code)]
+fn tokenize(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_lowercase())
+        .collect()
+}
+
+/// `true` se i token di `source_term` compaiono come sotto-sequenza contigua in
+/// `text_tokens`: tutte le parole devono coincidere esattamente, tranne
+/// l'ultima che tollera una variante di plurale ([`is_plural_variant`]).
+#[allow(dead_code)]
+fn term_matches(text_tokens: &[String], source_term: &str) -> bool {
+    let term_tokens = tokenize(source_term);
+    let n = term_tokens.len();
+    if n == 0 || text_tokens.len() < n {
+        return false;
+    }
+    for start in 0..=(text_tokens.len() - n) {
+        let hit = term_tokens.iter().enumerate().all(|(i, ct)| {
+            let tt = &text_tokens[start + i];
+            if i == n - 1 {
+                is_plural_variant(tt, ct)
+            } else {
+                tt == ct
+            }
+        });
+        if hit {
+            return true;
+        }
+    }
+    false
+}
+
+/// Tolleranza morfologica **semplice e bidirezionale** fra due parole già
+/// minuscole. Copre:
+/// - uguaglianza esatta;
+/// - plurale inglese: una parola è l'altra + `s` o + `es`
+///   (`board`/`boards`, `box`/`boxes`);
+/// - alternanza di vocale finale italiana a parità di lunghezza (stem >= 3):
+///   `-o/-i` (titolo/titoli), `-a/-e` (casa/case), `-e/-i` (cane/cani).
+///
+/// Limiti noti (documentati per il ticket): non copre plurali irregolari
+/// (uomo/uomini, città invariabile), plurali con mutazione di consonante
+/// (amico/amici, banco/banchi), inflessioni verbali/aggettivali, sinonimi o
+/// abbreviazioni. Può produrre falsi positivi fra classi omografe (es. `casi`
+/// vs il termine `case` per l'alternanza `-e/-i`): accettabile in un prototipo
+/// di selezione, dato che i termini scartati per errore restano rari e i locked
+/// non dipendono da questa euristica.
+#[allow(dead_code)]
+fn is_plural_variant(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    // Plurale inglese: long = short + "s" | "es".
+    if long == format!("{short}s") || long == format!("{short}es") {
+        return true;
+    }
+    // Alternanza di vocale finale italiana (stessa lunghezza, radice uguale).
+    if short.len() == long.len() && short.chars().count() >= 3 {
+        let s: Vec<char> = short.chars().collect();
+        let l: Vec<char> = long.chars().collect();
+        if s[..s.len() - 1] == l[..l.len() - 1] {
+            let (x, y) = (s[s.len() - 1], l[l.len() - 1]);
+            let pair = (x.min(y), x.max(y));
+            return matches!(pair, ('i', 'o') | ('a', 'e') | ('e', 'i'));
+        }
+    }
+    false
+}
+
 /// Insert `terms` for a document with `locked = 0` and `first_seen_page = page`,
 /// skipping any whose `source_term` already exists for the document
 /// (case-insensitive) and any duplicated within the incoming batch. Existing
@@ -357,5 +483,148 @@ mod tests {
         assert!(!locked.contains("CEO"));
         assert!(unlocked.contains("CEO => amministratrice delegata  [comune]"));
         assert!(!unlocked.contains("board"));
+    }
+
+    // --- select_glossary (ticket 03, selezione deterministica) ---------------
+
+    /// Build an in-memory entry without touching the DB (pure-function tests).
+    fn entry(source: &str, translation: &str, locked: bool) -> GlossaryEntry {
+        GlossaryEntry {
+            id: 0,
+            source_term: source.into(),
+            translation: translation.into(),
+            term_type: "comune".into(),
+            locked,
+            note: String::new(),
+            first_seen_page: 1,
+        }
+    }
+
+    fn sources(v: &[GlossaryEntry]) -> Vec<String> {
+        v.iter().map(|e| e.source_term.clone()).collect()
+    }
+
+    #[test]
+    fn selects_present_term_and_skips_absent() {
+        let entries = vec![
+            entry("board", "consiglio", false),
+            entry("shareholder", "azionista", false),
+        ];
+        let got = select_glossary("The board approved the plan.", &entries, None);
+        assert_eq!(sources(&got), vec!["board".to_string()]);
+    }
+
+    #[test]
+    fn match_is_case_insensitive_on_word_boundaries() {
+        let entries = vec![entry("Board", "consiglio", false)];
+        // Case-insensitive hit.
+        assert_eq!(select_glossary("the BOARD met", &entries, None).len(), 1);
+        // "board" as a substring of "boardroom" must NOT match (word boundary).
+        assert_eq!(select_glossary("a boardroom was booked", &entries, None).len(), 0);
+    }
+
+    #[test]
+    fn no_substring_false_positive() {
+        // The classic case: "art" must not match inside "start".
+        let entries = vec![entry("art", "arte", false)];
+        assert_eq!(select_glossary("we start now", &entries, None).len(), 0);
+        assert_eq!(select_glossary("modern art matters", &entries, None).len(), 1);
+    }
+
+    #[test]
+    fn matches_multiword_term() {
+        let entries = vec![entry("consiglio di amministrazione", "board", false)];
+        let got = select_glossary(
+            "Il consiglio di amministrazione ha deciso oggi.",
+            &entries,
+            None,
+        );
+        assert_eq!(got.len(), 1);
+        // A partial sub-sequence must not match the full multiword term.
+        assert_eq!(
+            select_glossary("solo il consiglio comunale", &entries, None).len(),
+            0
+        );
+    }
+
+    #[test]
+    fn matches_simple_plural_morphology() {
+        // English trailing -s.
+        let e_en = vec![entry("board", "consiglio", false)];
+        assert_eq!(select_glossary("the boards met", &e_en, None).len(), 1);
+        // Italian -o/-i plural on the last word.
+        let e_it = vec![entry("titolo", "title", false)];
+        assert_eq!(select_glossary("i titoli emessi", &e_it, None).len(), 1);
+    }
+
+    #[test]
+    fn locked_always_included_beyond_unlocked_cap() {
+        let entries = vec![
+            entry("alpha", "a", false),
+            entry("beta", "b", false),
+            entry("gamma", "g", false),
+            entry("delta", "d", true), // locked
+        ];
+        // All four appear in the text; cap unlocked to 1, locked must survive.
+        let got = select_glossary("alpha beta gamma delta", &entries, Some(1));
+        let got_sources = sources(&got);
+        // Locked delta present regardless of the cap.
+        assert!(got_sources.contains(&"delta".to_string()), "locked kept");
+        // Exactly one unlocked kept (the first in order).
+        let unlocked_kept = got.iter().filter(|e| !e.locked).count();
+        assert_eq!(unlocked_kept, 1, "unlocked capped to 1");
+        assert_eq!(got.iter().filter(|e| e.locked).count(), 1, "locked uncapped");
+    }
+
+    #[test]
+    fn empty_glossary_and_empty_unit_return_nothing() {
+        let entries = vec![entry("board", "consiglio", false)];
+        assert!(select_glossary("", &entries, None).is_empty());
+        assert!(select_glossary("board board board", &[], None).is_empty());
+        assert!(select_glossary("", &[], None).is_empty());
+    }
+
+    #[test]
+    fn measures_prompt_reduction_vs_full_glossary() {
+        use crate::llm::{est_tokens, DEFAULT_CHARS_PER_TOKEN};
+
+        // Realistic synthetic glossary of 120 terms.
+        let mut entries: Vec<GlossaryEntry> = (0..120)
+            .map(|i| {
+                entry(
+                    &format!("term{i:03}"),
+                    &format!("traduzione del termine numero {i}"),
+                    i % 20 == 0, // a few locked
+                )
+            })
+            .collect();
+        // Inject a handful of terms that actually appear in the unit.
+        entries.push(entry("board", "consiglio di amministrazione", false));
+        entries.push(entry("shareholder", "azionista", false));
+        entries.push(entry("dividend", "dividendo", true)); // locked + present
+
+        let unit = "The board approved a dividend for every shareholder this year.";
+
+        let full = render_terms(&entries.iter().collect::<Vec<_>>());
+        let selected_entries = select_glossary(unit, &entries, None);
+        let selected = render_terms(&selected_entries.iter().collect::<Vec<_>>());
+
+        let full_tok = est_tokens(&full, DEFAULT_CHARS_PER_TOKEN);
+        let sel_tok = est_tokens(&selected, DEFAULT_CHARS_PER_TOKEN);
+
+        eprintln!(
+            "MEASURE glossary tokens: full={full_tok} selected={sel_tok} \
+             reduction={:.1}% (chars full={} selected={}) selected_terms={}",
+            100.0 * (1.0 - sel_tok as f64 / full_tok as f64),
+            full.chars().count(),
+            selected.chars().count(),
+            selected_entries.len(),
+        );
+
+        // The three present terms are selected (incl. the locked one).
+        assert_eq!(selected_entries.len(), 3);
+        assert!(selected_entries.iter().any(|e| e.source_term == "dividend" && e.locked));
+        // Drastic reduction: the subset is a tiny fraction of the whole.
+        assert!(sel_tok * 5 < full_tok, "expected >80% token reduction");
     }
 }

@@ -41,6 +41,19 @@ Contesto: eredita l'epica provider locale
   context** (configurabile). I provider a contesto grande possono usare unità più grandi / il percorso
   attuale; i piccoli (4k locali) usano unità paragrafo + glossario selettivo. Da confermare nel grilling.
 - **Modello di budget token = DEFINITO** (Ticket 01, 2026-07-14; vedi sezione dedicata sotto).
+- **Chunking a paragrafo = PROTOTIPO OK** (Ticket 02): `split_into_units(text, budget, ratio)` in
+  `translate.rs` (non cablato), round-trip garantito, fallback a frase per paragrafi oltre budget. Paragrafi
+  reali ~40-90 token ≪ budget → una chiamata per paragrafo è ampiamente fattibile. **Default = paragrafo**,
+  fallback frase. *Finding per la build*: `pdfExtract.linesToText` (`src/lib/pdfExtract.ts`) unisce le righe
+  con un singolo `\n` e non emette righe vuote → una pagina ricostruita è **un unico paragrafo**; la build
+  deve far emettere separatori di paragrafo (da y-gap tra righe) perché emergano unità-paragrafo vere.
+- **Selezione deterministica glossario = PROTOTIPO OK** (Ticket 03, idea chiave): `select_glossary(unit,
+  entries, unlocked_cap)` in `glossary.rs` (non cablato); match word-boundary/case-insensitive/multiword +
+  morfologia semplice (EN -s, IT vocale finale); **locked sempre inclusi**, cap sugli unlocked.
+  **Riduzione token misurata: 98.2%** (1651→29 su glossario da 123 termini). Falsi negativi noti (plurali
+  irregolari, invarianti, flessioni) → mitigazione build: indice lemma/alias per termine, morfologia su
+  tutte le parole dei multiword. Severità raccomandata: word-boundary + morfologia sull'ultima parola,
+  cap unlocked ~10-20, locked uncapped (input al Ticket 05).
 
 ## Modello di budget token (Ticket 01)
 
@@ -82,11 +95,10 @@ limite (EC05); se il budget è stretto, ridurre prima il glossario selezionato (
 ## Not Yet Specified
 
 - ~~Modello di budget per-chiamata~~ → **DEFINITO dal Ticket 01** (sezione "Modello di budget token").
-- **Chunking a livello paragrafo**: come dividere una pagina in unità (paragrafo/frase) entro il budget,
-  riusando la ricostruzione di `src/lib/pdfExtract.ts` e `split_into_chunks`; riassemblaggio corretto. → Ticket 02.
-- **Selezione deterministica del glossario**: funzione (chunk + glossario) → sottoinsieme rilevante
-  (match `source_term`, case-insensitive, multiword, morfologia semplice), con cap e priorità ai locked;
-  garanzia di copertura dei termini locked presenti nel chunk. → Ticket 03.
+- ~~Chunking a livello paragrafo~~ → **PROTOTIPO OK dal Ticket 02** (vedi Decisions So Far). *Aperto per la
+  build*: far emettere i separatori di paragrafo in `pdfExtract.ts` (da y-gap).
+- ~~Selezione deterministica del glossario~~ → **PROTOTIPO OK dal Ticket 03** (98.2% riduzione). *Aperto per
+  la build*: indice lemma/alias per ridurre i falsi negativi morfologici.
 - **Percettore con molte chiamate piccole**: come mantenere coerenza di summary/glossario senza esplodere
   numero di chiamate/latenza; es. tradurre per-unità con contesto minimo e **aggiornare summary+glossario
   una volta per pagina** (step separato e compatto) vs incrementale. Split del contratto (translate-only vs
@@ -126,8 +138,8 @@ Cartella: `docs/tickets/small-context-translation/`
 | # | Tipo | Titolo | Stato |
 |---|------|--------|-------|
 | 01 | research | Modello di budget token per-chiamata (da n_ctx) | ✅ done (`done/`) — sezione "Modello di budget token" |
-| 02 | prototype | Chunking a livello paragrafo entro budget | ready |
-| 03 | prototype | Selezione deterministica del glossario per unità | ready |
+| 02 | prototype | Chunking a livello paragrafo entro budget | ✅ done (`done/`) — `split_into_units`, round-trip OK |
+| 03 | prototype | Selezione deterministica del glossario per unità | ✅ done (`done/`) — `select_glossary`, −98% token |
 | 04 | research | Percettore multi-chiamata + split contratto + cache per-unità | blocked by 01,02,03 |
 | 05 | grilling | Decisioni: granularità, default, latenza, match glossario | ready (gate) |
 
