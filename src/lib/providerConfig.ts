@@ -40,3 +40,99 @@ export function isValidKey(key: string | null | undefined): boolean {
 export function isCommonModel(id: string): boolean {
   return COMMON_MODELS.some((m) => m.id === id);
 }
+
+/**
+ * A selectable LLM provider preset for the settings UI. Mirrors the core's
+ * built-in `provider_presets()` (`settings.rs`): `id`/`label`/`base_url` are the
+ * built-in defaults; `base_url`/`model` are user-overridable at runtime and
+ * resolved by the core via `get_provider_config`. Decision D5 dropped the
+ * `requires_key` flag — every provider always saves a key; local servers just
+ * suggest a harmless dummy placeholder so the field "just works" without auth.
+ */
+export interface ProviderPreset {
+  /** Stable id shared with the core: `openrouter` | `unsloth` | … */
+  id: string;
+  /** UI label, e.g. "OpenRouter (cloud)". */
+  label: string;
+  /** Built-in default `/v1/chat/completions` endpoint (overridable). */
+  base_url: string;
+  /** OpenRouter (cloud) offers the curated {@link COMMON_MODELS} dropdown; local
+   *  providers use a free-text model field (the loaded model tag varies). */
+  cloud: boolean;
+  /** Suggested placeholder for the API-key field (D5). Local no-auth servers
+   *  suggest a dummy like `local`; auth'd providers hint their key format. */
+  dummyKey?: string;
+}
+
+/**
+ * Built-in provider presets, mirroring the core's `provider_presets()` in
+ * `src-tauri/src/settings.rs` (design §2). The active provider defaults to
+ * `unsloth` (decision D3) in the core; the UI reads the real value via
+ * `get_active_provider`. Base-URLs are starting defaults the user can override.
+ */
+export const PROVIDERS: ProviderPreset[] = [
+  {
+    id: 'openrouter',
+    label: 'OpenRouter (cloud)',
+    base_url: 'https://openrouter.ai/api/v1/chat/completions',
+    cloud: true,
+    dummyKey: 'sk-or-…'
+  },
+  {
+    id: 'unsloth',
+    label: 'Unsloth Studio (locale)',
+    base_url: 'http://localhost:8888/v1/chat/completions',
+    cloud: false,
+    dummyKey: 'sk-unsloth-…'
+  },
+  {
+    id: 'lmstudio',
+    label: 'LM Studio (locale)',
+    base_url: 'http://localhost:1234/v1/chat/completions',
+    cloud: false,
+    dummyKey: 'local'
+  },
+  {
+    id: 'ollama',
+    label: 'Ollama (locale)',
+    base_url: 'http://localhost:11434/v1/chat/completions',
+    cloud: false,
+    dummyKey: 'local'
+  },
+  {
+    id: 'llamaserver',
+    label: 'llama.cpp server (locale)',
+    base_url: 'http://127.0.0.1:8080/v1/chat/completions',
+    cloud: false,
+    dummyKey: 'local'
+  }
+];
+
+/** The preset for `id`, or `undefined` when the id is not a known provider. */
+export function providerById(id: string | null | undefined): ProviderPreset | undefined {
+  return PROVIDERS.find((p) => p.id === id);
+}
+
+/**
+ * Resolve the effective base-URL for a provider: the stored override when it is a
+ * non-blank string, otherwise the provider's built-in default (empty for an
+ * unknown id). Mirrors the core's `get_provider_config` base-URL fallback.
+ */
+export function resolveBaseUrl(
+  stored: string | null | undefined,
+  providerId: string | null | undefined
+): string {
+  if (typeof stored === 'string' && stored.trim().length > 0) {
+    return stored.trim();
+  }
+  return providerById(providerId)?.base_url ?? '';
+}
+
+/**
+ * Whether a typed API key is acceptable to save. Under decision D5 every
+ * provider always carries a key, so this is a plain non-empty check (an alias of
+ * {@link isValidKey}); local providers rely on the suggested dummy placeholder.
+ */
+export function keyAcceptable(key: string | null | undefined): boolean {
+  return isValidKey(key);
+}

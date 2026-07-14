@@ -4,7 +4,11 @@ import {
   resolveModel,
   isValidKey,
   isCommonModel,
-  COMMON_MODELS
+  COMMON_MODELS,
+  PROVIDERS,
+  providerById,
+  resolveBaseUrl,
+  keyAcceptable
 } from './providerConfig';
 
 describe('resolveModel', () => {
@@ -58,5 +62,68 @@ describe('isCommonModel', () => {
   it('recognises curated ids and rejects unknown ones', () => {
     expect(isCommonModel(COMMON_MODELS[0].id)).toBe(true);
     expect(isCommonModel('some/unknown-model')).toBe(false);
+  });
+});
+
+describe('PROVIDERS', () => {
+  it('mirrors the core presets: the five expected ids in order', () => {
+    expect(PROVIDERS.map((p) => p.id)).toEqual([
+      'openrouter',
+      'unsloth',
+      'lmstudio',
+      'ollama',
+      'llamaserver'
+    ]);
+  });
+
+  it('openrouter is the only cloud provider and points at OpenRouter', () => {
+    const cloud = PROVIDERS.filter((p) => p.cloud).map((p) => p.id);
+    expect(cloud).toEqual(['openrouter']);
+    expect(providerById('openrouter')?.base_url).toBe(
+      'https://openrouter.ai/api/v1/chat/completions'
+    );
+  });
+
+  it('every local provider suggests a dummy key placeholder (D5)', () => {
+    for (const p of PROVIDERS.filter((p) => !p.cloud)) {
+      expect(p.dummyKey && p.dummyKey.length > 0).toBe(true);
+    }
+    expect(providerById('lmstudio')?.dummyKey).toBe('local');
+  });
+});
+
+describe('providerById', () => {
+  it('resolves a known id and returns undefined otherwise', () => {
+    expect(providerById('ollama')?.label).toBe('Ollama (locale)');
+    expect(providerById('nope')).toBeUndefined();
+    expect(providerById(null)).toBeUndefined();
+    expect(providerById(undefined)).toBeUndefined();
+  });
+});
+
+describe('resolveBaseUrl', () => {
+  it('returns the trimmed stored override when present', () => {
+    expect(resolveBaseUrl('  http://host:9/v1/chat/completions  ', 'ollama')).toBe(
+      'http://host:9/v1/chat/completions'
+    );
+  });
+
+  it('falls back to the preset default when unset/blank', () => {
+    expect(resolveBaseUrl(null, 'lmstudio')).toBe('http://localhost:1234/v1/chat/completions');
+    expect(resolveBaseUrl('   ', 'ollama')).toBe('http://localhost:11434/v1/chat/completions');
+  });
+
+  it('yields an empty string for an unknown provider with no override', () => {
+    expect(resolveBaseUrl(undefined, 'mystery')).toBe('');
+  });
+});
+
+describe('keyAcceptable', () => {
+  it('behaves like isValidKey (non-empty) under D5', () => {
+    expect(keyAcceptable('')).toBe(false);
+    expect(keyAcceptable('   ')).toBe(false);
+    expect(keyAcceptable(null)).toBe(false);
+    expect(keyAcceptable('local')).toBe(true);
+    expect(keyAcceptable('sk-or-abc')).toBe(isValidKey('sk-or-abc'));
   });
 });

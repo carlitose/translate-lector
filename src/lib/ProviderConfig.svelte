@@ -4,9 +4,12 @@
   import {
     COMMON_MODELS,
     DEFAULT_MODEL,
+    PROVIDERS,
+    providerById,
     isCommonModel,
-    isValidKey,
-    resolveModel
+    keyAcceptable,
+    resolveModel,
+    type ProviderPreset
   } from './providerConfig';
   import {
     LANGUAGES,
@@ -25,7 +28,10 @@
 
   const CUSTOM = '__custom__';
 
-  // --- Provider ---
+  // --- Provider (provider-scoped: id + base-URL + key + model) ---
+  let activeProviderId = $state('openrouter'); // real value loaded from the core
+  let baseUrl = $state(''); // resolved base-URL for the active provider (editable)
+  let loadedBaseUrl = $state(''); // last loaded base-URL, to detect user changes
   let hasKey = $state(false);
   let keyInput = $state(''); // plaintext, only while typing — never persisted in the webview
   let modelSelect = $state(DEFAULT_MODEL); // dropdown value ('__custom__' for free text)
@@ -50,7 +56,18 @@
   let info = $state('');
 
   // Effective values from the current form state.
-  const chosenModel = $derived(resolveModel(modelSelect === CUSTOM ? modelFree : modelSelect));
+  const activeProvider = $derived<ProviderPreset | undefined>(providerById(activeProviderId));
+  // OpenRouter (cloud) uses the curated dropdown; local providers use free text.
+  const isCloud = $derived(activeProvider?.cloud ?? false);
+  const providerLabel = $derived(activeProvider?.label ?? activeProviderId);
+  // Key placeholder: suggest the dummy for local servers (D5), hint sk-or-… for
+  // the cloud, and prompt for a replacement when a key is already stored.
+  const keyPlaceholder = $derived(
+    hasKey ? 'inserisci per sostituire…' : (activeProvider?.dummyKey ?? 'chiave API…')
+  );
+  const chosenModel = $derived(
+    isCloud ? resolveModel(modelSelect === CUSTOM ? modelFree : modelSelect) : modelFree.trim()
+  );
   const chosenLanguage = $derived(
     resolveLanguage(langSelect === CUSTOM ? langFree : langSelect)
   );
@@ -60,6 +77,47 @@
     if (open) void load();
   });
 
+  /**
+   * Load the provider-scoped state (base-URL, model, key presence) for `id`.
+   * Reused on open and whenever the user switches provider in the selector. Does
+   * NOT touch the provider-independent reading preferences.
+   */
+  async function loadProviderState(id: string): Promise<void> {
+    keyInput = '';
+    hasKey = await invoke<boolean>('has_api_key', { providerId: id });
+
+    const cfg = await invoke<{ id: string; label: string; base_url: string; model: string }>(
+      'get_provider_config',
+      { providerId: id }
+    );
+    baseUrl = cfg.base_url ?? '';
+    loadedBaseUrl = baseUrl;
+
+    const storedModel = cfg.model ?? '';
+    // Cloud provider: offer the curated dropdown when the model is a known id;
+    // local providers always use the free-text field (the loaded tag varies).
+    if (providerById(id)?.cloud && isCommonModel(storedModel)) {
+      modelSelect = storedModel;
+      modelFree = '';
+    } else {
+      modelSelect = CUSTOM;
+      modelFree = storedModel;
+    }
+  }
+
+  /** Switch the active provider in the form and reload its scoped state. The
+   *  choice is only persisted on Save (via `set_active_provider`). */
+  async function selectProvider(id: string): Promise<void> {
+    error = '';
+    info = '';
+    activeProviderId = id;
+    try {
+      await loadProviderState(id);
+    } catch (e) {
+      error = `Errore nel caricamento del provider: ${e}`;
+    }
+  }
+
   async function load(): Promise<void> {
     error = '';
     info = '';
@@ -68,16 +126,8 @@
     clearConfirm = false;
     keyInput = '';
     try {
-      hasKey = await invoke<boolean>('has_api_key');
-
-      const storedModel = resolveModel(await invoke<string>('get_model'));
-      if (isCommonModel(storedModel)) {
-        modelSelect = storedModel;
-        modelFree = '';
-      } else {
-        modelSelect = CUSTOM;
-        modelFree = storedModel;
-      }
+      activeProviderId = await invoke<string>('get_active_provider');
+      await loadProviderState(activeProviderId);
 
       const storedLang = resolveLanguage(
         await invoke<string | null>('get_setting', { key: 'default_target_language' })
@@ -112,12 +162,40 @@
     info = '';
     busy = true;
     try {
-      // A key is optional: store it only when the user typed one; otherwise keep
-      // the existing key (the API key never leaves the keychain — NFR07).
-      if (isValidKey(keyInput)) {
-        await invoke('store_api_key', { key: keyInput.trim() });
+      // Persist the active provider choice (selection only changes it locally).
+      await invoke('set_active_provider', { providerId: activeProviderId });
+
+      // Store the key only when the user typed one; otherwise keep the existing
+      // key (the API key never leaves the keychain — NFR07). Provider-scoped (D5).
+      if (keyAcceptable(keyInput)) {
+        await invoke('store_api_key', { providerId: activeProviderId, key: keyInput.trim() });
       }
-      await invoke('set_setting', { key: 'model', value: chosenModel });
+
+      // Base-URL override: write to `provider.<id>.base_url` only when non-empty
+      // and actually changed (absent → the core uses the preset default).
+      const trimmedBase = baseUrl.trim();
+      if (trimmedBase.length > 0 && trimmedBase !== loadedBaseUrl) {
+        await invoke('set_setting', {
+          key: `provider.${activeProviderId}.base_url`,
+          value: trimmedBase
+        });
+        loadedBaseUrl = trimmedBase;
+      }
+
+      // Model override: write to `provider.<id>.model`. Cloud always has a
+      // resolved model; for local providers only persist a non-empty free-text id.
+      if (isCloud) {
+        await invoke('set_setting', {
+          key: `provider.${activeProviderId}.model`,
+          value: chosenModel
+        });
+      } else if (modelFree.trim().length > 0) {
+        await invoke('set_setting', {
+          key: `provider.${activeProviderId}.model`,
+          value: modelFree.trim()
+        });
+      }
+
       await invoke('set_setting', { key: 'default_target_language', value: chosenLanguage });
       await invoke('set_setting', {
         key: 'prefetch_enabled',
@@ -130,7 +208,7 @@
       // Reflect the normalised value back in the field.
       summaryLimit = String(parseSummaryLimit(summaryLimit));
       keyInput = '';
-      hasKey = await invoke<boolean>('has_api_key');
+      hasKey = await invoke<boolean>('has_api_key', { providerId: activeProviderId });
       info = 'Impostazioni salvate.';
       onSaved?.();
     } catch (e) {
@@ -145,9 +223,9 @@
     info = '';
     busy = true;
     try {
-      await invoke('clear_api_key');
+      await invoke('clear_api_key', { providerId: activeProviderId });
       keyInput = '';
-      hasKey = await invoke<boolean>('has_api_key');
+      hasKey = await invoke<boolean>('has_api_key', { providerId: activeProviderId });
       info = 'API key eliminata.';
     } catch (e) {
       error = `Errore nell'eliminazione: ${e}`;
@@ -228,30 +306,58 @@
 
       <div class="scroll">
         <div class="field">
-          <span class="label">API key OpenRouter</span>
-          <span class="status" class:present={hasKey}>
-            {hasKey ? '● key presente' : '○ nessuna key'}
-          </span>
+          <span class="label">Provider</span>
+          <select value={activeProviderId} onchange={(e) => selectProvider(e.currentTarget.value)}>
+            {#each PROVIDERS as p (p.id)}
+              <option value={p.id}>{p.label}</option>
+            {/each}
+          </select>
+        </div>
+
+        <div class="field">
+          <span class="label">Base URL</span>
+          <input
+            type="text"
+            placeholder="https://…/v1/chat/completions"
+            bind:value={baseUrl}
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <span class="hint">Endpoint OpenAI-compatible del provider.</span>
+        </div>
+
+        <div class="field">
+          <span class="label">API key {providerLabel}</span>
+          {#if hasKey}
+            <span class="status present">● chiave presente</span>
+          {/if}
           <input
             type="password"
-            placeholder={hasKey ? 'inserisci per sostituire…' : 'sk-or-…'}
+            placeholder={keyPlaceholder}
             bind:value={keyInput}
             autocomplete="off"
           />
+          {#if !isCloud}
+            <span class="hint">Per i server locali senza autenticazione va bene una chiave fittizia.</span>
+          {/if}
         </div>
 
         <div class="field">
           <span class="label">Modello</span>
-          <select bind:value={modelSelect}>
-            {#each COMMON_MODELS as m (m.id)}
-              <option value={m.id}>{m.label}</option>
-            {/each}
-            <option value={CUSTOM}>Altro (ID personalizzato)…</option>
-          </select>
-          {#if modelSelect === CUSTOM}
-            <input type="text" placeholder="es. mistralai/mistral-large" bind:value={modelFree} />
+          {#if isCloud}
+            <select bind:value={modelSelect}>
+              {#each COMMON_MODELS as m (m.id)}
+                <option value={m.id}>{m.label}</option>
+              {/each}
+              <option value={CUSTOM}>Altro (ID personalizzato)…</option>
+            </select>
+            {#if modelSelect === CUSTOM}
+              <input type="text" placeholder="es. mistralai/mistral-large" bind:value={modelFree} />
+            {/if}
+          {:else}
+            <input type="text" placeholder="es. il tag del modello caricato" bind:value={modelFree} />
           {/if}
-          <span class="hint">Verrà usato: <code>{chosenModel}</code></span>
+          <span class="hint">Verrà usato: <code>{chosenModel || '—'}</code></span>
         </div>
 
         <div class="field">
