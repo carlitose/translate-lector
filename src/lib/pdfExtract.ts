@@ -100,19 +100,59 @@ export function reconstructLines(items: TextItem[], pageWidth: number): Line[] {
   return lineTexts;
 }
 
-/** Join ordered lines into text, applying de-hyphenation at line ends. */
+/**
+ * Join ordered lines into text, applying de-hyphenation at line ends and
+ * inserting a blank line (a paragraph separator, i.e. a double '\n') where the
+ * vertical gap between two consecutive lines is clearly larger than the typical
+ * line spacing. Downstream paragraph chunking relies on these separators.
+ *
+ * Paragraph detection works on each line's page y (origin bottom-left): within a
+ * column y decreases top-to-bottom, so the gap to the next line is
+ * `prev.y - cur.y` (positive, ~one line height). A gap well beyond the typical
+ * spacing marks a new paragraph. The typical spacing is the median of those
+ * positive gaps, robust to the occasional large paragraph gap.
+ *
+ * Column boundaries are handled by construction: reading order lists the whole
+ * left column before the right, so the jump from the bottom of the left column
+ * to the top of the right column makes y increase — a negative gap, which never
+ * clears the threshold and so is never mistaken for a paragraph break.
+ */
 export function linesToText(lineTexts: Line[]): string {
+  const typical = typicalLineSpacing(lineTexts);
+  const paragraphFactor = 1.5; // gap beyond this * typical spacing => new paragraph
   let text = '';
   for (let i = 0; i < lineTexts.length; i++) {
     const cur = lineTexts[i].text;
     const dehyph = /([A-Za-z])[-‐]$/.test(cur);
     if (dehyph && i + 1 < lineTexts.length) {
       text += cur.replace(/[-‐]$/, '');
+    } else if (i + 1 < lineTexts.length) {
+      const gap = lineTexts[i].y - lineTexts[i + 1].y;
+      const paragraphBreak = typical > 0 && gap > typical * paragraphFactor;
+      text += cur + (paragraphBreak ? '\n\n' : '\n');
     } else {
       text += cur + '\n';
     }
   }
   return text.trim();
+}
+
+/**
+ * Median of the positive line-to-line y-gaps, i.e. the typical within-column
+ * line spacing. Negative gaps (column boundary jumps back up the page) are
+ * ignored so a column switch never skews the estimate. Returns 0 when there is
+ * no gap to measure (fewer than two lines, or a single column boundary).
+ */
+function typicalLineSpacing(lineTexts: Line[]): number {
+  const gaps: number[] = [];
+  for (let i = 1; i < lineTexts.length; i++) {
+    const gap = lineTexts[i - 1].y - lineTexts[i].y;
+    if (gap > 0) gaps.push(gap);
+  }
+  if (gaps.length === 0) return 0;
+  gaps.sort((a, b) => a - b);
+  const mid = Math.floor(gaps.length / 2);
+  return gaps.length % 2 === 0 ? (gaps[mid - 1] + gaps[mid]) / 2 : gaps[mid];
 }
 
 /** Insert spaces between items when there is a horizontal gap. */
