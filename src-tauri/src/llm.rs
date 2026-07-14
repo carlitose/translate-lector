@@ -15,7 +15,10 @@ pub const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions"
 /// Attribution headers (optional; used only for OpenRouter leaderboards).
 const HTTP_REFERER: &str = "https://github.com/translate-lector/translate-lector";
 const X_TITLE: &str = "translate-lector";
-/// JSON-schema name sent in `response_format` (§4.4).
+/// JSON-schema name sent in `response_format` (§4.4). Parte del **contratto
+/// completo**: dal flusso live usa il contratto snello (STC-10), ma il completo
+/// resta per i test e per eventuale riuso — da qui `allow(dead_code)`.
+#[allow(dead_code)]
 const SCHEMA_NAME: &str = "percettore_output";
 
 /// Default characters-per-token ratio for the `chars/4` heuristic (research §3).
@@ -40,7 +43,10 @@ pub struct GlossaryTerm {
 }
 
 /// The full structured output returned (as a JSON string) in
-/// `choices[0].message.content` (§4.4).
+/// `choices[0].message.content` (§4.4). **Contratto completo**: il flusso live
+/// usa [`PerceptorUpdateOutput`] (snello, STC-10); questo resta per i test e per
+/// eventuale riuso.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PerceptoreOutput {
     pub translated_text: String,
@@ -687,7 +693,10 @@ fn error_message(body: &str) -> Option<String> {
 
 /// The JSON schema passed in `response_format.json_schema.schema`, matching
 /// §4.4 field-for-field (`strict: true` requires `additionalProperties: false`
-/// and every property in `required`).
+/// and every property in `required`). **Contratto completo** (con
+/// `translated_text`): il flusso live usa [`perceptor_update_response_format`]
+/// (snello, STC-10); questo resta per i test e per eventuale riuso.
+#[allow(dead_code)]
 pub fn response_format() -> serde_json::Value {
     serde_json::json!({
         "type": "json_schema",
@@ -763,7 +772,10 @@ terminologia e fatti utili alla coerenza futura, così da tornare ben sotto il l
 
 /// System message: fixes the percettore role, the output schema and the "JSON
 /// only" rules (research §4). The summary budget is injected from settings
-/// (§3.5, decision D5) so the prompt reflects the configured limit.
+/// (§3.5, decision D5) so the prompt reflects the configured limit. **Contratto
+/// completo**: il flusso live usa [`build_perceptor_update_system_prompt`]
+/// (snello, STC-10); questo resta per i test e per eventuale riuso.
+#[allow(dead_code)]
 pub fn build_system_prompt(summary_token_limit: u32) -> String {
     format!(
         "Sei il motore di traduzione di translate-lector. Traduci il testo di UNA pagina di un \
@@ -794,7 +806,10 @@ REGOLE DI OUTPUT (tassative):\n\
 /// User message with full context slots (research §4). `rolling_summary`,
 /// `locked_terms` and `unlocked_terms` carry the percettore context (ticket 09;
 /// ticket 08 passed them empty). When `compress` is `true` an explicit
-/// recompression instruction is appended (EC05).
+/// recompression instruction is appended (EC05). **Contratto completo** (chiede
+/// `translated_text`): il flusso live usa [`build_perceptor_update_user_prompt`]
+/// (snello, STC-10); questo resta per i test e per eventuale riuso.
+#[allow(dead_code)]
 pub fn build_user_prompt(
     target_language: &str,
     page_text: &str,
@@ -830,7 +845,10 @@ Produci ora il JSON come da schema.{compress_note}"
 /// Assemble the system+user message pair for one page (or chunk), with the full
 /// percettore context. `summary_token_limit` shapes the system prompt; the
 /// `rolling_summary`/`locked_terms`/`unlocked_terms` slots and the `compress`
-/// flag shape the user message.
+/// flag shape the user message. **Contratto completo**: il flusso live usa
+/// [`build_perceptor_update_messages`] (snello, STC-10); questo resta per i test
+/// e per eventuale riuso.
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub fn build_messages(
     target_language: &str,
@@ -871,6 +889,11 @@ pub fn build_messages(
 /// ignores parameters the model does not support. `temperature` is kept (0.2)
 /// for deterministic translations but is optional, so the model-agnostic
 /// fallback ([`complete_with_fallback`]) can drop it if a model still rejects it.
+///
+/// **Contratto completo** (invia [`response_format`] con `translated_text`): il
+/// flusso live usa [`build_perceptor_update_request`] (snello, STC-10); questo
+/// resta per i test e per eventuale riuso.
+#[allow(dead_code)]
 pub fn build_request(model: &str, messages: Vec<ChatMessage>, max_tokens: u32) -> ChatRequest {
     ChatRequest {
         model: model.to_string(),
@@ -1018,12 +1041,209 @@ pub fn parse_translation(content: &str) -> String {
     trimmed.to_string()
 }
 
+// --- Contratto perceptor-update snello (STC-10, decisione D5) -----------------
+//
+// A fine pagina il percettore aggiorna SOLO il riassunto progressivo e il
+// glossario, SENZA ri-tradurre la pagina: la traduzione è già stata prodotta
+// dalle chiamate translate-only per unità. Il vecchio contratto completo
+// (`build_messages`/`build_request`/`response_format` con `translated_text`)
+// costringeva invece il modello a ri-tradurre l'intera pagina → maxi-output che
+// sfonda una finestra piccola (EC08); e poiché quella chiamata falliva con `?`,
+// l'app scartava la traduzione già fatta. Questo contratto snello toglie
+// `translated_text` da schema e prompt: output piccolo, budget-safe. Il contratto
+// completo resta disponibile (altri percorsi/test lo usano); qui si affianca.
+
+/// Nome dello schema JSON inviato in `response_format` per il perceptor-update.
+const PERCEPTOR_UPDATE_SCHEMA_NAME: &str = "perceptor_update";
+
+/// Output **snello** del perceptor-update (STC-10): SOLO riassunto aggiornato e
+/// nuovi termini di glossario, NESSUN `translated_text`. Nessun
+/// `deny_unknown_fields`, così una risposta che includa per errore l'intero JSON
+/// percettore (con `translated_text`) viene comunque estratta correttamente.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PerceptorUpdateOutput {
+    pub updated_summary: String,
+    pub new_glossary_terms: Vec<GlossaryTerm>,
+}
+
+/// Lo schema `response_format.json_schema.schema` per il perceptor-update snello:
+/// SOLO `updated_summary` + `new_glossary_terms` (nessun `translated_text`), così
+/// il modello non ri-traduce la pagina (STC-10). `strict: true` richiede
+/// `additionalProperties: false` e ogni proprietà in `required`.
+pub fn perceptor_update_response_format() -> serde_json::Value {
+    serde_json::json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": PERCEPTOR_UPDATE_SCHEMA_NAME,
+            "strict": true,
+            "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["updated_summary", "new_glossary_terms"],
+                "properties": {
+                    "updated_summary": { "type": "string" },
+                    "new_glossary_terms": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["source_term", "translation", "type", "note"],
+                            "properties": {
+                                "source_term": { "type": "string" },
+                                "translation": { "type": "string" },
+                                "type": { "type": "string", "enum": ["nome proprio", "tecnico", "comune"] },
+                                "note": { "type": "string" }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// System prompt del perceptor-update snello (STC-10): il modello aggiorna SOLO
+/// summary + glossario e NON traduce la pagina (è già tradotta altrove). Mantiene
+/// le stesse regole "JSON only" del percettore completo ma con lo schema ridotto.
+/// Il limite del summary è iniettato dalle settings (EC05, §3.5).
+pub fn build_perceptor_update_system_prompt(summary_token_limit: u32) -> String {
+    format!(
+        "Sei il percettore di translate-lector. Il testo di UNA pagina di un documento è GIA \
+stato tradotto altrove: il tuo compito NON e tradurre, ma SOLO aggiornare il contesto del \
+documento a partire dal testo della pagina.\n\n\
+Devi:\n\
+1. Aggiornare il riassunto progressivo (summary) integrando i punti chiave di questa pagina, \
+mantenendo la coerenza col resto del documento. Se il summary risultante supererebbe circa \
+{summary_token_limit} token, COMPRIMILO mantenendo solo trama, entita, terminologia e fatti utili \
+alla coerenza futura.\n\
+2. Proporre nuovi termini di glossario rilevanti apparsi in questa pagina (nomi propri, termini \
+tecnici, espressioni ricorrenti) che non siano gia nel glossario.\n\n\
+NON tradurre la pagina e NON restituire alcun testo tradotto: quello e gia stato prodotto.\n\n\
+REGOLE DI OUTPUT (tassative):\n\
+- Rispondi con UN SOLO oggetto JSON valido, senza testo prima o dopo, senza markdown, senza code fence.\n\
+- Lo schema e ESATTAMENTE:\n\
+  {{\n\
+    \"updated_summary\": string,\n\
+    \"new_glossary_terms\": [ {{ \"source_term\": string, \"translation\": string, \"type\": \"nome proprio\" | \"tecnico\" | \"comune\", \"note\": string }} ]\n\
+  }}\n\
+- Non aggiungere altre chiavi (in particolare NIENTE \"translated_text\"). Non tradurre le chiavi JSON. \"note\" vuota = \"\"."
+    )
+}
+
+/// User message del perceptor-update snello: riassunto corrente, glossario
+/// **gia noto** (per non riproporlo) e testo pagina come input per aggiornare il
+/// contesto — con la nota esplicita che la pagina è già tradotta. Quando
+/// `compress` è `true` appende l'istruzione di ricompressione (EC05).
+pub fn build_perceptor_update_user_prompt(
+    target_language: &str,
+    page_text: &str,
+    rolling_summary: &str,
+    locked_terms: &str,
+    unlocked_terms: &str,
+    compress: bool,
+) -> String {
+    let summary = if rolling_summary.trim().is_empty() {
+        "(nessuno: e la prima pagina)"
+    } else {
+        rolling_summary
+    };
+    let locked = if locked_terms.trim().is_empty() { "(nessuno)" } else { locked_terms };
+    let unlocked = if unlocked_terms.trim().is_empty() { "(nessuno)" } else { unlocked_terms };
+    let compress_note = if compress {
+        format!("\n\n{COMPRESSION_INSTRUCTION}")
+    } else {
+        String::new()
+    };
+
+    format!(
+        "LINGUA DI DESTINAZIONE: {target_language}\n\n\
+RIASSUNTO PROGRESSIVO FINORA (contesto delle pagine precedenti):\n{summary}\n\n\
+GLOSSARIO ATTUALE (termini gia noti, per non riproporli):\n\
+Termini BLOCCATI (vincolo assoluto):\n{locked}\n\
+Termini suggeriti:\n{unlocked}\n\n\
+TESTO DELLA PAGINA (gia tradotto altrove, qui solo per aggiornare il contesto):\n\"\"\"\n{page_text}\n\"\"\"\n\n\
+Produci ora il JSON con SOLO updated_summary e new_glossary_terms (NIENTE traduzione).{compress_note}"
+    )
+}
+
+/// Coppia system+user per la chiamata perceptor-update snella (STC-10).
+#[allow(clippy::too_many_arguments)]
+pub fn build_perceptor_update_messages(
+    target_language: &str,
+    page_text: &str,
+    rolling_summary: &str,
+    locked_terms: &str,
+    unlocked_terms: &str,
+    compress: bool,
+    summary_token_limit: u32,
+) -> Vec<ChatMessage> {
+    vec![
+        ChatMessage::system(build_perceptor_update_system_prompt(summary_token_limit)),
+        ChatMessage::user(build_perceptor_update_user_prompt(
+            target_language,
+            page_text,
+            rolling_summary,
+            locked_terms,
+            unlocked_terms,
+            compress,
+        )),
+    ]
+}
+
+/// [`ChatRequest`] per la chiamata perceptor-update snella: come [`build_request`]
+/// ma con lo schema ridotto [`perceptor_update_response_format`] (niente
+/// `translated_text`). `temperature` resta (0.2) ma opzionale, così il fallback
+/// model-agnostico può rimuoverla; `provider` assente per non forzare il routing
+/// (bug #1). `max_tokens` è quello di pagina: l'output ora è solo summary +
+/// glossario, molto più piccolo di una ri-traduzione dell'intera pagina.
+pub fn build_perceptor_update_request(
+    model: &str,
+    messages: Vec<ChatMessage>,
+    max_tokens: u32,
+) -> ChatRequest {
+    ChatRequest {
+        model: model.to_string(),
+        messages,
+        temperature: Some(0.2),
+        max_tokens,
+        stream: false,
+        response_format: Some(perceptor_update_response_format()),
+        provider: None,
+    }
+}
+
+/// Estrae [`PerceptorUpdateOutput`] dal `content` della risposta perceptor-update
+/// con lo stesso fallback robusto del contratto completo: (a) deserializzazione
+/// diretta, (b) primo blocco `{...}` bilanciato (strip di ```json / prosa). La
+/// correzione (layer c) vive nel servizio di traduzione, che può richiamare il
+/// client. Un `translated_text` eventualmente presente viene ignorato.
+pub fn parse_perceptor_update(content: &str) -> Result<PerceptorUpdateOutput, String> {
+    // (a) diretto.
+    if let Ok(out) = serde_json::from_str::<PerceptorUpdateOutput>(content.trim()) {
+        return Ok(out);
+    }
+    // (b) primo blocco bilanciato.
+    if let Some(block) = extract_first_json_block(content) {
+        if let Ok(out) = serde_json::from_str::<PerceptorUpdateOutput>(block) {
+            return Ok(out);
+        }
+    }
+    Err(format!(
+        "impossibile estrarre JSON conforme (updated_summary + new_glossary_terms) \
+         dal contenuto ({} char)",
+        content.chars().count()
+    ))
+}
+
 // --- Layered parsing (§4.4) --------------------------------------------------
 
 /// Parse the model `content` into [`PerceptoreOutput`] using layers (a) direct
 /// deserialize and (b) first balanced `{...}` block extraction. The correction
 /// retry (layer c) lives in the translation service, which can call the client
-/// again; this function is the pure, string-only part.
+/// again; this function is the pure, string-only part. **Contratto completo**: il
+/// flusso live usa [`parse_perceptor_update`] (snello, STC-10); questo resta per
+/// i test e per eventuale riuso.
+#[allow(dead_code)]
 pub fn parse_content(content: &str) -> Result<PerceptoreOutput, String> {
     // (a) direct.
     if let Ok(out) = serde_json::from_str::<PerceptoreOutput>(content.trim()) {
@@ -1317,6 +1537,92 @@ mod tests {
         // il solo translated_text (campi extra ignorati).
         let full = r#"{"translated_text":"Ciao","updated_summary":"s","new_glossary_terms":[]}"#;
         assert_eq!(parse_translation(full), "Ciao");
+    }
+
+    // --- STC-10: lean perceptor-update contract -----------------------------
+
+    #[test]
+    fn perceptor_update_response_format_requires_summary_and_glossary_not_translated_text() {
+        let rf = perceptor_update_response_format();
+        assert_eq!(rf["type"], "json_schema");
+        assert_eq!(rf["json_schema"]["strict"], true);
+        let required = &rf["json_schema"]["schema"]["required"];
+        // Only the two lean fields are required — never translated_text.
+        assert_eq!(required, &serde_json::json!(["updated_summary", "new_glossary_terms"]));
+        let props = &rf["json_schema"]["schema"]["properties"];
+        assert!(props.get("translated_text").is_none(), "lean schema must not expose translated_text");
+        assert!(props.get("updated_summary").is_some());
+        assert!(props.get("new_glossary_terms").is_some());
+    }
+
+    #[test]
+    fn perceptor_update_system_prompt_does_not_ask_to_translate() {
+        let s = build_perceptor_update_system_prompt(700);
+        // Explicitly forbids re-translation and the translated_text field.
+        assert!(s.contains("NON e tradurre") || s.contains("NON tradurre"));
+        assert!(s.contains("NIENTE \"translated_text\""));
+        // Still owns the summary + glossary duties and the configured limit.
+        assert!(s.contains("700 token"));
+        assert!(s.contains("updated_summary"));
+        assert!(s.contains("new_glossary_terms"));
+        assert!(!s.contains("\"translated_text\": string"), "no translated_text in the schema block");
+    }
+
+    #[test]
+    fn perceptor_update_user_prompt_appends_compression_only_when_flagged() {
+        let plain = build_perceptor_update_user_prompt("it", "Testo pagina", "sommario", "", "", false);
+        assert!(plain.contains("Testo pagina"));
+        assert!(plain.contains("sommario"));
+        assert!(plain.contains("NIENTE traduzione"));
+        assert!(!plain.contains("RICOMPRIMILO"), "no compression note when compress=false");
+
+        let compressed = build_perceptor_update_user_prompt("it", "x", "long", "", "", true);
+        assert!(compressed.contains(COMPRESSION_INSTRUCTION), "EC05 compression reused when flagged");
+    }
+
+    #[test]
+    fn build_perceptor_update_request_carries_the_lean_schema() {
+        let req = build_perceptor_update_request(
+            "m",
+            build_perceptor_update_messages("it", "x", "", "", "", false, 1000),
+            4096,
+        );
+        let rf = req.response_format.clone().expect("perceptor-update sends a response_format");
+        // It is the LEAN schema, not the full one (no translated_text).
+        assert_eq!(rf["json_schema"]["name"], "perceptor_update");
+        assert!(rf["json_schema"]["schema"]["properties"].get("translated_text").is_none());
+        assert_eq!(req.temperature, Some(0.2));
+        assert!(req.provider.is_none(), "no provider routing by default (bug #1)");
+    }
+
+    #[test]
+    fn parse_perceptor_update_reads_lean_json_and_ignores_translated_text() {
+        // Pure lean JSON.
+        let lean = r#"{"updated_summary":"riassunto","new_glossary_terms":[]}"#;
+        let out = parse_perceptor_update(lean).unwrap();
+        assert_eq!(out.updated_summary, "riassunto");
+        assert!(out.new_glossary_terms.is_empty());
+
+        // A full PerceptoreOutput JSON (with translated_text) still parses: the
+        // extra field is ignored, so old fixtures keep working.
+        let full = r#"{"translated_text":"ignored","updated_summary":"s","new_glossary_terms":[
+            {"source_term":"hello","translation":"ciao","type":"comune","note":""}
+        ]}"#;
+        let out = parse_perceptor_update(full).unwrap();
+        assert_eq!(out.updated_summary, "s");
+        assert_eq!(out.new_glossary_terms.len(), 1);
+        assert_eq!(out.new_glossary_terms[0].source_term, "hello");
+
+        // Inside a code fence + prose.
+        let fenced = format!("Ecco:\n```json\n{lean}\n```\nfine");
+        assert_eq!(parse_perceptor_update(&fenced).unwrap().updated_summary, "riassunto");
+    }
+
+    #[test]
+    fn parse_perceptor_update_errors_on_malformed_or_incomplete() {
+        assert!(parse_perceptor_update("not json at all").is_err());
+        // Missing the required new_glossary_terms field.
+        assert!(parse_perceptor_update(r#"{"updated_summary":"s"}"#).is_err());
     }
 
     // --- Bug #1: default body must not force provider routing --------------
