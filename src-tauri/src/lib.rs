@@ -304,6 +304,9 @@ async fn translate_page(
             target_language: &target_language,
             page_text: &page_text,
             model: &cfg.model,
+            // Tetto max_tokens del provider attivo (Ticket 02): cloud generoso,
+            // locale con margine entro n_ctx per lasciare spazio all'output.
+            max_tokens: cfg.max_tokens,
             update_context,
         };
         translate::translate_page(&conn, &client, &params).map_err(|e| e.user_message())

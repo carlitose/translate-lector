@@ -37,6 +37,11 @@ pub struct TranslateParams<'a> {
     pub target_language: &'a str,
     pub page_text: &'a str,
     pub model: &'a str,
+    /// Upper bound on generated tokens for each call (ticket 02), taken from the
+    /// active provider config. Local providers reserve output headroom within a
+    /// small `n_ctx` (default 2048); cloud keeps a generous value (4096) so long
+    /// pages are not truncated. Never the whole context window.
+    pub max_tokens: u32,
     /// Whether this translation should advance the percettore context (ticket
     /// 09): `true` on real navigation — persists the rolling summary and inserts
     /// glossary terms; `false` on **prefetch** (ticket 12) — caches only the
@@ -254,7 +259,7 @@ pub fn translate_page(
         );
         prompt_chars_sum += messages.iter().map(|m| m.content.chars().count()).sum::<usize>();
 
-        let mut req = build_request(p.model, messages);
+        let mut req = build_request(p.model, messages, p.max_tokens);
         // Reuse the optional-param shape discovered on a previous chunk so we
         // don't re-probe a param the model already rejected this page.
         if let Some(shape) = &working_shape {
@@ -438,8 +443,30 @@ mod tests {
             target_language: "it",
             page_text: text,
             model: "openai/gpt-4o",
+            max_tokens: 4096,
             update_context: true,
         }
+    }
+
+    // --- Ticket 02: the provider's max_tokens reaches the request ------------
+
+    #[test]
+    fn translate_page_threads_the_provider_max_tokens_into_the_request() {
+        let c = conn();
+        seed_session(&c);
+        let client = MockClient::new(vec![Ok(resp(&valid_content(), 400))]);
+        let p = TranslateParams {
+            document_id: 1,
+            page_number: 3,
+            target_language: "it",
+            page_text: "Hello",
+            model: "local-model",
+            max_tokens: 2048, // a local provider reserving output headroom
+            update_context: true,
+        };
+        translate_page(&c, &client, &p).unwrap();
+        let sent = client.requests.borrow();
+        assert_eq!(sent[0].max_tokens, 2048, "the request carries the provider's max_tokens");
     }
 
     // --- Cache hit -----------------------------------------------------------
@@ -536,6 +563,7 @@ mod tests {
             target_language: "it",
             page_text: "page 10 text",
             model: "openai/gpt-4o",
+            max_tokens: 4096,
             update_context: true,
         };
 
@@ -937,6 +965,7 @@ mod tests {
             target_language: "it",
             page_text: text,
             model: "openai/gpt-4o",
+            max_tokens: 4096,
             update_context: true,
         }
     }
@@ -964,6 +993,7 @@ mod tests {
             target_language: "it",
             page_text: "Next page text.",
             model: "openai/gpt-4o",
+            max_tokens: 4096,
             update_context: false,
         };
 
@@ -1017,6 +1047,7 @@ mod tests {
             target_language: "it",
             page_text: "Next",
             model: "openai/gpt-4o",
+            max_tokens: 4096,
             update_context: false,
         };
 

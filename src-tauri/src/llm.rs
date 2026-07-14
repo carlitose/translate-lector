@@ -814,6 +814,13 @@ pub fn build_messages(
 /// Assemble a `ChatRequest` for the given model and messages, with the §4.4
 /// `response_format` and a low `temperature` for quality.
 ///
+/// `max_tokens` is supplied by the caller (from the active provider config,
+/// ticket 02) instead of being hardcoded to the whole context window: a small
+/// local model (`n_ctx ~4096`) needs headroom for `prompt + reasoning + output`,
+/// otherwise the server returns `finish_reason: length` with empty `content`
+/// (see local-llm-empty-content diagnosis). Cloud providers pass a generous
+/// value so long page translations are not truncated.
+///
 /// Deliberately does **not** send `provider.require_parameters` (bug #1): with
 /// it, OpenRouter routes only to endpoints supporting *every* parameter in the
 /// body, so a model that does not advertise `temperature` (e.g. a reasoning
@@ -821,12 +828,12 @@ pub fn build_messages(
 /// ignores parameters the model does not support. `temperature` is kept (0.2)
 /// for deterministic translations but is optional, so the model-agnostic
 /// fallback ([`complete_with_fallback`]) can drop it if a model still rejects it.
-pub fn build_request(model: &str, messages: Vec<ChatMessage>) -> ChatRequest {
+pub fn build_request(model: &str, messages: Vec<ChatMessage>, max_tokens: u32) -> ChatRequest {
     ChatRequest {
         model: model.to_string(),
         messages,
         temperature: Some(0.2),
-        max_tokens: 4096,
+        max_tokens,
         stream: false,
         response_format: Some(response_format()),
         provider: None,
@@ -1049,7 +1056,7 @@ mod tests {
 
     #[test]
     fn build_request_sets_response_format_and_low_temperature() {
-        let req = build_request("openai/gpt-4o", build_messages("it", "x", "", "", "", false, 1000));
+        let req = build_request("openai/gpt-4o", build_messages("it", "x", "", "", "", false, 1000), 4096);
         assert_eq!(req.model, "openai/gpt-4o");
         assert!(!req.stream);
         let rf = req.response_format.clone().unwrap();
@@ -1058,11 +1065,24 @@ mod tests {
         assert_eq!(req.temperature, Some(0.2), "low temperature kept for quality");
     }
 
+    // --- Ticket 02: max_tokens comes from the caller, not a hardcoded window --
+
+    #[test]
+    fn build_request_uses_the_provided_max_tokens_not_a_hardcoded_4096() {
+        // The whole point of ticket 02: `max_tokens` is no longer pinned to the
+        // (small local) context window — it flows in from the provider config so
+        // a local model keeps room to actually emit `content`.
+        let local = build_request("m", build_messages("it", "x", "", "", "", false, 1000), 2048);
+        assert_eq!(local.max_tokens, 2048, "max_tokens is threaded from the caller");
+        let cloud = build_request("openai/gpt-4o", build_messages("it", "x", "", "", "", false, 1000), 4096);
+        assert_eq!(cloud.max_tokens, 4096, "a generous cloud value passes through unchanged");
+    }
+
     // --- Bug #1: default body must not force provider routing --------------
 
     #[test]
     fn build_request_default_body_has_no_require_parameters() {
-        let req = build_request("openai/gpt-4o", build_messages("it", "x", "", "", "", false, 1000));
+        let req = build_request("openai/gpt-4o", build_messages("it", "x", "", "", "", false, 1000), 4096);
         // The default body must not send provider.require_parameters, which
         // would 404 on models that don't advertise `temperature` (bug #1).
         assert!(req.provider.is_none(), "no provider block by default");
@@ -1134,7 +1154,7 @@ mod tests {
 
     #[test]
     fn degrade_strips_provider_then_response_format_then_temperature_then_stops() {
-        let mut req = build_request("m", build_messages("it", "x", "", "", "", false, 1000));
+        let mut req = build_request("m", build_messages("it", "x", "", "", "", false, 1000), 4096);
         req.provider = Some(serde_json::json!({ "require_parameters": true }));
         // provider first
         assert!(req.degrade());
@@ -1458,7 +1478,7 @@ mod tests {
     }
 
     fn a_request() -> ChatRequest {
-        build_request("openai/gpt-4o", build_messages("it", "x", "", "", "", false, 1000))
+        build_request("openai/gpt-4o", build_messages("it", "x", "", "", "", false, 1000), 4096)
     }
 
     #[test]
@@ -1510,7 +1530,7 @@ mod tests {
             "   ",
             /* send_openrouter_headers = */ true,
         );
-        let req = build_request("openai/gpt-4o", build_messages("it", "x", "", "", "", false, 1000));
+        let req = build_request("openai/gpt-4o", build_messages("it", "x", "", "", "", false, 1000), 4096);
         assert_eq!(client.complete(&req), Err(LlmError::MissingApiKey));
     }
 
@@ -1548,7 +1568,7 @@ mod tests {
 
         let base_url = format!("http://{addr}/v1/chat/completions");
         let client = ChatCompletionsClient::new(base_url, "test-key", send_openrouter_headers);
-        let req = build_request("openai/gpt-4o", build_messages("it", "x", "", "", "", false, 1000));
+        let req = build_request("openai/gpt-4o", build_messages("it", "x", "", "", "", false, 1000), 4096);
         let _ = client.complete(&req);
         let captured = rx.recv().unwrap();
         handle.join().unwrap();
