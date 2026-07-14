@@ -1,11 +1,12 @@
-//! OpenRouter chat-completions transport, percettore output types, prompt
-//! builder and the layered JSON parsing fallback (SPECIFICATION §4.4, ticket
-//! 08, research-openrouter-contract.md).
+//! OpenAI-compatible chat-completions transport, percettore output types,
+//! prompt builder and the layered JSON parsing fallback (SPECIFICATION §4.4,
+//! ticket 08, research-openrouter-contract.md).
 //!
 //! The transport is abstracted behind [`ChatClient`] so the translation service
 //! can be unit-tested with a mock, no network required. The real
-//! [`OpenRouterClient`] uses a blocking `reqwest` client and is exercised only
-//! by human QA against a live key.
+//! [`ChatCompletionsClient`] uses a blocking `reqwest` client, targets any
+//! configurable OpenAI-compatible endpoint (OpenRouter or a local `/v1` server)
+//! and is exercised only by human QA against a live endpoint.
 
 use serde::{Deserialize, Serialize};
 
@@ -14,7 +15,10 @@ pub const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions"
 /// Attribution headers (optional; used only for OpenRouter leaderboards).
 const HTTP_REFERER: &str = "https://github.com/translate-lector/translate-lector";
 const X_TITLE: &str = "translate-lector";
-/// JSON-schema name sent in `response_format` (§4.4).
+/// JSON-schema name sent in `response_format` (§4.4). Parte del **contratto
+/// completo**: dal flusso live usa il contratto snello (STC-10), ma il completo
+/// resta per i test e per eventuale riuso — da qui `allow(dead_code)`.
+#[allow(dead_code)]
 const SCHEMA_NAME: &str = "percettore_output";
 
 /// Default characters-per-token ratio for the `chars/4` heuristic (research §3).
@@ -39,7 +43,10 @@ pub struct GlossaryTerm {
 }
 
 /// The full structured output returned (as a JSON string) in
-/// `choices[0].message.content` (§4.4).
+/// `choices[0].message.content` (§4.4). **Contratto completo**: il flusso live
+/// usa [`PerceptorUpdateOutput`] (snello, STC-10); questo resta per i test e per
+/// eventuale riuso.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PerceptoreOutput {
     pub translated_text: String,
@@ -140,6 +147,14 @@ pub struct ResponseMessage {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Choice {
     pub message: ResponseMessage,
+    /// Why generation stopped (`stop` | `length` | …), when the provider reports
+    /// it. Optional (defaults to `None` if missing). `length` with empty/null
+    /// `content` means the model exhausted its completion budget — typically a
+    /// reasoning model in a small context window — and is surfaced as the
+    /// dedicated [`LlmError::OutputBudgetExhausted`] instead of the generic
+    /// empty-content error (local-llm-empty-content, ticket 03).
+    #[serde(default)]
+    pub finish_reason: Option<String>,
 }
 
 /// Response body (relevant fields, §4.4).
@@ -162,10 +177,62 @@ impl ChatResponse {
             .ok_or_else(|| LlmError::Http("risposta senza choices".into()))?;
         match choice.message.content.as_deref() {
             Some(c) if !c.trim().is_empty() => Ok(c),
+            // Empty/null content: distinguish the "ran out of output budget"
+            // case (finish_reason == "length", typical of a reasoning model in a
+            // small context window) from a plain empty response. The former gets
+            // a dedicated, actionable error (ticket 03); the latter keeps the
+            // generic message (bug #2 reasoning-null path is unaffected: no
+            // finish_reason == "length" there).
+            _ if matches!(
+                choice.finish_reason.as_deref(),
+                Some(r) if r.eq_ignore_ascii_case("length")
+            ) =>
+            {
+                Err(LlmError::OutputBudgetExhausted(
+                    choice.finish_reason.clone().unwrap_or_default(),
+                ))
+            }
             _ => Err(LlmError::Http(
                 "risposta senza contenuto testuale (content null/vuoto)".into(),
             )),
         }
+    }
+
+    /// Like [`content`], but additionally refuses a **truncated** completion: a
+    /// non-empty content with `finish_reason == "length"` means the model ran out
+    /// of budget mid-answer, so the text is cut off (e.g. "…con milioni o"). On
+    /// the translate path we must NOT accept such a partial — it would silently
+    /// drop half a page (unit-truncation-diagnosis, ticket 11) — so it is
+    /// surfaced as [`LlmError::OutputTruncated`], letting the caller retry with a
+    /// larger budget. Everything else defers to [`content`]: the empty+length
+    /// case still maps to [`LlmError::OutputBudgetExhausted`] (EC08) exactly as
+    /// before, and an empty/`null`/blank content stays the generic error.
+    ///
+    /// Deliberately a **separate** accessor. It is used by the whole translate
+    /// path — including the single-unit / cloud-degrade case — so a truncation
+    /// triggers a bounded retry there too (a truncated page is worse than a
+    /// retried one). The **perceptor-update** path keeps calling [`content`] and
+    /// retains its old accept-partial behaviour (it never emits page text).
+    ///
+    /// [`content`]: ChatResponse::content
+    pub fn content_complete(&self) -> Result<&str, LlmError> {
+        // Reuse content() for the no-choice / empty / empty+length (EC08) cases;
+        // an Ok here means there IS a first choice with non-empty text.
+        let text = self.content()?;
+        let truncated = self
+            .choices
+            .first()
+            .and_then(|c| c.finish_reason.as_deref())
+            .is_some_and(|r| r.eq_ignore_ascii_case("length"));
+        if truncated {
+            let reason = self
+                .choices
+                .first()
+                .and_then(|c| c.finish_reason.clone())
+                .unwrap_or_default();
+            return Err(LlmError::OutputTruncated(reason));
+        }
+        Ok(text)
     }
 }
 
@@ -211,6 +278,50 @@ pub enum LlmError {
     /// No network connection reached the provider (EC02). Transient: retried a
     /// bounded number of times, then surfaced so cached pages stay readable.
     Offline(String),
+    /// A **local** provider endpoint refused the connection / could not be
+    /// reached (connection refused, host down): the local server is simply not
+    /// running or the address/port is wrong (D3/D7, ticket 09). Distinct from
+    /// [`Offline`] (a remote endpoint unreachable = EC02): this carries the
+    /// `base_url` and a dedicated, actionable message. **Permanent** (fail-fast):
+    /// it is NOT retried, because spinning on a server that is down only delays
+    /// the clear message. There is deliberately **no** automatic fallback to the
+    /// cloud (decision D4).
+    ///
+    /// [`Offline`]: LlmError::Offline
+    Unreachable(String),
+    /// The response came back with empty/`null` `content` **and**
+    /// `finish_reason == "length"`: the model exhausted its completion-token
+    /// budget before emitting any text — typically a **reasoning** model whose
+    /// chain of thought fills a small context window (local-llm-empty-content
+    /// diagnosis, ticket 03). Distinct from the generic empty-content [`Http`]
+    /// error: it carries a dedicated, actionable message (EC08 — change model /
+    /// reduce text / raise `n_ctx`). **Permanent**: not transient (a retry with
+    /// the same budget would likely burn it again) and not param-degradable
+    /// (relaxing optional params does not add budget), so it surfaces
+    /// immediately for the user to act. The carried string is the reported
+    /// `finish_reason` (for diagnostics/logs).
+    ///
+    /// [`Http`]: LlmError::Http
+    OutputBudgetExhausted(String),
+    /// The response came back with **non-empty** content but
+    /// `finish_reason == "length"`: the model emitted a **partial** answer and hit
+    /// the completion-token budget mid-output — the text is truncated (e.g. a
+    /// paragraph cut at "…con milioni o"). Distinct from
+    /// [`OutputBudgetExhausted`] (empty content + length = EC08): here there IS
+    /// text, but it is incomplete, so accepting it would silently drop half a page
+    /// (unit-truncation-diagnosis, ticket 11). Surfaced only by the dedicated
+    /// [`ChatResponse::content_complete`] used on the whole translate path
+    /// (single-unit / cloud-degrade included); the perceptor-update path keeps
+    /// [`ChatResponse::content`] and its old accept-partial behaviour. On the
+    /// translate path this triggers a retry with a larger `max_tokens`
+    /// ([`crate::translate`]); if the retry still truncates at the maximum
+    /// headroom the partial is refused and re-surfaced as EC08
+    /// ([`OutputBudgetExhausted`]). **Not transient** (a retry with the *same*
+    /// budget would truncate again — the retry must GROW the budget) and not
+    /// param-degradable. The carried string is the reported `finish_reason`.
+    ///
+    /// [`OutputBudgetExhausted`]: LlmError::OutputBudgetExhausted
+    OutputTruncated(String),
     /// The response could not be parsed even after the correction retry.
     ParseFailed(String),
     /// A local storage error while reading/writing the cache.
@@ -243,17 +354,17 @@ impl LlmError {
     pub fn user_message(&self) -> String {
         match self {
             LlmError::MissingApiKey => {
-                "EC03: API key OpenRouter mancante o non valida. \
+                "EC03: API key mancante o non valida. \
                  Configurala in ⚙️ (Impostazioni provider)."
                     .into()
             }
-            LlmError::Http(m) => format!("Errore di rete/OpenRouter: {m}"),
+            LlmError::Http(m) => format!("Errore di rete/servizio LLM: {m}"),
             LlmError::UnsupportedParams(m) => format!(
                 "Il modello selezionato non supporta i parametri richiesti \
                  (nessun endpoint compatibile). {m}"
             ),
-            LlmError::Timeout(m) => format!("Errore di rete/OpenRouter (timeout): {m}"),
-            LlmError::ServerError(m) => format!("Errore del servizio OpenRouter: {m}"),
+            LlmError::Timeout(m) => format!("Errore di rete/servizio LLM (timeout): {m}"),
+            LlmError::ServerError(m) => format!("Errore del servizio LLM: {m}"),
             LlmError::RateLimited(m) => {
                 format!("EC07: limite di richieste raggiunto (rate limit). Riprova tra poco. {m}")
             }
@@ -262,6 +373,27 @@ impl LlmError {
                     "EC02: nessuna connessione. Le pagine già tradotte restano \
                      leggibili dalla cache. {m}"
                 )
+            }
+            LlmError::Unreachable(base_url) => {
+                format!(
+                    "Server locale non raggiungibile a {base_url}. \
+                     Avvia il server (es. Unsloth Studio) o verifica l'indirizzo in ⚙️."
+                )
+            }
+            LlmError::OutputBudgetExhausted(_) => {
+                "EC08: il modello locale ha esaurito il budget di token \
+                 (probabile reasoning entro una finestra piccola). Usa un modello \
+                 non-reasoning, riduci il testo, o aumenta il context (n_ctx) del server."
+                    .into()
+            }
+            LlmError::OutputTruncated(_) => {
+                // Same actionable EC08 framing: the per-unit retry converts a
+                // persistent truncation into OutputBudgetExhausted, but keep a
+                // coherent message here in case this variant ever surfaces.
+                "EC08: la traduzione è stata troncata (budget di token esaurito a \
+                 metà risposta). Riduci il testo, usa un modello meno verboso, o \
+                 aumenta il context (n_ctx) del server."
+                    .into()
             }
             LlmError::ParseFailed(m) => {
                 format!("Risposta del modello non valida (JSON non conforme): {m}")
@@ -384,48 +516,60 @@ pub fn complete_with_fallback(
     }
 }
 
-/// Real OpenRouter client backed by a blocking `reqwest` client.
-pub struct OpenRouterClient {
+/// Real chat-completions client backed by a blocking `reqwest` client, talking
+/// to any OpenAI-compatible endpoint. `base_url` is the full
+/// `/v1/chat/completions` URL (OpenRouter's is [`OPENROUTER_URL`], the openrouter
+/// preset default); `send_openrouter_headers` gates the OpenRouter-only
+/// attribution headers so other endpoints don't receive them.
+pub struct ChatCompletionsClient {
+    base_url: String,
     api_key: String,
+    send_openrouter_headers: bool,
     http: reqwest::blocking::Client,
 }
 
-impl OpenRouterClient {
-    pub fn new(api_key: impl Into<String>) -> Self {
+impl ChatCompletionsClient {
+    pub fn new(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        send_openrouter_headers: bool,
+    ) -> Self {
         Self {
+            base_url: base_url.into(),
             api_key: api_key.into(),
+            send_openrouter_headers,
             http: reqwest::blocking::Client::new(),
         }
     }
 }
 
-impl ChatClient for OpenRouterClient {
+impl ChatClient for ChatCompletionsClient {
     fn complete(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
-        // EC03 guard: never touch the network without a key.
+        // EC03 guard: never touch the network without a key. Per decision D5 the
+        // key is mandatory for every provider (local servers get a dummy key).
         if self.api_key.trim().is_empty() {
             return Err(LlmError::MissingApiKey);
         }
 
-        let resp = self
+        let mut rb = self
             .http
-            .post(OPENROUTER_URL)
+            .post(&self.base_url)
             .bearer_auth(self.api_key.trim())
-            .header("Content-Type", "application/json")
-            .header("HTTP-Referer", HTTP_REFERER)
-            .header("X-Title", X_TITLE)
+            .header("Content-Type", "application/json");
+        // Attribution headers are OpenRouter-specific: send them only for the
+        // openrouter preset, not for local/other OpenAI-compatible endpoints.
+        if self.send_openrouter_headers {
+            rb = rb.header("HTTP-Referer", HTTP_REFERER).header("X-Title", X_TITLE);
+        }
+
+        let resp = rb
             .json(req)
             .send()
             .map_err(|e| {
                 // Classify transport failures so the retry layer can react
-                // (timeout/offline = transient; anything else = permanent).
-                let msg = e.to_string();
-                if e.is_timeout() {
-                    LlmError::Timeout(msg)
-                } else if e.is_connect() {
-                    LlmError::Offline(msg)
-                } else {
-                    LlmError::Http(msg)
-                }
+                // (timeout = transient; connection refused to a local server =
+                // fail-fast Unreachable; to a remote endpoint = offline EC02).
+                classify_send_error(e.is_timeout(), e.is_connect(), &self.base_url, e.to_string())
             })?;
 
         let status = resp.status();
@@ -512,6 +656,91 @@ pub fn is_unsupported_params_error(status: u16, body: &str) -> bool {
     param_cue && rejection_cue
 }
 
+/// Classify a transport-level `send()` failure into a typed [`LlmError`], given
+/// the `reqwest` error flags and the target `base_url`. Split out as a pure,
+/// unit-testable function because constructing a real `reqwest::Error` in a test
+/// is awkward (ticket 09):
+///
+/// - **timeout** → [`Timeout`] (transient, retried with backoff, NFR06).
+/// - **connect** (connection refused / cannot connect to host): for a **local**
+///   endpoint → [`Unreachable`] carrying the `base_url` (the local server is
+///   down — fail-fast, no retry, no cloud fallback, D4); for a **remote**
+///   endpoint → [`Offline`] (EC02, no connection).
+/// - anything else → [`Http`] (permanent).
+///
+/// [`Timeout`]: LlmError::Timeout
+/// [`Unreachable`]: LlmError::Unreachable
+/// [`Offline`]: LlmError::Offline
+/// [`Http`]: LlmError::Http
+pub fn classify_send_error(
+    is_timeout: bool,
+    is_connect: bool,
+    base_url: &str,
+    msg: String,
+) -> LlmError {
+    if is_timeout {
+        LlmError::Timeout(msg)
+    } else if is_connect {
+        if is_local_url(base_url) {
+            LlmError::Unreachable(base_url.to_string())
+        } else {
+            LlmError::Offline(msg)
+        }
+    } else {
+        LlmError::Http(msg)
+    }
+}
+
+/// Whether `url`'s host is a loopback/local address (`localhost`, `127.x.x.x`,
+/// `::1`, `0.0.0.0`). Used to tell a **local server down** ([`LlmError::Unreachable`])
+/// apart from a **remote endpoint unreachable** ([`LlmError::Offline`], EC02) on
+/// a connection failure. Pure string parsing (no DNS), unit-testable.
+pub fn is_local_url(url: &str) -> bool {
+    // Drop the scheme, then keep only the authority (up to the first '/').
+    let after_scheme = url.split("://").nth(1).unwrap_or(url);
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    // Strip any userinfo ("user:pass@host").
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    // Strip the port, honouring bracketed IPv6 literals ("[::1]:8080").
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        host_port.split(':').next().unwrap_or(host_port)
+    };
+    let h = host.to_ascii_lowercase();
+    h == "localhost" || h == "::1" || h == "0.0.0.0" || h.starts_with("127.")
+}
+
+/// Derive a cheap `/v1/models` reachability-probe URL from a chat-completions
+/// `base_url` (ticket 09). `…/v1/chat/completions` → `…/v1/models`; any other
+/// URL is probed as-is (a successful TCP connection is what proves reachability,
+/// regardless of the path). Pure and unit-testable.
+pub fn models_probe_url(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    match trimmed.strip_suffix("/chat/completions") {
+        Some(prefix) => format!("{prefix}/models"),
+        None => trimmed.to_string(),
+    }
+}
+
+/// Cheap, dependency-free reachability probe for the onboarding hint (ticket 09):
+/// a short-timeout blocking `GET` to the provider's [`models_probe_url`]. Returns
+/// `true` when the server answers **at all** (any HTTP status, even 401/404 — the
+/// endpoint is up), `false` on connection refused / timeout / DNS error. Never
+/// surfaces an error: "down" is simply `false`. It performs no cloud fallback and
+/// never translates — it only checks whether the endpoint is listening.
+pub fn probe_reachable(base_url: &str) -> bool {
+    let url = models_probe_url(base_url);
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_millis(1500))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    client.get(&url).send().is_ok()
+}
+
 /// Extract a human-readable error string from an OpenRouter error body. Handles
 /// `{"error":{"message":"…"}}` (the common shape), `{"error":"…"}` and a
 /// top-level `{"message":"…"}`. Returns `None` when the body is not JSON or has
@@ -529,7 +758,10 @@ fn error_message(body: &str) -> Option<String> {
 
 /// The JSON schema passed in `response_format.json_schema.schema`, matching
 /// §4.4 field-for-field (`strict: true` requires `additionalProperties: false`
-/// and every property in `required`).
+/// and every property in `required`). **Contratto completo** (con
+/// `translated_text`): il flusso live usa [`perceptor_update_response_format`]
+/// (snello, STC-10); questo resta per i test e per eventuale riuso.
+#[allow(dead_code)]
 pub fn response_format() -> serde_json::Value {
     serde_json::json!({
         "type": "json_schema",
@@ -605,7 +837,10 @@ terminologia e fatti utili alla coerenza futura, così da tornare ben sotto il l
 
 /// System message: fixes the percettore role, the output schema and the "JSON
 /// only" rules (research §4). The summary budget is injected from settings
-/// (§3.5, decision D5) so the prompt reflects the configured limit.
+/// (§3.5, decision D5) so the prompt reflects the configured limit. **Contratto
+/// completo**: il flusso live usa [`build_perceptor_update_system_prompt`]
+/// (snello, STC-10); questo resta per i test e per eventuale riuso.
+#[allow(dead_code)]
 pub fn build_system_prompt(summary_token_limit: u32) -> String {
     format!(
         "Sei il motore di traduzione di translate-lector. Traduci il testo di UNA pagina di un \
@@ -636,7 +871,10 @@ REGOLE DI OUTPUT (tassative):\n\
 /// User message with full context slots (research §4). `rolling_summary`,
 /// `locked_terms` and `unlocked_terms` carry the percettore context (ticket 09;
 /// ticket 08 passed them empty). When `compress` is `true` an explicit
-/// recompression instruction is appended (EC05).
+/// recompression instruction is appended (EC05). **Contratto completo** (chiede
+/// `translated_text`): il flusso live usa [`build_perceptor_update_user_prompt`]
+/// (snello, STC-10); questo resta per i test e per eventuale riuso.
+#[allow(dead_code)]
 pub fn build_user_prompt(
     target_language: &str,
     page_text: &str,
@@ -672,7 +910,10 @@ Produci ora il JSON come da schema.{compress_note}"
 /// Assemble the system+user message pair for one page (or chunk), with the full
 /// percettore context. `summary_token_limit` shapes the system prompt; the
 /// `rolling_summary`/`locked_terms`/`unlocked_terms` slots and the `compress`
-/// flag shape the user message.
+/// flag shape the user message. **Contratto completo**: il flusso live usa
+/// [`build_perceptor_update_messages`] (snello, STC-10); questo resta per i test
+/// e per eventuale riuso.
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub fn build_messages(
     target_language: &str,
@@ -699,6 +940,13 @@ pub fn build_messages(
 /// Assemble a `ChatRequest` for the given model and messages, with the §4.4
 /// `response_format` and a low `temperature` for quality.
 ///
+/// `max_tokens` is supplied by the caller (from the active provider config,
+/// ticket 02) instead of being hardcoded to the whole context window: a small
+/// local model (`n_ctx ~4096`) needs headroom for `prompt + reasoning + output`,
+/// otherwise the server returns `finish_reason: length` with empty `content`
+/// (see local-llm-empty-content diagnosis). Cloud providers pass a generous
+/// value so long page translations are not truncated.
+///
 /// Deliberately does **not** send `provider.require_parameters` (bug #1): with
 /// it, OpenRouter routes only to endpoints supporting *every* parameter in the
 /// body, so a model that does not advertise `temperature` (e.g. a reasoning
@@ -706,12 +954,17 @@ pub fn build_messages(
 /// ignores parameters the model does not support. `temperature` is kept (0.2)
 /// for deterministic translations but is optional, so the model-agnostic
 /// fallback ([`complete_with_fallback`]) can drop it if a model still rejects it.
-pub fn build_request(model: &str, messages: Vec<ChatMessage>) -> ChatRequest {
+///
+/// **Contratto completo** (invia [`response_format`] con `translated_text`): il
+/// flusso live usa [`build_perceptor_update_request`] (snello, STC-10); questo
+/// resta per i test e per eventuale riuso.
+#[allow(dead_code)]
+pub fn build_request(model: &str, messages: Vec<ChatMessage>, max_tokens: u32) -> ChatRequest {
     ChatRequest {
         model: model.to_string(),
         messages,
         temperature: Some(0.2),
-        max_tokens: 4096,
+        max_tokens,
         stream: false,
         response_format: Some(response_format()),
         provider: None,
@@ -723,12 +976,456 @@ pub const CORRECTION_PROMPT: &str =
     "La tua risposta non era JSON valido conforme allo schema. Rispondi di nuovo con SOLO \
 l'oggetto JSON, senza testo aggiuntivo, senza markdown, senza code fence.";
 
+// --- Contratto translate-only per unità (STC-08, decisione D5) ---------------
+//
+// Sul percorso a budget la pagina è divisa in unità piccole (STC-02) tradotte una
+// per una con un prompt MINIMALE: niente schema JSON ricco del percettore, niente
+// riassunto/glossario da PRODURRE — solo la traduzione. Il grosso del contesto
+// (glossario intero, contratto ricco) resta fuori da queste chiamate, che così
+// stanno larghe dentro una finestra piccola e riducono il rischio EC08. Il
+// riassunto e i nuovi termini vengono ricavati una sola volta per pagina dalla
+// chiamata percettore separata (D6), che continua a usare `build_messages` +
+// `build_request` + `response_format` come prima.
+
+/// System prompt per una chiamata **translate-only** di una singola unità
+/// (STC-08, D5). Minimale di proposito: traduci fedelmente, rispetta in modo
+/// assoluto i termini bloccati, rispondi con il SOLO testo tradotto (nessun JSON,
+/// nessun riassunto, nessun glossario da generare).
+///
+/// Vieta esplicitamente la **chain-of-thought** nel contenuto ("Thinking
+/// Process"/"Reasoning"): sui modelli locali verbosi quel ragionamento consuma il
+/// budget di output e tronca la traduzione a metà (unit-truncation-diagnosis,
+/// ticket 11). La difesa a valle è [`parse_translation`], che strippa comunque un
+/// eventuale blocco CoT iniziale.
+pub fn build_translate_only_system_prompt() -> String {
+    "Sei il motore di traduzione di translate-lector. Traduci fedelmente il testo fornito \
+verso la lingua di destinazione indicata, mantenendo tono, significato e formattazione.\n\n\
+Regole:\n\
+- Rispetta in modo ASSOLUTO le traduzioni dei termini marcati come BLOCCATI: usa sempre e \
+solo la traduzione indicata, senza eccezioni.\n\
+- Usa i termini suggeriti quando appropriato, per coerenza.\n\
+- Non riassumere, non omettere, non aggiungere commenti o spiegazioni.\n\
+- VIETATO mostrare il ragionamento: NON produrre \"Thinking Process\", \"Reasoning\", \
+catene di pensiero o passaggi intermedi. Vai DIRETTO alla traduzione.\n\
+- Rispondi con IL SOLO testo tradotto, senza virgolette, senza markdown, senza JSON."
+        .to_string()
+}
+
+/// User message per una chiamata **translate-only**: riassunto **read-only** come
+/// contesto, glossario **già selezionato** per l'unità (locked-first, STC-03) e
+/// il testo dell'unità da tradurre. Nessuna richiesta di aggiornare summary o
+/// glossario: quello è compito della chiamata percettore per-pagina (D6).
+pub fn build_translate_only_user_prompt(
+    target_language: &str,
+    unit_text: &str,
+    rolling_summary: &str,
+    locked_terms: &str,
+    unlocked_terms: &str,
+) -> String {
+    let summary = if rolling_summary.trim().is_empty() {
+        "(nessuno: e la prima pagina)"
+    } else {
+        rolling_summary
+    };
+    let locked = if locked_terms.trim().is_empty() { "(nessuno)" } else { locked_terms };
+    let unlocked = if unlocked_terms.trim().is_empty() { "(nessuno)" } else { unlocked_terms };
+
+    format!(
+        "LINGUA DI DESTINAZIONE: {target_language}\n\n\
+CONTESTO (riassunto delle pagine precedenti, solo lettura):\n{summary}\n\n\
+GLOSSARIO RILEVANTE PER QUESTO TESTO:\n\
+Termini BLOCCATI (vincolo assoluto - usa esattamente questa traduzione):\n{locked}\n\
+Termini suggeriti (coerenza consigliata, non vincolante):\n{unlocked}\n\n\
+TESTO DA TRADURRE:\n\"\"\"\n{unit_text}\n\"\"\"\n\n\
+Rispondi con il solo testo tradotto."
+    )
+}
+
+/// Coppia system+user per una chiamata translate-only di una singola unità.
+pub fn build_translate_only_messages(
+    target_language: &str,
+    unit_text: &str,
+    rolling_summary: &str,
+    locked_terms: &str,
+    unlocked_terms: &str,
+) -> Vec<ChatMessage> {
+    vec![
+        ChatMessage::system(build_translate_only_system_prompt()),
+        ChatMessage::user(build_translate_only_user_prompt(
+            target_language,
+            unit_text,
+            rolling_summary,
+            locked_terms,
+            unlocked_terms,
+        )),
+    ]
+}
+
+/// [`ChatRequest`] per una chiamata translate-only: come [`build_request`] ma
+/// **senza** il `response_format` ricco del percettore (D5). Il contratto è
+/// "solo testo", con fallback JSON minimo in [`parse_translation`]. `temperature`
+/// resta (0.2) ma è opzionale, così il fallback model-agnostico può rimuoverla se
+/// un modello la rifiuta. `max_tokens` è piccolo (out_unit) sul percorso a budget
+/// stretto — vedi `translate::translate_page`.
+pub fn build_translate_only_request(
+    model: &str,
+    messages: Vec<ChatMessage>,
+    max_tokens: u32,
+) -> ChatRequest {
+    ChatRequest {
+        model: model.to_string(),
+        messages,
+        temperature: Some(0.2),
+        max_tokens,
+        stream: false,
+        // Contratto minimo: niente schema JSON ricco su queste chiamate (D5).
+        response_format: None,
+        provider: None,
+    }
+}
+
+/// Contratto minimo di una risposta translate-only: solo il testo tradotto.
+/// I campi extra sono ignorati (nessun `deny_unknown_fields`), così anche una
+/// risposta che includa per errore l'intero JSON percettore viene estratta.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct TranslateUnitOutput {
+    translated_text: String,
+}
+
+/// Estrae la traduzione dalla risposta di una chiamata **translate-only** (D5).
+/// Contratto robusto e minimale: prova prima il JSON `{ "translated_text": ... }`
+/// (diretto o dentro il primo blocco bilanciato), poi ripiega sul **testo puro**
+/// (l'intero contenuto senza spazi di bordo). Riesce sempre finché il contenuto
+/// non è vuoto — l'assenza di contenuto (incl. EC08 `finish_reason == "length"`)
+/// è già intercettata a monte da [`ChatResponse::content`].
+///
+/// Sul ramo testo-puro rimuove un eventuale **blocco di ragionamento (CoT)**
+/// iniziale che un modello verboso può emettere prima della traduzione
+/// ([`strip_leading_cot`], unit-truncation-diagnosis ticket 11): difesa a valle
+/// del divieto già presente nel system prompt translate-only.
+pub fn parse_translation(content: &str) -> String {
+    let trimmed = content.trim();
+    // (a) JSON minimo diretto.
+    if let Ok(v) = serde_json::from_str::<TranslateUnitOutput>(trimmed) {
+        return v.translated_text;
+    }
+    // (b) primo blocco JSON bilanciato (strip di ```json / prosa attorno).
+    if let Some(block) = extract_first_json_block(content) {
+        if let Ok(v) = serde_json::from_str::<TranslateUnitOutput>(block) {
+            return v.translated_text;
+        }
+    }
+    // (c) testo puro: il contenuto è già la traduzione, meno un eventuale
+    // blocco chain-of-thought iniziale.
+    strip_leading_cot(trimmed)
+}
+
+/// Rimuove un blocco di **chain-of-thought (CoT)** in testa a una risposta
+/// translate-only, restituendo la sola traduzione (ticket 11). È volutamente
+/// **conservativo**: non deve MAI poter rimuovere testo di traduzione legittimo
+/// (era il bug "mezza pagina mancante" che il ticket 11 corregge). Gestisce due
+/// forme, entrambe non ambigue:
+///
+/// 1. Un blocco XML-ish `<think>…</think>`: è CoT di macchina inequivocabile,
+///    quindi si strippa sempre in sicurezza.
+/// 2. Una sezione etichettata: si strippa SOLO quando sono presenti **entrambi**
+///    (a) un'intestazione CoT distintiva a inizio testo (frasi multi-parola come
+///    "Thinking process:"/"Chain of thought:" — mai parole comuni come
+///    "Reasoning"/"Ragionamento" che possono aprire legittimamente un paragrafo
+///    di prosa) E (b) un marcatore di traduzione esplicito ("Traduzione:" /
+///    "Translation:") a **inizio di una riga successiva**. In quel caso si taglia
+///    fino al marcatore. Se il marcatore manca NON si strippa nulla (si ritorna
+///    l'input invariato): niente fallback "prima riga vuota", perché è la via
+///    non sicura che mangia il paragrafo iniziale.
+fn strip_leading_cot(text: &str) -> String {
+    let trimmed = text.trim();
+
+    // (1) blocco `<think>…</think>` (chiusura case-insensitive): CoT di macchina
+    // inequivocabile, sempre sicuro da rimuovere.
+    if starts_with_ci(trimmed, "<think>") {
+        if let Some(pos) = find_ascii_ci(trimmed, "</think>") {
+            return trimmed[pos + "</think>".len()..].trim().to_string();
+        }
+    }
+
+    // (2) sezione etichettata: strip SOLO se la prima riga è un'intestazione CoT
+    // distintiva E c'è un marcatore di traduzione a inizio di una riga
+    // successiva. Senza marcatore non si tocca nulla (mai il fallback "riga
+    // vuota", che potrebbe scartare vera traduzione).
+    let first_line = trimmed.lines().next().unwrap_or("");
+    if is_cot_header_line(first_line) {
+        for marker in ["traduzione:", "translation:"] {
+            // Il marcatore deve iniziare una riga OLTRE la prima, così una
+            // menzione della parola nel corpo del ragionamento non può essere
+            // scelta come punto di taglio.
+            if let Some(idx) = find_line_start_marker_after_first_line(trimmed, marker) {
+                return trimmed[idx + marker.len()..].trim().to_string();
+            }
+        }
+    }
+
+    trimmed.to_string()
+}
+
+/// Whether `first_line` is a distinctive machine chain-of-thought header. Only
+/// multi-word phrases a human paragraph would not open with are recognized
+/// (never bare words like "reasoning"/"ragionamento"), and each must be
+/// colon-terminated ("Thinking process: …") or be the entire line ("Thinking
+/// process") — so a paragraph that merely *contains* such words is never taken
+/// for CoT.
+fn is_cot_header_line(first_line: &str) -> bool {
+    const HEADERS: [&str; 6] = [
+        "thinking process",
+        "thought process",
+        "reasoning process",
+        "chain of thought",
+        "processo di ragionamento",
+        "catena di pensiero",
+    ];
+    let line = first_line.trim();
+    HEADERS.iter().any(|h| {
+        if !starts_with_ci(line, h) {
+            return false;
+        }
+        // Header colon-terminated ("Thinking process:") or the whole line
+        // ("Thinking process"); "Thinking processing" must NOT match.
+        let rest = line[h.len()..].trim_start();
+        rest.is_empty() || rest.starts_with(':')
+    })
+}
+
+/// Byte offset of a translation `marker` that STARTS a line other than the
+/// first. Searching only at line starts after the header line prevents a mention
+/// of the word inside the reasoning body from being chosen as the split point.
+fn find_line_start_marker_after_first_line(text: &str, marker: &str) -> Option<usize> {
+    text.match_indices('\n')
+        .map(|(i, _)| i + 1)
+        .find(|&start| starts_with_ci(&text[start..], marker))
+}
+
+/// Whether `s` begins with the ASCII `prefix`, case-insensitively. Byte-wise
+/// ASCII comparison so no allocation and no multi-byte offset surprises.
+fn starts_with_ci(s: &str, prefix: &str) -> bool {
+    let (sb, pb) = (s.as_bytes(), prefix.as_bytes());
+    sb.len() >= pb.len() && sb[..pb.len()].iter().zip(pb).all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+/// Byte offset in `haystack` of the first case-insensitive occurrence of the
+/// ASCII `needle`. ASCII-only comparison keeps the returned offset valid on the
+/// original string (it lands on an ASCII byte = a char boundary), unlike a
+/// `to_lowercase()` copy whose offsets can shift on multi-byte input.
+fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
+    let (hb, nb) = (haystack.as_bytes(), needle.as_bytes());
+    if nb.is_empty() || hb.len() < nb.len() {
+        return None;
+    }
+    (0..=hb.len() - nb.len())
+        .find(|&i| hb[i..i + nb.len()].iter().zip(nb).all(|(a, b)| a.eq_ignore_ascii_case(b)))
+}
+
+// --- Contratto perceptor-update snello (STC-10, decisione D5) -----------------
+//
+// A fine pagina il percettore aggiorna SOLO il riassunto progressivo e il
+// glossario, SENZA ri-tradurre la pagina: la traduzione è già stata prodotta
+// dalle chiamate translate-only per unità. Il vecchio contratto completo
+// (`build_messages`/`build_request`/`response_format` con `translated_text`)
+// costringeva invece il modello a ri-tradurre l'intera pagina → maxi-output che
+// sfonda una finestra piccola (EC08); e poiché quella chiamata falliva con `?`,
+// l'app scartava la traduzione già fatta. Questo contratto snello toglie
+// `translated_text` da schema e prompt: output piccolo, budget-safe. Il contratto
+// completo resta disponibile (altri percorsi/test lo usano); qui si affianca.
+
+/// Nome dello schema JSON inviato in `response_format` per il perceptor-update.
+const PERCEPTOR_UPDATE_SCHEMA_NAME: &str = "perceptor_update";
+
+/// Output **snello** del perceptor-update (STC-10): SOLO riassunto aggiornato e
+/// nuovi termini di glossario, NESSUN `translated_text`. Nessun
+/// `deny_unknown_fields`, così una risposta che includa per errore l'intero JSON
+/// percettore (con `translated_text`) viene comunque estratta correttamente.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PerceptorUpdateOutput {
+    pub updated_summary: String,
+    pub new_glossary_terms: Vec<GlossaryTerm>,
+}
+
+/// Lo schema `response_format.json_schema.schema` per il perceptor-update snello:
+/// SOLO `updated_summary` + `new_glossary_terms` (nessun `translated_text`), così
+/// il modello non ri-traduce la pagina (STC-10). `strict: true` richiede
+/// `additionalProperties: false` e ogni proprietà in `required`.
+pub fn perceptor_update_response_format() -> serde_json::Value {
+    serde_json::json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": PERCEPTOR_UPDATE_SCHEMA_NAME,
+            "strict": true,
+            "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["updated_summary", "new_glossary_terms"],
+                "properties": {
+                    "updated_summary": { "type": "string" },
+                    "new_glossary_terms": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["source_term", "translation", "type", "note"],
+                            "properties": {
+                                "source_term": { "type": "string" },
+                                "translation": { "type": "string" },
+                                "type": { "type": "string", "enum": ["nome proprio", "tecnico", "comune"] },
+                                "note": { "type": "string" }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// System prompt del perceptor-update snello (STC-10): il modello aggiorna SOLO
+/// summary + glossario e NON traduce la pagina (è già tradotta altrove). Mantiene
+/// le stesse regole "JSON only" del percettore completo ma con lo schema ridotto.
+/// Il limite del summary è iniettato dalle settings (EC05, §3.5).
+pub fn build_perceptor_update_system_prompt(summary_token_limit: u32) -> String {
+    format!(
+        "Sei il percettore di translate-lector. Il testo di UNA pagina di un documento è GIA \
+stato tradotto altrove: il tuo compito NON e tradurre, ma SOLO aggiornare il contesto del \
+documento a partire dal testo della pagina.\n\n\
+Devi:\n\
+1. Aggiornare il riassunto progressivo (summary) integrando i punti chiave di questa pagina, \
+mantenendo la coerenza col resto del documento. Se il summary risultante supererebbe circa \
+{summary_token_limit} token, COMPRIMILO mantenendo solo trama, entita, terminologia e fatti utili \
+alla coerenza futura.\n\
+2. Proporre nuovi termini di glossario rilevanti apparsi in questa pagina (nomi propri, termini \
+tecnici, espressioni ricorrenti) che non siano gia nel glossario.\n\n\
+NON tradurre la pagina e NON restituire alcun testo tradotto: quello e gia stato prodotto.\n\n\
+REGOLE DI OUTPUT (tassative):\n\
+- Rispondi con UN SOLO oggetto JSON valido, senza testo prima o dopo, senza markdown, senza code fence.\n\
+- Lo schema e ESATTAMENTE:\n\
+  {{\n\
+    \"updated_summary\": string,\n\
+    \"new_glossary_terms\": [ {{ \"source_term\": string, \"translation\": string, \"type\": \"nome proprio\" | \"tecnico\" | \"comune\", \"note\": string }} ]\n\
+  }}\n\
+- Non aggiungere altre chiavi (in particolare NIENTE \"translated_text\"). Non tradurre le chiavi JSON. \"note\" vuota = \"\"."
+    )
+}
+
+/// User message del perceptor-update snello: riassunto corrente, glossario
+/// **gia noto** (per non riproporlo) e testo pagina come input per aggiornare il
+/// contesto — con la nota esplicita che la pagina è già tradotta. Quando
+/// `compress` è `true` appende l'istruzione di ricompressione (EC05).
+pub fn build_perceptor_update_user_prompt(
+    target_language: &str,
+    page_text: &str,
+    rolling_summary: &str,
+    locked_terms: &str,
+    unlocked_terms: &str,
+    compress: bool,
+) -> String {
+    let summary = if rolling_summary.trim().is_empty() {
+        "(nessuno: e la prima pagina)"
+    } else {
+        rolling_summary
+    };
+    let locked = if locked_terms.trim().is_empty() { "(nessuno)" } else { locked_terms };
+    let unlocked = if unlocked_terms.trim().is_empty() { "(nessuno)" } else { unlocked_terms };
+    let compress_note = if compress {
+        format!("\n\n{COMPRESSION_INSTRUCTION}")
+    } else {
+        String::new()
+    };
+
+    format!(
+        "LINGUA DI DESTINAZIONE: {target_language}\n\n\
+RIASSUNTO PROGRESSIVO FINORA (contesto delle pagine precedenti):\n{summary}\n\n\
+GLOSSARIO ATTUALE (termini gia noti, per non riproporli):\n\
+Termini BLOCCATI (vincolo assoluto):\n{locked}\n\
+Termini suggeriti:\n{unlocked}\n\n\
+TESTO DELLA PAGINA (gia tradotto altrove, qui solo per aggiornare il contesto):\n\"\"\"\n{page_text}\n\"\"\"\n\n\
+Produci ora il JSON con SOLO updated_summary e new_glossary_terms (NIENTE traduzione).{compress_note}"
+    )
+}
+
+/// Coppia system+user per la chiamata perceptor-update snella (STC-10).
+#[allow(clippy::too_many_arguments)]
+pub fn build_perceptor_update_messages(
+    target_language: &str,
+    page_text: &str,
+    rolling_summary: &str,
+    locked_terms: &str,
+    unlocked_terms: &str,
+    compress: bool,
+    summary_token_limit: u32,
+) -> Vec<ChatMessage> {
+    vec![
+        ChatMessage::system(build_perceptor_update_system_prompt(summary_token_limit)),
+        ChatMessage::user(build_perceptor_update_user_prompt(
+            target_language,
+            page_text,
+            rolling_summary,
+            locked_terms,
+            unlocked_terms,
+            compress,
+        )),
+    ]
+}
+
+/// [`ChatRequest`] per la chiamata perceptor-update snella: come [`build_request`]
+/// ma con lo schema ridotto [`perceptor_update_response_format`] (niente
+/// `translated_text`). `temperature` resta (0.2) ma opzionale, così il fallback
+/// model-agnostico può rimuoverla; `provider` assente per non forzare il routing
+/// (bug #1). `max_tokens` è quello di pagina: l'output ora è solo summary +
+/// glossario, molto più piccolo di una ri-traduzione dell'intera pagina.
+pub fn build_perceptor_update_request(
+    model: &str,
+    messages: Vec<ChatMessage>,
+    max_tokens: u32,
+) -> ChatRequest {
+    ChatRequest {
+        model: model.to_string(),
+        messages,
+        temperature: Some(0.2),
+        max_tokens,
+        stream: false,
+        response_format: Some(perceptor_update_response_format()),
+        provider: None,
+    }
+}
+
+/// Estrae [`PerceptorUpdateOutput`] dal `content` della risposta perceptor-update
+/// con lo stesso fallback robusto del contratto completo: (a) deserializzazione
+/// diretta, (b) primo blocco `{...}` bilanciato (strip di ```json / prosa). La
+/// correzione (layer c) vive nel servizio di traduzione, che può richiamare il
+/// client. Un `translated_text` eventualmente presente viene ignorato.
+pub fn parse_perceptor_update(content: &str) -> Result<PerceptorUpdateOutput, String> {
+    // (a) diretto.
+    if let Ok(out) = serde_json::from_str::<PerceptorUpdateOutput>(content.trim()) {
+        return Ok(out);
+    }
+    // (b) primo blocco bilanciato.
+    if let Some(block) = extract_first_json_block(content) {
+        if let Ok(out) = serde_json::from_str::<PerceptorUpdateOutput>(block) {
+            return Ok(out);
+        }
+    }
+    Err(format!(
+        "impossibile estrarre JSON conforme (updated_summary + new_glossary_terms) \
+         dal contenuto ({} char)",
+        content.chars().count()
+    ))
+}
+
 // --- Layered parsing (§4.4) --------------------------------------------------
 
 /// Parse the model `content` into [`PerceptoreOutput`] using layers (a) direct
 /// deserialize and (b) first balanced `{...}` block extraction. The correction
 /// retry (layer c) lives in the translation service, which can call the client
-/// again; this function is the pure, string-only part.
+/// again; this function is the pure, string-only part. **Contratto completo**: il
+/// flusso live usa [`parse_perceptor_update`] (snello, STC-10); questo resta per
+/// i test e per eventuale riuso.
+#[allow(dead_code)]
 pub fn parse_content(content: &str) -> Result<PerceptoreOutput, String> {
     // (a) direct.
     if let Ok(out) = serde_json::from_str::<PerceptoreOutput>(content.trim()) {
@@ -934,7 +1631,7 @@ mod tests {
 
     #[test]
     fn build_request_sets_response_format_and_low_temperature() {
-        let req = build_request("openai/gpt-4o", build_messages("it", "x", "", "", "", false, 1000));
+        let req = build_request("openai/gpt-4o", build_messages("it", "x", "", "", "", false, 1000), 4096);
         assert_eq!(req.model, "openai/gpt-4o");
         assert!(!req.stream);
         let rf = req.response_format.clone().unwrap();
@@ -943,11 +1640,284 @@ mod tests {
         assert_eq!(req.temperature, Some(0.2), "low temperature kept for quality");
     }
 
+    // --- Ticket 02: max_tokens comes from the caller, not a hardcoded window --
+
+    #[test]
+    fn build_request_uses_the_provided_max_tokens_not_a_hardcoded_4096() {
+        // The whole point of ticket 02: `max_tokens` is no longer pinned to the
+        // (small local) context window — it flows in from the provider config so
+        // a local model keeps room to actually emit `content`.
+        let local = build_request("m", build_messages("it", "x", "", "", "", false, 1000), 2048);
+        assert_eq!(local.max_tokens, 2048, "max_tokens is threaded from the caller");
+        let cloud = build_request("openai/gpt-4o", build_messages("it", "x", "", "", "", false, 1000), 4096);
+        assert_eq!(cloud.max_tokens, 4096, "a generous cloud value passes through unchanged");
+    }
+
+    // --- STC-08: translate-only contract (minimal prompt + parse) -----------
+
+    #[test]
+    fn translate_only_system_prompt_is_minimal_text_only_no_json_schema() {
+        let s = build_translate_only_system_prompt();
+        // Deve chiedere il SOLO testo tradotto e vietare il JSON (contratto minimo).
+        assert!(s.to_lowercase().contains("solo testo tradotto"));
+        assert!(s.contains("senza JSON"));
+        // Deve ribadire il vincolo assoluto sui termini bloccati (D5).
+        assert!(s.contains("BLOCCATI"));
+    }
+
+    #[test]
+    fn translate_only_user_prompt_carries_summary_selected_glossary_and_unit() {
+        let p = build_translate_only_user_prompt(
+            "italiano",
+            "The board met.",
+            "Riassunto delle pagine precedenti.",
+            "board => consiglio  [tecnico]",
+            "CEO => amministratrice delegata  [tecnico]",
+        );
+        assert!(p.contains("LINGUA DI DESTINAZIONE: italiano"));
+        assert!(p.contains("Riassunto delle pagine precedenti."), "summary read-only in prompt");
+        assert!(p.contains("Termini BLOCCATI (vincolo assoluto"));
+        assert!(p.contains("board => consiglio"));
+        assert!(p.contains("The board met."), "unit text present");
+        // Nessuna richiesta di produrre summary/glossario o JSON.
+        assert!(!p.contains("updated_summary"));
+        assert!(!p.contains("new_glossary_terms"));
+    }
+
+    #[test]
+    fn translate_only_request_omits_the_rich_response_format() {
+        // Contratto minimo (D5): nessuno schema JSON ricco sulle chiamate di unità.
+        let req = build_translate_only_request(
+            "m",
+            build_translate_only_messages("it", "x", "", "", ""),
+            768,
+        );
+        assert!(req.response_format.is_none(), "translate-only sends no rich JSON schema");
+        assert_eq!(req.max_tokens, 768, "small per-unit output cap threaded");
+        assert_eq!(req.temperature, Some(0.2), "temperature kept but optional");
+        // Non deve serializzare alcun response_format sul wire.
+        let wire = serde_json::to_value(&req).unwrap();
+        assert!(wire.get("response_format").is_none());
+    }
+
+    #[test]
+    fn parse_translation_reads_plain_text() {
+        assert_eq!(parse_translation("Ciao mondo"), "Ciao mondo");
+        assert_eq!(parse_translation("  Ciao mondo  "), "Ciao mondo", "trims edge whitespace");
+    }
+
+    #[test]
+    fn parse_translation_reads_tiny_json_and_ignores_extra_fields() {
+        // JSON minimo diretto.
+        assert_eq!(parse_translation(r#"{"translated_text":"Ciao mondo"}"#), "Ciao mondo");
+        // JSON dentro un code fence + prosa attorno.
+        assert_eq!(
+            parse_translation("Ecco:\n```json\n{\"translated_text\":\"Ciao\"}\n```\nfine"),
+            "Ciao"
+        );
+        // Un intero JSON percettore su una chiamata di unità: si estrae comunque
+        // il solo translated_text (campi extra ignorati).
+        let full = r#"{"translated_text":"Ciao","updated_summary":"s","new_glossary_terms":[]}"#;
+        assert_eq!(parse_translation(full), "Ciao");
+    }
+
+    // --- Ticket 11: chain-of-thought suppression + stripping -----------------
+
+    #[test]
+    fn translate_only_system_prompt_forbids_chain_of_thought() {
+        let s = build_translate_only_system_prompt();
+        // Vieta esplicitamente la CoT nel contenuto (assorbe budget → troncamento).
+        assert!(s.contains("Thinking Process"));
+        assert!(s.contains("Reasoning"));
+        assert!(s.to_lowercase().contains("solo testo tradotto"));
+    }
+
+    #[test]
+    fn parse_translation_strips_labeled_cot_only_with_explicit_marker() {
+        // Intestazione CoT distintiva ("Thinking process:") + marcatore di
+        // traduzione a inizio di una riga successiva: esce SOLO la traduzione.
+        let content = "Thinking process:\nThe user wants a faithful, natural rendering. \
+I'll keep the tone.\n\nTraduzione: Ciao, mondo.";
+        assert_eq!(parse_translation(content), "Ciao, mondo.");
+    }
+
+    #[test]
+    fn parse_translation_keeps_cot_header_without_marker_unchanged() {
+        // CONSERVATIVO: intestazione CoT ma NESSUN marcatore di traduzione
+        // esplicito ⇒ non si può sapere dove finisce il ragionamento, quindi non
+        // si strippa nulla (niente fallback "prima riga vuota" che mangiava il
+        // paragrafo iniziale — il bug "mezza pagina mancante" del ticket 11).
+        let content = "Thinking process:\nsome reasoning here.\n\nCiao, mondo.";
+        assert_eq!(parse_translation(content), content);
+    }
+
+    #[test]
+    fn parse_translation_leaves_paragraph_opening_with_reasoning_word_untouched() {
+        // Una traduzione legittima il cui PRIMO paragrafo apre con una parola
+        // comune di ragionamento (prosa di psicologia/filosofia) NON deve essere
+        // scambiata per CoT: senza marcatore e senza <think> resta invariata,
+        // anche se c'è una riga vuota più sotto.
+        let content = "Ragionamento: il filosofo procede per gradi verso la sintesi.\n\n\
+E così, senza fretta, l'argomentazione si chiude.";
+        assert_eq!(parse_translation(content), content);
+    }
+
+    #[test]
+    fn parse_translation_strips_think_xml_block() {
+        let content = "<think>ragiono sul testo e sui termini bloccati</think>\nCiao mondo";
+        assert_eq!(parse_translation(content), "Ciao mondo");
+    }
+
+    #[test]
+    fn parse_translation_leaves_plain_text_untouched_even_mentioning_reasoning() {
+        // "ragionamento" a metà frase non è un'intestazione CoT: nessuno strip.
+        let plain = "Il ragionamento del filosofo era complesso ma affascinante.";
+        assert_eq!(parse_translation(plain), plain);
+    }
+
+    // --- Ticket 11: truncation accessor (content_complete) -------------------
+
+    #[test]
+    fn content_complete_refuses_nonempty_length_as_truncated() {
+        let resp: ChatResponse = serde_json::from_str(
+            r#"{"choices":[{"message":{"role":"assistant","content":"…con milioni o"},"finish_reason":"length"}]}"#,
+        )
+        .unwrap();
+        // Il path pagina/percettore (content) accetta ancora il parziale (invariato).
+        assert_eq!(resp.content().unwrap(), "…con milioni o");
+        // Il path unità (content_complete) lo rifiuta come troncato.
+        assert!(
+            matches!(resp.content_complete().unwrap_err(), LlmError::OutputTruncated(_)),
+            "non-empty + length must be OutputTruncated on the unit path"
+        );
+    }
+
+    #[test]
+    fn content_complete_accepts_nonempty_stop_and_missing_reason() {
+        let stop: ChatResponse = serde_json::from_str(
+            r#"{"choices":[{"message":{"role":"assistant","content":"Ciao mondo"},"finish_reason":"stop"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(stop.content_complete().unwrap(), "Ciao mondo");
+        let no_reason: ChatResponse = serde_json::from_str(
+            r#"{"choices":[{"message":{"role":"assistant","content":"Ciao"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(no_reason.content_complete().unwrap(), "Ciao");
+    }
+
+    #[test]
+    fn content_complete_keeps_empty_plus_length_as_ec08() {
+        // Il caso vuoto+length resta EC08 esattamente come content() (non toccato).
+        let resp: ChatResponse = serde_json::from_str(
+            r#"{"choices":[{"message":{"role":"assistant","content":null},"finish_reason":"length"}]}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            resp.content_complete().unwrap_err(),
+            LlmError::OutputBudgetExhausted(_)
+        ));
+    }
+
+    #[test]
+    fn output_truncated_is_permanent_not_degradable_with_ec08_message() {
+        let e = LlmError::OutputTruncated("length".into());
+        assert!(!e.is_transient(), "same budget would truncate again: not a backoff retry");
+        assert!(!e.is_param_unsupported(), "not a param relaxation case");
+        assert!(e.user_message().contains("EC08"), "actionable EC08 framing");
+    }
+
+    // --- STC-10: lean perceptor-update contract -----------------------------
+
+    #[test]
+    fn perceptor_update_response_format_requires_summary_and_glossary_not_translated_text() {
+        let rf = perceptor_update_response_format();
+        assert_eq!(rf["type"], "json_schema");
+        assert_eq!(rf["json_schema"]["strict"], true);
+        let required = &rf["json_schema"]["schema"]["required"];
+        // Only the two lean fields are required — never translated_text.
+        assert_eq!(required, &serde_json::json!(["updated_summary", "new_glossary_terms"]));
+        let props = &rf["json_schema"]["schema"]["properties"];
+        assert!(props.get("translated_text").is_none(), "lean schema must not expose translated_text");
+        assert!(props.get("updated_summary").is_some());
+        assert!(props.get("new_glossary_terms").is_some());
+    }
+
+    #[test]
+    fn perceptor_update_system_prompt_does_not_ask_to_translate() {
+        let s = build_perceptor_update_system_prompt(700);
+        // Explicitly forbids re-translation and the translated_text field.
+        assert!(s.contains("NON e tradurre") || s.contains("NON tradurre"));
+        assert!(s.contains("NIENTE \"translated_text\""));
+        // Still owns the summary + glossary duties and the configured limit.
+        assert!(s.contains("700 token"));
+        assert!(s.contains("updated_summary"));
+        assert!(s.contains("new_glossary_terms"));
+        assert!(!s.contains("\"translated_text\": string"), "no translated_text in the schema block");
+    }
+
+    #[test]
+    fn perceptor_update_user_prompt_appends_compression_only_when_flagged() {
+        let plain = build_perceptor_update_user_prompt("it", "Testo pagina", "sommario", "", "", false);
+        assert!(plain.contains("Testo pagina"));
+        assert!(plain.contains("sommario"));
+        assert!(plain.contains("NIENTE traduzione"));
+        assert!(!plain.contains("RICOMPRIMILO"), "no compression note when compress=false");
+
+        let compressed = build_perceptor_update_user_prompt("it", "x", "long", "", "", true);
+        assert!(compressed.contains(COMPRESSION_INSTRUCTION), "EC05 compression reused when flagged");
+    }
+
+    #[test]
+    fn build_perceptor_update_request_carries_the_lean_schema() {
+        let req = build_perceptor_update_request(
+            "m",
+            build_perceptor_update_messages("it", "x", "", "", "", false, 1000),
+            4096,
+        );
+        let rf = req.response_format.clone().expect("perceptor-update sends a response_format");
+        // It is the LEAN schema, not the full one (no translated_text).
+        assert_eq!(rf["json_schema"]["name"], "perceptor_update");
+        assert!(rf["json_schema"]["schema"]["properties"].get("translated_text").is_none());
+        assert_eq!(req.temperature, Some(0.2));
+        assert!(req.provider.is_none(), "no provider routing by default (bug #1)");
+    }
+
+    #[test]
+    fn parse_perceptor_update_reads_lean_json_and_ignores_translated_text() {
+        // Pure lean JSON.
+        let lean = r#"{"updated_summary":"riassunto","new_glossary_terms":[]}"#;
+        let out = parse_perceptor_update(lean).unwrap();
+        assert_eq!(out.updated_summary, "riassunto");
+        assert!(out.new_glossary_terms.is_empty());
+
+        // A full PerceptoreOutput JSON (with translated_text) still parses: the
+        // extra field is ignored, so old fixtures keep working.
+        let full = r#"{"translated_text":"ignored","updated_summary":"s","new_glossary_terms":[
+            {"source_term":"hello","translation":"ciao","type":"comune","note":""}
+        ]}"#;
+        let out = parse_perceptor_update(full).unwrap();
+        assert_eq!(out.updated_summary, "s");
+        assert_eq!(out.new_glossary_terms.len(), 1);
+        assert_eq!(out.new_glossary_terms[0].source_term, "hello");
+
+        // Inside a code fence + prose.
+        let fenced = format!("Ecco:\n```json\n{lean}\n```\nfine");
+        assert_eq!(parse_perceptor_update(&fenced).unwrap().updated_summary, "riassunto");
+    }
+
+    #[test]
+    fn parse_perceptor_update_errors_on_malformed_or_incomplete() {
+        assert!(parse_perceptor_update("not json at all").is_err());
+        // Missing the required new_glossary_terms field.
+        assert!(parse_perceptor_update(r#"{"updated_summary":"s"}"#).is_err());
+    }
+
     // --- Bug #1: default body must not force provider routing --------------
 
     #[test]
     fn build_request_default_body_has_no_require_parameters() {
-        let req = build_request("openai/gpt-4o", build_messages("it", "x", "", "", "", false, 1000));
+        let req = build_request("openai/gpt-4o", build_messages("it", "x", "", "", "", false, 1000), 4096);
         // The default body must not send provider.require_parameters, which
         // would 404 on models that don't advertise `temperature` (bug #1).
         assert!(req.provider.is_none(), "no provider block by default");
@@ -1019,7 +1989,7 @@ mod tests {
 
     #[test]
     fn degrade_strips_provider_then_response_format_then_temperature_then_stops() {
-        let mut req = build_request("m", build_messages("it", "x", "", "", "", false, 1000));
+        let mut req = build_request("m", build_messages("it", "x", "", "", "", false, 1000), 4096);
         req.provider = Some(serde_json::json!({ "require_parameters": true }));
         // provider first
         assert!(req.degrade());
@@ -1125,6 +2095,64 @@ mod tests {
         assert!(resp.content().is_err(), "blank content is treated as empty");
     }
 
+    // --- Ticket 03: empty content + finish_reason == "length" ----------------
+
+    #[test]
+    fn empty_content_with_finish_reason_length_is_output_budget_exhausted() {
+        // A reasoning model burned the whole completion budget: the server
+        // returns finish_reason "length" with empty/null content. This is NOT
+        // the generic empty-content error — it gets a dedicated, actionable
+        // variant + message (change model / reduce text / raise n_ctx).
+        let resp: ChatResponse = serde_json::from_str(
+            r#"{"choices":[{"message":{"role":"assistant","content":null},"finish_reason":"length"}],"usage":{"completion_tokens":2048,"total_tokens":4096}}"#,
+        )
+        .expect("length+null content must deserialize");
+        let err = resp.content().unwrap_err();
+        assert!(
+            matches!(err, LlmError::OutputBudgetExhausted(_)),
+            "length + empty content -> dedicated variant, got {err:?}"
+        );
+        let msg = err.user_message();
+        assert!(msg.contains("EC08"), "carries the EC08 marker for the frontend");
+        assert!(msg.contains("budget"), "actionable: mentions the token budget");
+        assert!(msg.contains("n_ctx"), "actionable: suggests raising the context");
+    }
+
+    #[test]
+    fn empty_string_content_with_finish_reason_length_is_output_budget_exhausted() {
+        // Same case but with an empty string (not null) content.
+        let resp: ChatResponse = serde_json::from_str(
+            r#"{"choices":[{"message":{"role":"assistant","content":""},"finish_reason":"length"}]}"#,
+        )
+        .unwrap();
+        assert!(matches!(resp.content().unwrap_err(), LlmError::OutputBudgetExhausted(_)));
+    }
+
+    #[test]
+    fn empty_content_with_finish_reason_stop_keeps_the_generic_error() {
+        // finish_reason "stop" (or any non-length reason) with empty content is
+        // NOT a budget-exhaustion case: keep the existing generic Http error so
+        // we don't mislead the user with a budget message.
+        let resp: ChatResponse = serde_json::from_str(
+            r#"{"choices":[{"message":{"role":"assistant","content":null},"finish_reason":"stop"}]}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(resp.content().unwrap_err(), LlmError::Http(_)),
+            "stop + empty content stays a generic Http error"
+        );
+    }
+
+    #[test]
+    fn output_budget_exhausted_is_permanent_and_not_degradable() {
+        // A retry with the same budget would likely burn it again, and relaxing
+        // optional params does not add budget: surface immediately (no backoff
+        // retry, no param-relaxation fallback).
+        let e = LlmError::OutputBudgetExhausted("length".into());
+        assert!(!e.is_transient(), "no backoff retry: the budget won't grow on retry");
+        assert!(!e.is_param_unsupported(), "not a param relaxation case");
+    }
+
     // --- Errors --------------------------------------------------------------
 
     #[test]
@@ -1158,6 +2186,149 @@ mod tests {
     fn rate_limit_and_offline_carry_their_edge_case_codes() {
         assert!(LlmError::RateLimited("".into()).user_message().contains("EC07"));
         assert!(LlmError::Offline("".into()).user_message().contains("EC02"));
+    }
+
+    // --- Local server unreachable (ticket 09, D3/D4/D7, EC02 local case) ------
+
+    #[test]
+    fn connection_error_to_a_local_server_maps_to_unreachable_with_base_url() {
+        // A connection refused (is_connect) to a loopback endpoint means the
+        // local server is simply down: a dedicated, fail-fast Unreachable that
+        // names the base_url — not a generic Http nor a cloud-y Offline.
+        let base = "http://localhost:8888/v1/chat/completions";
+        let err = classify_send_error(
+            /* is_timeout = */ false,
+            /* is_connect = */ true,
+            base,
+            "connection refused".into(),
+        );
+        assert_eq!(err, LlmError::Unreachable(base.to_string()));
+        let msg = err.user_message();
+        assert!(msg.contains(base), "message names the configured base_url");
+        assert!(msg.contains("Server locale non raggiungibile"), "clear local-down copy");
+        assert!(msg.contains("⚙️"), "actionable: points at settings");
+    }
+
+    #[test]
+    fn connection_error_to_a_remote_endpoint_stays_offline_ec02() {
+        // The same connection failure to a REMOTE endpoint is the EC02 offline
+        // case (no internet), not the local-server-down case.
+        let err = classify_send_error(
+            false,
+            true,
+            OPENROUTER_URL,
+            "dns error".into(),
+        );
+        assert_eq!(err, LlmError::Offline("dns error".into()));
+        assert!(err.user_message().contains("EC02"));
+    }
+
+    #[test]
+    fn timeout_and_generic_send_errors_are_classified_independently_of_host() {
+        assert_eq!(
+            classify_send_error(true, false, "http://localhost:8888/v1/chat/completions", "t".into()),
+            LlmError::Timeout("t".into())
+        );
+        assert_eq!(
+            classify_send_error(false, false, "http://localhost:8888/v1/chat/completions", "x".into()),
+            LlmError::Http("x".into())
+        );
+    }
+
+    #[test]
+    fn unreachable_is_fail_fast_not_transient_and_not_degradable() {
+        let e = LlmError::Unreachable("http://localhost:8888/v1/chat/completions".into());
+        // Must NOT be retried with backoff (would spin on a down server), and is
+        // not a param-relaxation case either — it surfaces immediately.
+        assert!(!e.is_transient(), "a down local server fails fast, no backoff retry");
+        assert!(!e.is_param_unsupported());
+    }
+
+    #[test]
+    fn retry_layer_returns_unreachable_immediately_without_spinning() {
+        // A down local server (Unreachable) must fail fast: the RetryingChatClient
+        // returns it on the first attempt, never looping/hanging (ticket 09).
+        let inner = SeqClient::new(vec![Err(LlmError::Unreachable(
+            "http://localhost:8888/v1/chat/completions".into(),
+        ))]);
+        let client = RetryingChatClient::new(&inner, RetryPolicy::no_delay(5));
+        let err = client.complete(&a_request()).unwrap_err();
+        assert!(matches!(err, LlmError::Unreachable(_)));
+        assert_eq!(inner.calls.get(), 1, "no retry on a fail-fast Unreachable");
+    }
+
+    #[test]
+    fn complete_with_fallback_passes_unreachable_through_without_cloud_fallback() {
+        // D4: an unreachable local server must NOT trigger any fallback — the
+        // error surfaces unchanged (no second, cloud-bound attempt).
+        let inner = SeqClient::new(vec![Err(LlmError::Unreachable("http://127.0.0.1:8080".into()))]);
+        let err = complete_with_fallback(&inner, &a_request()).unwrap_err();
+        assert!(matches!(err, LlmError::Unreachable(_)));
+        assert_eq!(inner.calls.get(), 1, "no degrade/fallback attempt on Unreachable");
+    }
+
+    #[test]
+    fn is_local_url_recognises_loopback_hosts_only() {
+        assert!(is_local_url("http://localhost:8888/v1/chat/completions"));
+        assert!(is_local_url("http://127.0.0.1:8080/v1/chat/completions"));
+        assert!(is_local_url("http://127.5.6.7:1234/v1"));
+        assert!(is_local_url("http://0.0.0.0:11434/v1/chat/completions"));
+        assert!(is_local_url("http://[::1]:1234/v1/chat/completions"));
+        // Remote hosts are not local.
+        assert!(!is_local_url(OPENROUTER_URL));
+        assert!(!is_local_url("https://api.example.com/v1/chat/completions"));
+        assert!(!is_local_url("http://192.168.1.10:8888/v1")); // LAN IP, not loopback
+    }
+
+    #[test]
+    fn models_probe_url_maps_chat_completions_to_models() {
+        assert_eq!(
+            models_probe_url("http://localhost:8888/v1/chat/completions"),
+            "http://localhost:8888/v1/models"
+        );
+        assert_eq!(
+            models_probe_url("http://127.0.0.1:8080/v1/chat/completions/"),
+            "http://127.0.0.1:8080/v1/models"
+        );
+        // A non-standard URL is probed as-is (connecting is what matters).
+        assert_eq!(models_probe_url("http://localhost:1234/health"), "http://localhost:1234/health");
+    }
+
+    #[test]
+    fn probe_reachable_is_false_when_nothing_is_listening() {
+        // Bind then drop to obtain an almost-certainly-free loopback port; a probe
+        // there gets connection refused fast → false (AC: "false con server spento").
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let base = format!("http://127.0.0.1:{port}/v1/chat/completions");
+        assert!(!probe_reachable(&base), "a closed port is not reachable");
+    }
+
+    #[test]
+    fn probe_reachable_is_true_when_the_endpoint_answers() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                // Any HTTP status proves the endpoint is up (even 404).
+                let body = r#"{"data":[]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        let base = format!("http://{addr}/v1/chat/completions");
+        assert!(probe_reachable(&base), "a listening endpoint is reachable");
+        handle.join().unwrap();
     }
 
     #[test]
@@ -1200,7 +2371,7 @@ mod tests {
     }
 
     fn a_request() -> ChatRequest {
-        build_request("openai/gpt-4o", build_messages("it", "x", "", "", "", false, 1000))
+        build_request("openai/gpt-4o", build_messages("it", "x", "", "", "", false, 1000), 4096)
     }
 
     #[test]
@@ -1244,10 +2415,78 @@ mod tests {
     // --- Real client key guard (no network) ---------------------------------
 
     #[test]
-    fn openrouter_client_with_empty_key_errors_before_network() {
-        let client = OpenRouterClient::new("   ");
-        let req = build_request("openai/gpt-4o", build_messages("it", "x", "", "", "", false, 1000));
+    fn chat_completions_client_with_empty_key_errors_before_network() {
+        // Per D5 the key is always mandatory: a blank key trips EC03 before any
+        // network call, regardless of the (arbitrary) base-URL configured.
+        let client = ChatCompletionsClient::new(
+            "http://127.0.0.1:9/v1/chat/completions",
+            "   ",
+            /* send_openrouter_headers = */ true,
+        );
+        let req = build_request("openai/gpt-4o", build_messages("it", "x", "", "", "", false, 1000), 4096);
         assert_eq!(client.complete(&req), Err(LlmError::MissingApiKey));
+    }
+
+    // --- Base-URL routing + attribution-header gating (loopback, no internet) -
+
+    /// Spin up a one-shot loopback HTTP server, point the client at it, fire one
+    /// `complete()` and return the raw request bytes the client sent. Lets us
+    /// assert *where* the POST goes and *which* headers are attached without any
+    /// real provider or internet access.
+    #[cfg(test)]
+    fn capture_request(send_openrouter_headers: bool) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // Headers precede the body, so the first read carries them in full.
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let body =
+                r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"total_tokens":1}}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = tx.send(req);
+        });
+
+        let base_url = format!("http://{addr}/v1/chat/completions");
+        let client = ChatCompletionsClient::new(base_url, "test-key", send_openrouter_headers);
+        let req = build_request("openai/gpt-4o", build_messages("it", "x", "", "", "", false, 1000), 4096);
+        let _ = client.complete(&req);
+        let captured = rx.recv().unwrap();
+        handle.join().unwrap();
+        captured
+    }
+
+    #[test]
+    fn complete_posts_to_the_configured_base_url() {
+        // The request reaches the arbitrary base-URL (not the OpenRouter const),
+        // hitting the /v1/chat/completions path we configured.
+        let captured = capture_request(true);
+        assert!(captured.starts_with("POST /v1/chat/completions"));
+    }
+
+    #[test]
+    fn attribution_headers_sent_only_when_openrouter_flag_is_set() {
+        // openrouter preset -> attribution headers present.
+        let with = capture_request(true).to_lowercase();
+        assert!(with.contains("http-referer"));
+        assert!(with.contains("x-title"));
+
+        // Any other endpoint -> no OpenRouter-specific attribution headers.
+        let without = capture_request(false).to_lowercase();
+        assert!(!without.contains("http-referer"));
+        assert!(!without.contains("x-title"));
     }
 
     // --- Response helper -----------------------------------------------------

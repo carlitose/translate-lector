@@ -14,28 +14,28 @@ fn ping() -> String {
     "pong from Rust core".to_string()
 }
 
-/// Store (or overwrite) the OpenRouter API key in the OS credential store.
+/// Store (or overwrite) a provider's API key in the OS credential store.
 #[tauri::command]
-fn store_api_key(key: String) -> Result<(), String> {
-    secrets::set_api_key(&key).map_err(|e| e.to_string())
+fn store_api_key(provider_id: String, key: String) -> Result<(), String> {
+    secrets::set_api_key(&provider_id, &key).map_err(|e| e.to_string())
 }
 
-/// Load the OpenRouter API key. Returns `null` when none is stored.
+/// Load a provider's API key. Returns `null` when none is stored.
 #[tauri::command]
-fn load_api_key() -> Result<Option<String>, String> {
-    secrets::get_api_key().map_err(|e| e.to_string())
+fn load_api_key(provider_id: String) -> Result<Option<String>, String> {
+    secrets::get_api_key(&provider_id).map_err(|e| e.to_string())
 }
 
-/// Remove the stored OpenRouter API key (idempotent).
+/// Remove a provider's stored API key (idempotent).
 #[tauri::command]
-fn clear_api_key() -> Result<(), String> {
-    secrets::delete_api_key().map_err(|e| e.to_string())
+fn clear_api_key(provider_id: String) -> Result<(), String> {
+    secrets::delete_api_key(&provider_id).map_err(|e| e.to_string())
 }
 
-/// Whether an OpenRouter API key is stored, without exposing the secret.
+/// Whether a provider's API key is stored, without exposing the secret.
 #[tauri::command]
-fn has_api_key() -> Result<bool, String> {
-    secrets::has_api_key().map_err(|e| e.to_string())
+fn has_api_key(provider_id: String) -> Result<bool, String> {
+    secrets::has_api_key(&provider_id).map_err(|e| e.to_string())
 }
 
 /// Read a global setting by key. Returns `null` when unset.
@@ -57,6 +57,38 @@ fn set_setting(app: tauri::AppHandle, key: String, value: String) -> Result<(), 
 fn get_model(app: tauri::AppHandle) -> Result<String, String> {
     let conn = open_db(&app)?;
     settings::get_model(&conn).map_err(|e| e.to_string())
+}
+
+/// Read the active provider id (D3: default "unsloth" when unset).
+#[tauri::command]
+fn get_active_provider(app: tauri::AppHandle) -> Result<String, String> {
+    let conn = open_db(&app)?;
+    settings::get_active_provider(&conn).map_err(|e| e.to_string())
+}
+
+/// Set the active provider id (one of the built-in preset ids).
+#[tauri::command]
+fn set_active_provider(app: tauri::AppHandle, provider_id: String) -> Result<(), String> {
+    let conn = open_db(&app)?;
+    settings::set_active_provider(&conn, &provider_id).map_err(|e| e.to_string())
+}
+
+/// Resolve one provider's effective config: preset defaults + stored overrides
+/// (openrouter falls back to the legacy `model` key).
+#[tauri::command]
+fn get_provider_config(
+    app: tauri::AppHandle,
+    provider_id: String,
+) -> Result<settings::ProviderConfig, String> {
+    let conn = open_db(&app)?;
+    settings::get_provider_config(&conn, &provider_id).map_err(|e| e.to_string())
+}
+
+/// List the built-in provider presets (id + label + default base_url/model) for
+/// the settings UI.
+#[tauri::command]
+fn list_providers() -> Vec<settings::ProviderConfig> {
+    settings::provider_presets()
 }
 
 /// Read the default target language for new documents (§3.5, D4), falling back
@@ -249,11 +281,21 @@ async fn translate_page(
 ) -> Result<translate::TranslationResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let conn = open_db(&app)?;
-        let api_key = secrets::get_api_key()
+        // Risolvi il provider attivo (D3: default unsloth) e la sua config
+        // (base-URL + modello, con override e fallback legacy `model` per
+        // openrouter). La chiave è provider-scoped (Ticket 06).
+        let active_id = settings::get_active_provider(&conn).map_err(|e| e.to_string())?;
+        let cfg = settings::get_provider_config(&conn, &active_id).map_err(|e| e.to_string())?;
+        let api_key = secrets::get_api_key(&active_id)
             .map_err(|e| e.to_string())?
             .unwrap_or_default();
-        let model = settings::get_model(&conn).map_err(|e| e.to_string())?;
-        let base = llm::OpenRouterClient::new(api_key);
+        // Costruisci il client sull'endpoint del provider attivo; le attribution
+        // header OpenRouter partono solo per openrouter (Ticket 05).
+        let base = llm::ChatCompletionsClient::new(
+            cfg.base_url,
+            api_key,
+            /* send_openrouter_headers = */ active_id == "openrouter",
+        );
         // Retry transient failures (timeout/5xx/429/offline) with backoff (NFR06).
         let client = llm::RetryingChatClient::new(&base, llm::RetryPolicy::default());
         let params = translate::TranslateParams {
@@ -261,13 +303,41 @@ async fn translate_page(
             page_number,
             target_language: &target_language,
             page_text: &page_text,
-            model: &model,
+            model: &cfg.model,
+            // Tetto max_tokens del provider attivo (Ticket 02): cloud generoso,
+            // locale con margine entro n_ctx per lasciare spazio all'output.
+            max_tokens: cfg.max_tokens,
+            // Context window del provider attivo (Ticket 07): input della formula
+            // di budget (STC-08). Locale ~4096 → unità piccole; cloud grande →
+            // una sola unità = pagina intera (degradazione D2).
+            n_ctx: cfg.n_ctx,
             update_context,
         };
         translate::translate_page(&conn, &client, &params).map_err(|e| e.user_message())
     })
     .await
     .map_err(|e| format!("translation task failed: {e}"))?
+}
+
+/// Cheap reachability probe for the active/selected provider (ticket 09, D3/D7),
+/// used by the non-blocking onboarding hint. Resolves the provider's effective
+/// `base_url` and does a short-timeout GET to its `/v1/models`. Returns `true`
+/// when the endpoint answers at all, `false` when it is down (connection refused
+/// / timeout). Never throws for "down" — a missing/misconfigured server is just
+/// `false`. Runs on a worker thread so the short network wait never blocks the UI.
+/// It performs no translation and never falls back to the cloud (D4).
+#[tauri::command]
+async fn check_provider_reachable(
+    app: tauri::AppHandle,
+    provider_id: String,
+) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db(&app)?;
+        let cfg = settings::get_provider_config(&conn, &provider_id).map_err(|e| e.to_string())?;
+        Ok::<bool, String>(llm::probe_reachable(&cfg.base_url))
+    })
+    .await
+    .map_err(|e| format!("reachability check failed: {e}"))?
 }
 
 /// Whether background prefetch of the next page is enabled (§3.5, ticket 12).
@@ -365,6 +435,10 @@ pub fn run() {
             get_setting,
             set_setting,
             get_model,
+            get_active_provider,
+            set_active_provider,
+            get_provider_config,
+            list_providers,
             get_default_target_language,
             clear_translations_cache,
             get_data_dir,
@@ -379,6 +453,7 @@ pub fn run() {
             relocate_document,
             remove_recent,
             translate_page,
+            check_provider_reachable,
             get_prefetch_enabled,
             list_glossary,
             update_glossary_term

@@ -9,35 +9,48 @@ use keyring::{Entry, Error};
 
 /// Service name registered in the OS credential store.
 const SERVICE: &str = "translate-lector";
-/// Fixed account under which the single OpenRouter API key is stored.
+/// Legacy account for OpenRouter's key. Kept as the back-compat anchor for the
+/// unit test: `account_for("openrouter")` must equal this exact string so
+/// existing users' keys are found without any migration (§8). Test-only because
+/// the live source of truth is now [`account_for`].
+#[cfg(test)]
 const ACCOUNT: &str = "openrouter-api-key";
+
+/// Keychain account for a provider's key: `"{provider_id}-api-key"`.
+/// `openrouter` → `"openrouter-api-key"` (unchanged → existing keys are found
+/// as-is, §3b/§8). Every provider (anche i server locali senza auth, D5) ha
+/// il suo account, quindi il keychain le contiene tutte.
+fn account_for(provider_id: &str) -> String {
+    format!("{provider_id}-api-key")
+}
 
 /// Build an [`Entry`] for the given service/account against the default store.
 fn entry(service: &str, account: &str) -> Result<Entry, Error> {
     Entry::new(service, account)
 }
 
-/// Store (or overwrite) the API key in the OS credential store.
-pub fn set_api_key(key: &str) -> Result<(), Error> {
-    set_api_key_for(SERVICE, ACCOUNT, key)
+/// Store (or overwrite) the given provider's API key in the OS credential store.
+pub fn set_api_key(provider_id: &str, key: &str) -> Result<(), Error> {
+    set_api_key_for(SERVICE, &account_for(provider_id), key)
 }
 
-/// Read the API key. Returns `Ok(None)` when no key has been stored yet —
-/// a missing credential is a clean absence, never an error.
-pub fn get_api_key() -> Result<Option<String>, Error> {
-    get_api_key_for(SERVICE, ACCOUNT)
+/// Read the given provider's API key. Returns `Ok(None)` when no key has been
+/// stored yet — a missing credential is a clean absence, never an error.
+pub fn get_api_key(provider_id: &str) -> Result<Option<String>, Error> {
+    get_api_key_for(SERVICE, &account_for(provider_id))
 }
 
-/// Delete the stored API key. A missing credential is treated as success
-/// (idempotent delete).
-pub fn delete_api_key() -> Result<(), Error> {
-    delete_api_key_for(SERVICE, ACCOUNT)
+/// Delete the given provider's stored API key. A missing credential is treated
+/// as success (idempotent delete).
+pub fn delete_api_key(provider_id: &str) -> Result<(), Error> {
+    delete_api_key_for(SERVICE, &account_for(provider_id))
 }
 
-/// Whether an API key is present, without exposing the secret itself. Lets the
-/// UI reflect key presence while the plaintext key stays inside the core.
-pub fn has_api_key() -> Result<bool, Error> {
-    has_api_key_for(SERVICE, ACCOUNT)
+/// Whether the given provider has an API key, without exposing the secret
+/// itself. Lets the UI reflect key presence while the plaintext key stays
+/// inside the core.
+pub fn has_api_key(provider_id: &str) -> Result<bool, Error> {
+    has_api_key_for(SERVICE, &account_for(provider_id))
 }
 
 // --- Parametrised internals (let tests target a throwaway account) ---------
@@ -131,5 +144,53 @@ mod tests {
 
         delete_api_key_for(TEST_SERVICE, &account).unwrap();
         assert!(!has_api_key_for(TEST_SERVICE, &account).unwrap());
+    }
+
+    /// Back-compat lock: `openrouter` must map to the account existing users
+    /// already have (`openrouter-api-key`), so their key is found without any
+    /// migration (§8). This assertion needs no keychain access.
+    #[test]
+    fn account_for_openrouter_matches_legacy_account() {
+        assert_eq!(account_for("openrouter"), "openrouter-api-key");
+        // Legacy constant and the derived account must agree.
+        assert_eq!(account_for("openrouter"), ACCOUNT);
+    }
+
+    /// The account name is provider-scoped: `{provider_id}-api-key`.
+    #[test]
+    fn account_for_is_provider_scoped() {
+        assert_eq!(account_for("lmstudio"), "lmstudio-api-key");
+        assert_eq!(account_for("ollama"), "ollama-api-key");
+    }
+
+    /// Full round-trip through the provider-scoped PUBLIC surface, but pointed
+    /// at a throwaway provider id so it never touches a real provider account.
+    /// The throwaway id embeds the pid to stay unique across concurrent runs.
+    #[test]
+    fn provider_scoped_roundtrip_hits_real_store() {
+        let _guard = STORE_LOCK.lock().unwrap();
+        let provider_id = format!("it-provider-{}", std::process::id());
+        let secret = "sk-or-provider-scoped-0123456789";
+
+        // Clean slate.
+        delete_api_key(&provider_id).unwrap();
+        assert_eq!(get_api_key(&provider_id).unwrap(), None);
+        assert!(!has_api_key(&provider_id).unwrap());
+
+        // Set -> get round-trips the exact value; presence flips.
+        set_api_key(&provider_id, secret).unwrap();
+        assert_eq!(get_api_key(&provider_id).unwrap(), Some(secret.to_string()));
+        assert!(has_api_key(&provider_id).unwrap());
+
+        // The public API resolves to the provider-scoped account.
+        assert_eq!(
+            get_api_key_for(SERVICE, &account_for(&provider_id)).unwrap(),
+            Some(secret.to_string())
+        );
+
+        // Delete -> gone; idempotent.
+        delete_api_key(&provider_id).unwrap();
+        assert_eq!(get_api_key(&provider_id).unwrap(), None);
+        delete_api_key(&provider_id).unwrap();
     }
 }
