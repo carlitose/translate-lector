@@ -150,6 +150,16 @@ pub struct TranslateParams<'a> {
     /// summary/glossary. The current context is still used read-only as prompt
     /// input either way.
     pub update_context: bool,
+    /// Liveness predicate checked at the top of every unit iteration (ticket
+    /// 06, L3/L4): when `Some(f)` and `f()` returns `false`, the loop stops
+    /// BEFORE starting a new unit/window (never mid an in-flight HTTP call)
+    /// and the call returns `LlmError::Cancelled`. Used to stop a stale job
+    /// (the user navigated to another page) or a prefetch that yielded the
+    /// single local-provider slot to a higher-priority on-demand request.
+    /// `None` means "always current" -- the default for every caller that
+    /// does not need this coordination (e.g. existing tests, single-shot
+    /// callers).
+    pub is_current: Option<&'a dyn Fn() -> bool>,
 }
 
 /// Result of a translation, exposed to the frontend.
@@ -702,6 +712,21 @@ pub fn translate_page(
     let mut working_shape: Option<ChatRequest> = None;
 
     for (idx, unit) in units.iter().enumerate() {
+        // Stale-job cancellation (ticket 06, L3/L4): checked at the boundary
+        // between units, never mid an in-flight HTTP call. A `false` here means
+        // either the page is no longer the current one (navigation happened) or
+        // this prefetch yielded the local-provider slot to an on-demand request.
+        // Units already translated (and cached) in previous iterations of THIS
+        // call are untouched -- returning `Err` here simply skips the
+        // perceptor-update and page-level cache write that only happen on the
+        // success path below (no ad-hoc rollback needed, ticket 09 partial-cache
+        // semantics already cover this).
+        if let Some(is_current) = p.is_current {
+            if !is_current() {
+                return Err(LlmError::Cancelled);
+            }
+        }
+
         // Preserve the paragraph separator across translation: translate the body
         // and re-append the trailing separator so the reassembly keeps structure.
         let (body, sep) = split_unit_body_sep(unit);
@@ -1077,6 +1102,7 @@ mod tests {
             max_tokens: 4096,
             n_ctx: 128_000,
             update_context: true,
+            is_current: None,
         }
     }
 
@@ -1092,6 +1118,7 @@ mod tests {
             max_tokens: 2048,
             n_ctx: 4096,
             update_context: true,
+            is_current: None,
         }
     }
 
@@ -1142,6 +1169,7 @@ mod tests {
             max_tokens: 2048, // a local provider reserving output headroom
             n_ctx: 128_000,
             update_context: true,
+            is_current: None,
         };
         translate_page(&c, &client, &p).unwrap();
         let sent = client.requests.borrow();
@@ -1251,6 +1279,7 @@ mod tests {
             max_tokens: 4096,
             n_ctx: 128_000,
             update_context: true,
+            is_current: None,
         };
 
         let out = translate_page(&c, &client, &p).unwrap();
@@ -1873,6 +1902,7 @@ lines, so it stays a single translation unit even though it is not short.";
             max_tokens: 2048,
             n_ctx: 4096,
             update_context: false,
+            is_current: None,
         };
         translate_page(&c2, &client2, &prefetch).unwrap();
         assert_eq!(client2.calls(), 2, "prefetch = units only");
@@ -2050,6 +2080,7 @@ lines, so it stays a single translation unit even though it is not short.";
             max_tokens: 4096,
             n_ctx: 128_000,
             update_context: false,
+            is_current: None,
         };
 
         let out = translate_page(&c, &client, &prefetch).unwrap();
@@ -2105,6 +2136,7 @@ lines, so it stays a single translation unit even though it is not short.";
             max_tokens: 4096,
             n_ctx: 128_000,
             update_context: false,
+            is_current: None,
         };
 
         let out = translate_page(&c, &client, &prefetch).unwrap();
@@ -2115,6 +2147,51 @@ lines, so it stays a single translation unit even though it is not short.";
             crate::documents::get_rolling_summary(&c, 1).unwrap(),
             "Riassunto originale."
         );
+    }
+
+    // --- Stale-job cancellation (ticket 06, L3/L4) ---------------------------
+
+    /// `is_current` turning `false` once the first unit has reached the model
+    /// stops the loop at the SECOND unit's boundary (`Err(LlmError::Cancelled)`)
+    /// WITHOUT calling the model for that unit. The first unit -- already
+    /// translated and cached in this same call -- stays a valid cache HIT on a
+    /// later call (zero model calls to re-translate it).
+    #[test]
+    fn is_current_false_before_second_unit_cancels_without_extra_calls_and_keeps_prior_cache() {
+        let c = conn();
+        seed_session(&c);
+        let client = MockClient::new(vec![Ok(resp("UN", 10))]);
+        // Becomes non-current exactly once the first unit's call has landed,
+        // so the SECOND unit's boundary check (top of the next loop iteration)
+        // is what observes `false` and cancels -- not the first.
+        let is_current = || client.calls() == 0;
+        let p = TranslateParams { is_current: Some(&is_current), ..params_small(two_paragraphs()) };
+
+        let result = translate_page(&c, &client, &p);
+        assert!(
+            matches!(result, Err(LlmError::Cancelled)),
+            "job stops with Cancelled once the second unit's boundary sees is_current() == false"
+        );
+        assert_eq!(client.calls(), 1, "only the first unit reached the model; the second never did");
+
+        // The first unit's translation was written to the per-unit cache
+        // before cancellation: a fresh, always-current call must HIT it and
+        // make only ONE model call to translate the second unit (plus the
+        // perceptor-update call, since this resumed run is real navigation:
+        // `params_small`'s `update_context: true`).
+        let client2 = MockClient::new(vec![
+            Ok(resp("DEUX", 10)),
+            Ok(resp(&content_with("ignored", "s", &[]), 10)),
+        ]);
+        let p2 = TranslateParams { is_current: None, ..params_small(two_paragraphs()) };
+        let out2 = translate_page(&c, &client2, &p2).unwrap();
+        assert_eq!(
+            client2.calls(),
+            2,
+            "first unit served from cache (zero calls for it); only the second unit + perceptor call the model"
+        );
+        assert!(out2.translated_text.contains("UN"), "cached first unit resurfaces intact");
+        assert!(out2.translated_text.contains("DEUX"), "second unit translated fresh after resuming");
     }
 
     // --- PROTOTYPE Ticket 02: paragraph-level unit splitting ----------------

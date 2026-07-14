@@ -6,7 +6,184 @@ mod secrets;
 mod settings;
 mod translate;
 
+use std::collections::HashMap;
+use std::sync::Mutex;
 use tauri::Manager;
+
+// --- Serialize prefetch vs on-demand + cancel stale jobs (ticket 06) --------
+//
+// The local provider (llama-server behind Unsloth Studio) is single-model: a
+// prefetch (`update_context=false`) and an on-demand translation
+// (`update_context=true`) running as concurrent `spawn_blocking` tasks would
+// fight over the GPU and slow each other down (decision brief L3/L4). Two
+// pieces of Tauri-managed state coordinate this, kept as thin wrappers around
+// plain data so the decision logic itself is pure and unit-testable without
+// any Tauri/Mutex machinery (see `is_page_current` / `update_current_page`
+// below and their tests).
+
+/// `document_id -> page_number` of the last page requested **on-demand**
+/// (`update_context == true`). Written only by on-demand requests, read by
+/// every in-flight job (on-demand or prefetch) to decide whether it is still
+/// translating the page the user is actually looking at.
+struct CurrentPage(Mutex<HashMap<i64, i64>>);
+
+impl CurrentPage {
+    fn new() -> Self {
+        Self(Mutex::new(HashMap::new()))
+    }
+}
+
+/// Single-occupant slot for the local provider: held for the whole duration of
+/// a `translate::translate_page` call when the active provider is local
+/// (`llm::is_local_url`). Cloud calls never acquire it and stay concurrent, as
+/// before. Because a stale/superseded job notices at the next unit boundary
+/// and cancels quickly (see `translate::TranslateParams::is_current`), holding
+/// this lock does not starve an on-demand request queued behind a prefetch —
+/// the prefetch yields the slot at its next boundary instead of running to
+/// completion (L3: priority to on-demand without true HTTP-level preemption).
+struct LocalProviderSlot(Mutex<()>);
+
+impl LocalProviderSlot {
+    fn new() -> Self {
+        Self(Mutex::new(()))
+    }
+}
+
+/// Locks `m`, recovering the inner value if the mutex was poisoned by a panic
+/// while held. Neither `CurrentPage`'s `HashMap<i64, i64>` nor
+/// `LocalProviderSlot`'s `()` carries an invariant that a panic mid-update
+/// could leave broken, so refusing to lock ever again (the default poisoning
+/// behaviour) would only turn one unrelated panic into a permanent, app-wide
+/// outage for local translation and cursor tracking. Recovering here is safe
+/// and keeps both features usable after a transient panic elsewhere.
+fn lock_ignoring_poison<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Whether `translate::TranslateParams::is_current` should be wired up for a
+/// provider at `base_url` (Ticket 06, L3/L4). Only the local provider is
+/// serialized behind `LocalProviderSlot` and can be preempted by a fresher
+/// on-demand request at the next unit boundary, so only it needs the
+/// staleness check. Cloud providers must keep their pre-ticket behaviour of
+/// always running to completion (and populating the page cache) regardless
+/// of whether the page is still current when they finish — passing
+/// `is_current` to them would let an in-flight cloud call be cancelled
+/// without ever making its API call, silently losing that cache population.
+fn should_check_is_current(base_url: &str) -> bool {
+    llm::is_local_url(base_url)
+}
+
+/// Whether `page_number` is still the current page for `document_id`,
+/// according to `cursor` (`document_id -> page_number`, written only by
+/// on-demand requests). No cursor recorded yet for that document (the
+/// earliest possible call) is treated as "current" — there is nothing yet to
+/// contradict it. Pure and Mutex-free so it is directly unit-testable.
+fn is_page_current(cursor: &HashMap<i64, i64>, document_id: i64, page_number: i64) -> bool {
+    match cursor.get(&document_id) {
+        Some(&current) => current == page_number,
+        None => true,
+    }
+}
+
+/// Record `page_number` as the current page for `document_id`. Must be called
+/// ONLY for on-demand requests (`update_context == true`); prefetch requests
+/// must never call this (they only read the cursor via `is_page_current`).
+/// Pure and Mutex-free so the "write on-demand only" rule is unit-testable
+/// without touching the `Mutex`/Tauri state.
+fn update_current_page(cursor: &mut HashMap<i64, i64>, document_id: i64, page_number: i64) {
+    cursor.insert(document_id, page_number);
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+
+    // --- is_page_current -----------------------------------------------------
+
+    #[test]
+    fn no_cursor_recorded_yet_is_treated_as_current() {
+        // Earliest-possible-call edge case (design doc, ticket 06): a document
+        // with no cursor entry must not block the very first request.
+        let cursor: HashMap<i64, i64> = HashMap::new();
+        assert!(is_page_current(&cursor, 1, 7), "no constraint yet == current");
+    }
+
+    #[test]
+    fn matching_page_number_is_current() {
+        let mut cursor = HashMap::new();
+        cursor.insert(1, 7);
+        assert!(is_page_current(&cursor, 1, 7));
+    }
+
+    #[test]
+    fn differing_page_number_for_the_same_document_is_not_current() {
+        let mut cursor = HashMap::new();
+        cursor.insert(1, 7); // the user navigated to page 7
+        assert!(!is_page_current(&cursor, 1, 5), "page 5 is stale once 7 is current");
+    }
+
+    #[test]
+    fn a_different_document_is_unaffected_by_another_documents_cursor() {
+        let mut cursor = HashMap::new();
+        cursor.insert(1, 7);
+        assert!(
+            is_page_current(&cursor, 2, 1),
+            "document 2 has no cursor entry of its own yet -> current"
+        );
+    }
+
+    // --- update_current_page --------------------------------------------------
+
+    #[test]
+    fn update_current_page_writes_the_cursor_for_its_document() {
+        let mut cursor = HashMap::new();
+        update_current_page(&mut cursor, 1, 3);
+        assert_eq!(cursor.get(&1), Some(&3));
+    }
+
+    #[test]
+    fn update_current_page_overwrites_a_previous_value_for_the_same_document() {
+        let mut cursor = HashMap::new();
+        cursor.insert(1, 3);
+        update_current_page(&mut cursor, 1, 4); // real navigation moved on
+        assert_eq!(cursor.get(&1), Some(&4), "the cursor tracks only the latest on-demand page");
+    }
+
+    #[test]
+    fn update_current_page_is_the_only_way_the_cursor_changes_prefetch_must_never_call_it() {
+        // This test documents the invariant at the call site (`translate_page`
+        // command): prefetch requests (`update_context == false`) must read
+        // via `is_page_current` only and never call `update_current_page`. The
+        // function itself has no `update_context` parameter by design -- it
+        // cannot special-case prefetch, so the caller is what must enforce the
+        // rule (verified by inspection of the `translate_page` command, which
+        // gates the call behind `if update_context { ... }`).
+        let mut cursor = HashMap::new();
+        update_current_page(&mut cursor, 9, 2);
+        assert_eq!(cursor.len(), 1);
+        assert_eq!(cursor.get(&9), Some(&2));
+    }
+
+    // --- should_check_is_current ----------------------------------------------
+
+    #[test]
+    fn should_check_is_current_is_true_for_the_local_provider() {
+        assert!(should_check_is_current("http://localhost:8888/v1/chat/completions"));
+        assert!(should_check_is_current("http://127.0.0.1:1234/v1"));
+    }
+
+    #[test]
+    fn should_check_is_current_is_false_for_a_cloud_provider() {
+        // Ticket 06 fix: the staleness check (`is_current`) must NOT be wired
+        // up for cloud providers (e.g. OpenRouter). Cloud calls are not
+        // serialized behind `LocalProviderSlot` and must keep their
+        // pre-ticket behaviour of always running to completion and
+        // populating the page cache, even if the page is no longer current
+        // by the time they finish.
+        assert!(!should_check_is_current("https://openrouter.ai/api/v1/chat/completions"));
+        assert!(!should_check_is_current("https://api.example.com/v1/chat/completions"));
+    }
+}
 
 /// Bridge check: proves the webview -> core invoke path works.
 #[tauri::command]
@@ -281,6 +458,22 @@ async fn translate_page(
 ) -> Result<translate::TranslationResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let conn = open_db(&app)?;
+
+        // Ticket 06 (L3/L4): on-demand requests are the ONLY writer of the
+        // current-page cursor, and they write it BEFORE translating, so an
+        // in-flight prefetch for another page notices as early as possible
+        // that it is now stale. Prefetch never writes the cursor, only reads
+        // it (via the `is_current` predicate below).
+        let current_page = app.state::<CurrentPage>();
+        if update_context {
+            let mut cursor = lock_ignoring_poison(&current_page.0);
+            update_current_page(&mut cursor, document_id, page_number);
+        }
+        let is_current = move || {
+            let cursor = lock_ignoring_poison(&current_page.0);
+            is_page_current(&cursor, document_id, page_number)
+        };
+
         // Risolvi il provider attivo (D3: default unsloth) e la sua config
         // (base-URL + modello, con override e fallback legacy `model` per
         // openrouter). La chiave è provider-scoped (Ticket 06).
@@ -292,7 +485,7 @@ async fn translate_page(
         // Costruisci il client sull'endpoint del provider attivo; le attribution
         // header OpenRouter partono solo per openrouter (Ticket 05).
         let base = llm::ChatCompletionsClient::new(
-            cfg.base_url,
+            cfg.base_url.clone(),
             api_key,
             /* send_openrouter_headers = */ active_id == "openrouter",
         );
@@ -312,6 +505,27 @@ async fn translate_page(
             // una sola unità = pagina intera (degradazione D2).
             n_ctx: cfg.n_ctx,
             update_context,
+            // Ticket 06 (L3/L4): only the local provider needs the staleness
+            // check (see `should_check_is_current`). Cloud providers keep
+            // their pre-ticket behaviour unchanged — they always run to
+            // completion and populate the page cache, even if the page is no
+            // longer current by the time they finish.
+            is_current: if should_check_is_current(&cfg.base_url) { Some(&is_current) } else { None },
+        };
+
+        // Serialize the local provider (L3/L4): one in-flight translation at a
+        // time, held for the whole call. Cloud is left concurrent/unchanged —
+        // no slot is acquired. Priority to on-demand is realized by the stale
+        // job noticing `is_current() == false` at its next unit boundary and
+        // returning quickly (see `translate::TranslateParams::is_current`), not
+        // by true HTTP-level preemption (the client is blocking, out of scope).
+        // The slot's `State` is bound to a local so its `Arc`-backed `Mutex`
+        // outlives the guard (a `State` temporary would be freed too early).
+        let local_slot = app.state::<LocalProviderSlot>();
+        let _local_guard = if llm::is_local_url(&cfg.base_url) {
+            Some(lock_ignoring_poison(&local_slot.0))
+        } else {
+            None
         };
         translate::translate_page(&conn, &client, &params).map_err(|e| e.user_message())
     })
@@ -423,6 +637,11 @@ pub fn run() {
             let db_path = database_path(&app.handle())?;
             db::open_and_init(&db_path)?;
             println!("SQLite initialised at {}", db_path.display());
+            // Ticket 06 (L3/L4): shared state for serializing the local
+            // provider and cancelling stale prefetch jobs. See the module-level
+            // doc comment near `CurrentPage`/`LocalProviderSlot` above.
+            app.manage(CurrentPage::new());
+            app.manage(LocalProviderSlot::new());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
