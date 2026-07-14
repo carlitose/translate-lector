@@ -9,6 +9,7 @@
     isCommonModel,
     keyAcceptable,
     resolveModel,
+    resolveNctx,
     type ProviderPreset
   } from './providerConfig';
   import {
@@ -36,6 +37,8 @@
   let keyInput = $state(''); // plaintext, only while typing — never persisted in the webview
   let modelSelect = $state(DEFAULT_MODEL); // dropdown value ('__custom__' for free text)
   let modelFree = $state(''); // free-text model id
+  let nCtx = $state(''); // context window (n_ctx) for the active provider (editable)
+  let loadedNctx = $state(''); // last loaded n_ctx, to detect user changes
 
   // --- Reading preferences ---
   let langSelect = $state('it'); // default target language dropdown ('__custom__' for free)
@@ -86,12 +89,19 @@
     keyInput = '';
     hasKey = await invoke<boolean>('has_api_key', { providerId: id });
 
-    const cfg = await invoke<{ id: string; label: string; base_url: string; model: string }>(
-      'get_provider_config',
-      { providerId: id }
-    );
+    const cfg = await invoke<{
+      id: string;
+      label: string;
+      base_url: string;
+      model: string;
+      n_ctx: number;
+    }>('get_provider_config', { providerId: id });
     baseUrl = cfg.base_url ?? '';
     loadedBaseUrl = baseUrl;
+
+    // Context window (ticket 07): il core lo risolve già con override+preset.
+    nCtx = String(resolveNctx(cfg.n_ctx, id));
+    loadedNctx = nCtx;
 
     const storedModel = cfg.model ?? '';
     // Cloud provider: offer the curated dropdown when the model is a known id;
@@ -181,6 +191,19 @@
         });
         loadedBaseUrl = trimmedBase;
       }
+
+      // n_ctx override: write to `provider.<id>.n_ctx` only when it parses to a
+      // positive integer and actually changed (absent → the core uses the preset
+      // default). Normalise via resolveNctx so an invalid entry reverts sanely.
+      const resolvedNctx = resolveNctx(nCtx, activeProviderId);
+      if (nCtx.trim() !== loadedNctx.trim()) {
+        await invoke('set_setting', {
+          key: `provider.${activeProviderId}.n_ctx`,
+          value: String(resolvedNctx)
+        });
+        loadedNctx = String(resolvedNctx);
+      }
+      nCtx = String(resolvedNctx);
 
       // Model override: write to `provider.<id>.model`. Cloud always has a
       // resolved model; for local providers only persist a non-empty free-text id.
@@ -358,6 +381,12 @@
             <input type="text" placeholder="es. il tag del modello caricato" bind:value={modelFree} />
           {/if}
           <span class="hint">Verrà usato: <code>{chosenModel || '—'}</code></span>
+        </div>
+
+        <div class="field">
+          <span class="label">Context window (n_ctx, token)</span>
+          <input type="number" min="1" step="512" bind:value={nCtx} />
+          <span class="hint">Finestra del modello: guida il budget di traduzione. Locale ~4096; cloud molto ampio.</span>
         </div>
 
         <div class="field">

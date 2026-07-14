@@ -7,6 +7,16 @@
  *  structured_outputs, so the default call is not rejected by the router. */
 export const DEFAULT_MODEL = 'anthropic/claude-sonnet-4.6';
 
+/** Default context window (`n_ctx`) per i provider locali. Mirrors the core's
+ *  `DEFAULT_N_CTX_LOCAL`: i modelli locali girano tipicamente con ~4096 token,
+ *  finestra da cui la formula di budget (ticket 07/08) deriva lo spazio input. */
+export const DEFAULT_N_CTX_LOCAL = 4096;
+
+/** Default context window (`n_ctx`) per il provider cloud (OpenRouter). Mirrors
+ *  the core's `DEFAULT_N_CTX_CLOUD`: molto grande così il budget non vincola mai
+ *  la traduzione a pagina intera. */
+export const DEFAULT_N_CTX_CLOUD = 128000;
+
 /** A few common OpenRouter model ids offered in the dropdown (D5), refreshed to
  *  the current July-2026 catalog (ticket 14). The user can still type any other
  *  id via the free-text field. */
@@ -56,6 +66,10 @@ export interface ProviderPreset {
   label: string;
   /** Built-in default `/v1/chat/completions` endpoint (overridable). */
   base_url: string;
+  /** Built-in default context window (`n_ctx`) in token, input della formula di
+   *  budget (ticket 07): locale ~4096, cloud molto grande così il budget non
+   *  vincola. Overridabile via `provider.<id>.n_ctx`. Mirrors the core preset. */
+  n_ctx: number;
   /** OpenRouter (cloud) offers the curated {@link COMMON_MODELS} dropdown; local
    *  providers use a free-text model field (the loaded model tag varies). */
   cloud: boolean;
@@ -76,35 +90,40 @@ export const PROVIDERS: ProviderPreset[] = [
     label: 'OpenRouter (cloud)',
     base_url: 'https://openrouter.ai/api/v1/chat/completions',
     cloud: true,
-    dummyKey: 'sk-or-…'
+    dummyKey: 'sk-or-…',
+    n_ctx: DEFAULT_N_CTX_CLOUD
   },
   {
     id: 'unsloth',
     label: 'Unsloth Studio (locale)',
     base_url: 'http://localhost:8888/v1/chat/completions',
     cloud: false,
-    dummyKey: 'sk-unsloth-…'
+    dummyKey: 'sk-unsloth-…',
+    n_ctx: DEFAULT_N_CTX_LOCAL
   },
   {
     id: 'lmstudio',
     label: 'LM Studio (locale)',
     base_url: 'http://localhost:1234/v1/chat/completions',
     cloud: false,
-    dummyKey: 'local'
+    dummyKey: 'local',
+    n_ctx: DEFAULT_N_CTX_LOCAL
   },
   {
     id: 'ollama',
     label: 'Ollama (locale)',
     base_url: 'http://localhost:11434/v1/chat/completions',
     cloud: false,
-    dummyKey: 'local'
+    dummyKey: 'local',
+    n_ctx: DEFAULT_N_CTX_LOCAL
   },
   {
     id: 'llamaserver',
     label: 'llama.cpp server (locale)',
     base_url: 'http://127.0.0.1:8080/v1/chat/completions',
     cloud: false,
-    dummyKey: 'local'
+    dummyKey: 'local',
+    n_ctx: DEFAULT_N_CTX_LOCAL
   }
 ];
 
@@ -160,6 +179,24 @@ export function resolveBaseUrl(
     return stored.trim();
   }
   return providerById(providerId)?.base_url ?? '';
+}
+
+/**
+ * Resolve the effective context window (`n_ctx`) for a provider: the stored
+ * override when it parses to a positive integer, otherwise the provider's
+ * built-in preset default (conservative local default for an unknown id).
+ * Mirrors the core's `get_provider_config` n_ctx fallback (positive-int gate).
+ */
+export function resolveNctx(
+  stored: string | number | null | undefined,
+  providerId: string | null | undefined
+): number {
+  const n =
+    typeof stored === 'number' ? stored : Number.parseInt(String(stored ?? '').trim(), 10);
+  if (Number.isFinite(n) && n > 0) {
+    return Math.floor(n);
+  }
+  return providerById(providerId)?.n_ctx ?? DEFAULT_N_CTX_LOCAL;
 }
 
 /**

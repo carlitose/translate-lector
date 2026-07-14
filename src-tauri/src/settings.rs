@@ -132,6 +132,18 @@ pub const DEFAULT_MAX_TOKENS_CLOUD: u32 = 4096;
 /// abbastanza ampio per la traduzione di una pagina/chunk. Overridabile per-provider.
 pub const DEFAULT_MAX_TOKENS_LOCAL: u32 = 2048;
 
+/// Default context window (`n_ctx`) per il provider cloud (OpenRouter). Valore
+/// molto grande così la formula di budget (spec §"Modello di budget token",
+/// STC-01/08) non vincola mai la traduzione a pagina intera: sul cloud la
+/// finestra è ampia e il chunking degrada a una singola chiamata per pagina.
+pub const DEFAULT_N_CTX_CLOUD: u32 = 128_000;
+/// Default context window (`n_ctx`) per i provider locali
+/// (unsloth/lmstudio/ollama/llamaserver). I modelli locali girano tipicamente
+/// con una finestra ~4096 token (spec §"Modello di budget token"): è il default
+/// sensato da cui il budget deriva `budget_input`/`budget_unit_text`.
+/// Overridabile per-provider (`provider.<id>.n_ctx`).
+pub const DEFAULT_N_CTX_LOCAL: u32 = 4096;
+
 /// A selectable LLM provider: identità + endpoint + modello. `base_url` e `model`
 /// hanno default built-in ma sono overridabili (persistiti in `settings`); per i
 /// provider locali `model` parte vuoto ed è scelto poi a mano (free-text).
@@ -148,6 +160,10 @@ pub struct ProviderConfig {
     /// Tetto `max_tokens` per la generazione (default del preset o override
     /// utente). Ticket 02: cloud generoso, locale con margine entro `n_ctx`.
     pub max_tokens: u32,
+    /// Context window del modello (default del preset o override utente).
+    /// Ticket 07: input della formula di budget (locale ~4096, cloud molto
+    /// grande così il budget non vincola).
+    pub n_ctx: u32,
 }
 
 /// Built-in provider presets (design §2, research §5/§Q3). Le base-URL locali
@@ -162,6 +178,7 @@ pub fn provider_presets() -> Vec<ProviderConfig> {
             base_url: crate::llm::OPENROUTER_URL.to_string(),
             model: DEFAULT_MODEL.to_string(),
             max_tokens: DEFAULT_MAX_TOKENS_CLOUD,
+            n_ctx: DEFAULT_N_CTX_CLOUD,
         },
         ProviderConfig {
             id: "unsloth".to_string(),
@@ -169,6 +186,7 @@ pub fn provider_presets() -> Vec<ProviderConfig> {
             base_url: "http://localhost:8888/v1/chat/completions".to_string(),
             model: String::new(),
             max_tokens: DEFAULT_MAX_TOKENS_LOCAL,
+            n_ctx: DEFAULT_N_CTX_LOCAL,
         },
         ProviderConfig {
             id: "lmstudio".to_string(),
@@ -176,6 +194,7 @@ pub fn provider_presets() -> Vec<ProviderConfig> {
             base_url: "http://localhost:1234/v1/chat/completions".to_string(),
             model: String::new(),
             max_tokens: DEFAULT_MAX_TOKENS_LOCAL,
+            n_ctx: DEFAULT_N_CTX_LOCAL,
         },
         ProviderConfig {
             id: "ollama".to_string(),
@@ -183,6 +202,7 @@ pub fn provider_presets() -> Vec<ProviderConfig> {
             base_url: "http://localhost:11434/v1/chat/completions".to_string(),
             model: String::new(),
             max_tokens: DEFAULT_MAX_TOKENS_LOCAL,
+            n_ctx: DEFAULT_N_CTX_LOCAL,
         },
         ProviderConfig {
             id: "llamaserver".to_string(),
@@ -190,6 +210,7 @@ pub fn provider_presets() -> Vec<ProviderConfig> {
             base_url: "http://127.0.0.1:8080/v1/chat/completions".to_string(),
             model: String::new(),
             max_tokens: DEFAULT_MAX_TOKENS_LOCAL,
+            n_ctx: DEFAULT_N_CTX_LOCAL,
         },
     ]
 }
@@ -213,6 +234,12 @@ pub fn provider_model_key(id: &str) -> String {
 /// `provider.{id}.max_tokens` (ticket 02).
 pub fn provider_max_tokens_key(id: &str) -> String {
     format!("provider.{id}.max_tokens")
+}
+
+/// Settings key holding a provider's context-window override:
+/// `provider.{id}.n_ctx` (ticket 07).
+pub fn provider_nctx_key(id: &str) -> String {
+    format!("provider.{id}.n_ctx")
 }
 
 /// Read the active provider id, falling back to [`DEFAULT_PROVIDER_ID`] (D3:
@@ -245,6 +272,9 @@ pub fn get_provider_config(conn: &Connection, id: &str) -> rusqlite::Result<Prov
         // Un id sconosciuto è trattato in modo conservativo come "locale":
         // meglio riservare margine di output che chiedere l'intera finestra.
         max_tokens: DEFAULT_MAX_TOKENS_LOCAL,
+        // Idem per il context window: una finestra piccola è più prudente per
+        // il budget che sovrastimare lo spazio disponibile.
+        n_ctx: DEFAULT_N_CTX_LOCAL,
     });
 
     let base_url = match get_setting(conn, &provider_base_url_key(id))? {
@@ -270,12 +300,25 @@ pub fn get_provider_config(conn: &Connection, id: &str) -> rusqlite::Result<Prov
         _ => preset.max_tokens,
     };
 
+    // n_ctx override (ticket 07): intero positivo, altrimenti il default del
+    // preset (locale ~4096 / cloud molto grande). Un valore invalido o 0 è
+    // ignorato, così il budget non parte mai da una finestra assurda.
+    let n_ctx = match get_setting(conn, &provider_nctx_key(id))?
+        .as_deref()
+        .map(str::trim)
+        .map(str::parse::<u32>)
+    {
+        Some(Ok(n)) if n > 0 => n,
+        _ => preset.n_ctx,
+    };
+
     Ok(ProviderConfig {
         id: preset.id,
         label: preset.label,
         base_url,
         model,
         max_tokens,
+        n_ctx,
     })
 }
 
@@ -585,6 +628,85 @@ mod tests {
         assert_eq!(
             get_provider_config(&c, "unsloth").unwrap().max_tokens,
             DEFAULT_MAX_TOKENS_LOCAL
+        );
+    }
+
+    // --- Ticket 07: per-provider n_ctx (context window per il budget) --------
+
+    #[test]
+    fn provider_nctx_key_formats_scoped_key() {
+        assert_eq!(provider_nctx_key("unsloth"), "provider.unsloth.n_ctx");
+        assert_eq!(provider_nctx_key("openrouter"), "provider.openrouter.n_ctx");
+    }
+
+    #[test]
+    fn openrouter_preset_keeps_a_large_n_ctx_so_the_budget_never_constrains() {
+        // Cloud ha una finestra ampia: n_ctx molto grande così la formula di
+        // budget (STC-01/08) non vincola mai la traduzione a pagina intera.
+        assert_eq!(provider_preset("openrouter").unwrap().n_ctx, DEFAULT_N_CTX_CLOUD);
+        assert_eq!(DEFAULT_N_CTX_CLOUD, 128_000);
+    }
+
+    #[test]
+    fn local_presets_default_to_a_small_n_ctx() {
+        // I modelli locali girano tipicamente con una finestra ~4096 token
+        // (spec §"Modello di budget token"): è il default sensato per il budget.
+        for id in ["unsloth", "lmstudio", "ollama", "llamaserver"] {
+            let n = provider_preset(id).unwrap().n_ctx;
+            assert_eq!(n, DEFAULT_N_CTX_LOCAL, "{id} defaults to the local n_ctx");
+        }
+        assert_eq!(DEFAULT_N_CTX_LOCAL, 4096);
+    }
+
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn local_default_n_ctx_is_smaller_than_cloud() {
+        assert!(DEFAULT_N_CTX_LOCAL < DEFAULT_N_CTX_CLOUD);
+    }
+
+    #[test]
+    fn get_provider_config_returns_the_preset_n_ctx_by_default() {
+        let c = conn();
+        assert_eq!(
+            get_provider_config(&c, "openrouter").unwrap().n_ctx,
+            DEFAULT_N_CTX_CLOUD
+        );
+        assert_eq!(
+            get_provider_config(&c, "unsloth").unwrap().n_ctx,
+            DEFAULT_N_CTX_LOCAL
+        );
+    }
+
+    #[test]
+    fn get_provider_config_honors_an_n_ctx_override() {
+        let c = conn();
+        set_setting(&c, &provider_nctx_key("unsloth"), "8192").unwrap();
+        assert_eq!(get_provider_config(&c, "unsloth").unwrap().n_ctx, 8192);
+    }
+
+    #[test]
+    fn get_provider_config_ignores_an_invalid_or_zero_n_ctx_override() {
+        let c = conn();
+        set_setting(&c, &provider_nctx_key("unsloth"), "abc").unwrap();
+        assert_eq!(
+            get_provider_config(&c, "unsloth").unwrap().n_ctx,
+            DEFAULT_N_CTX_LOCAL
+        );
+        set_setting(&c, &provider_nctx_key("unsloth"), "0").unwrap();
+        assert_eq!(
+            get_provider_config(&c, "unsloth").unwrap().n_ctx,
+            DEFAULT_N_CTX_LOCAL
+        );
+    }
+
+    #[test]
+    fn get_provider_config_unknown_id_uses_conservative_local_n_ctx() {
+        // Un id sconosciuto è trattato in modo conservativo come "locale":
+        // meglio una finestra piccola che sovrastimare il budget disponibile.
+        let c = conn();
+        assert_eq!(
+            get_provider_config(&c, "mystery").unwrap().n_ctx,
+            DEFAULT_N_CTX_LOCAL
         );
     }
 }

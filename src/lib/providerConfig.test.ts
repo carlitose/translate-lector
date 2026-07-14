@@ -11,7 +11,10 @@ import {
   keyAcceptable,
   isLocalProvider,
   shouldShowLocalHint,
-  LOCAL_UNREACHABLE_HINT
+  LOCAL_UNREACHABLE_HINT,
+  DEFAULT_N_CTX_LOCAL,
+  DEFAULT_N_CTX_CLOUD,
+  resolveNctx
 } from './providerConfig';
 
 describe('resolveModel', () => {
@@ -92,6 +95,39 @@ describe('PROVIDERS', () => {
       expect(p.dummyKey && p.dummyKey.length > 0).toBe(true);
     }
     expect(providerById('lmstudio')?.dummyKey).toBe('local');
+  });
+});
+
+describe('n_ctx presets (ticket 07)', () => {
+  it('openrouter (cloud) keeps a large n_ctx so the budget never constrains', () => {
+    expect(providerById('openrouter')?.n_ctx).toBe(DEFAULT_N_CTX_CLOUD);
+    expect(DEFAULT_N_CTX_CLOUD).toBe(128000);
+  });
+
+  it('every local provider defaults to the small local n_ctx', () => {
+    for (const p of PROVIDERS.filter((p) => !p.cloud)) {
+      expect(p.n_ctx).toBe(DEFAULT_N_CTX_LOCAL);
+    }
+    expect(DEFAULT_N_CTX_LOCAL).toBe(4096);
+  });
+});
+
+describe('resolveNctx', () => {
+  it('returns the parsed stored override when it is a positive integer', () => {
+    expect(resolveNctx('8192', 'unsloth')).toBe(8192);
+    expect(resolveNctx('  8192  ', 'unsloth')).toBe(8192);
+  });
+
+  it('falls back to the provider preset when unset/blank/invalid/zero', () => {
+    expect(resolveNctx(null, 'unsloth')).toBe(DEFAULT_N_CTX_LOCAL);
+    expect(resolveNctx('   ', 'lmstudio')).toBe(DEFAULT_N_CTX_LOCAL);
+    expect(resolveNctx('abc', 'ollama')).toBe(DEFAULT_N_CTX_LOCAL);
+    expect(resolveNctx('0', 'unsloth')).toBe(DEFAULT_N_CTX_LOCAL);
+    expect(resolveNctx(null, 'openrouter')).toBe(DEFAULT_N_CTX_CLOUD);
+  });
+
+  it('falls back to the conservative local default for an unknown provider', () => {
+    expect(resolveNctx(undefined, 'mystery')).toBe(DEFAULT_N_CTX_LOCAL);
   });
 });
 
