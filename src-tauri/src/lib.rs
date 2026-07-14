@@ -253,7 +253,13 @@ async fn translate_page(
             .map_err(|e| e.to_string())?
             .unwrap_or_default();
         let model = settings::get_model(&conn).map_err(|e| e.to_string())?;
-        let base = llm::OpenRouterClient::new(api_key);
+        // Behaviour unchanged: still OpenRouter with the same endpoint, key and
+        // attribution headers. Provider selection arrives in later tickets.
+        let base = llm::ChatCompletionsClient::new(
+            llm::OPENROUTER_URL,
+            api_key,
+            /* send_openrouter_headers = */ true,
+        );
         // Retry transient failures (timeout/5xx/429/offline) with backoff (NFR06).
         let client = llm::RetryingChatClient::new(&base, llm::RetryPolicy::default());
         let params = translate::TranslateParams {

@@ -1,11 +1,12 @@
-//! OpenRouter chat-completions transport, percettore output types, prompt
-//! builder and the layered JSON parsing fallback (SPECIFICATION §4.4, ticket
-//! 08, research-openrouter-contract.md).
+//! OpenAI-compatible chat-completions transport, percettore output types,
+//! prompt builder and the layered JSON parsing fallback (SPECIFICATION §4.4,
+//! ticket 08, research-openrouter-contract.md).
 //!
 //! The transport is abstracted behind [`ChatClient`] so the translation service
 //! can be unit-tested with a mock, no network required. The real
-//! [`OpenRouterClient`] uses a blocking `reqwest` client and is exercised only
-//! by human QA against a live key.
+//! [`ChatCompletionsClient`] uses a blocking `reqwest` client, targets any
+//! configurable OpenAI-compatible endpoint (OpenRouter or a local `/v1` server)
+//! and is exercised only by human QA against a live endpoint.
 
 use serde::{Deserialize, Serialize};
 
@@ -243,17 +244,17 @@ impl LlmError {
     pub fn user_message(&self) -> String {
         match self {
             LlmError::MissingApiKey => {
-                "EC03: API key OpenRouter mancante o non valida. \
+                "EC03: API key mancante o non valida. \
                  Configurala in ⚙️ (Impostazioni provider)."
                     .into()
             }
-            LlmError::Http(m) => format!("Errore di rete/OpenRouter: {m}"),
+            LlmError::Http(m) => format!("Errore di rete/servizio LLM: {m}"),
             LlmError::UnsupportedParams(m) => format!(
                 "Il modello selezionato non supporta i parametri richiesti \
                  (nessun endpoint compatibile). {m}"
             ),
-            LlmError::Timeout(m) => format!("Errore di rete/OpenRouter (timeout): {m}"),
-            LlmError::ServerError(m) => format!("Errore del servizio OpenRouter: {m}"),
+            LlmError::Timeout(m) => format!("Errore di rete/servizio LLM (timeout): {m}"),
+            LlmError::ServerError(m) => format!("Errore del servizio LLM: {m}"),
             LlmError::RateLimited(m) => {
                 format!("EC07: limite di richieste raggiunto (rate limit). Riprova tra poco. {m}")
             }
@@ -384,35 +385,53 @@ pub fn complete_with_fallback(
     }
 }
 
-/// Real OpenRouter client backed by a blocking `reqwest` client.
-pub struct OpenRouterClient {
+/// Real chat-completions client backed by a blocking `reqwest` client, talking
+/// to any OpenAI-compatible endpoint. `base_url` is the full
+/// `/v1/chat/completions` URL (OpenRouter's is [`OPENROUTER_URL`], the openrouter
+/// preset default); `send_openrouter_headers` gates the OpenRouter-only
+/// attribution headers so other endpoints don't receive them.
+pub struct ChatCompletionsClient {
+    base_url: String,
     api_key: String,
+    send_openrouter_headers: bool,
     http: reqwest::blocking::Client,
 }
 
-impl OpenRouterClient {
-    pub fn new(api_key: impl Into<String>) -> Self {
+impl ChatCompletionsClient {
+    pub fn new(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        send_openrouter_headers: bool,
+    ) -> Self {
         Self {
+            base_url: base_url.into(),
             api_key: api_key.into(),
+            send_openrouter_headers,
             http: reqwest::blocking::Client::new(),
         }
     }
 }
 
-impl ChatClient for OpenRouterClient {
+impl ChatClient for ChatCompletionsClient {
     fn complete(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
-        // EC03 guard: never touch the network without a key.
+        // EC03 guard: never touch the network without a key. Per decision D5 the
+        // key is mandatory for every provider (local servers get a dummy key).
         if self.api_key.trim().is_empty() {
             return Err(LlmError::MissingApiKey);
         }
 
-        let resp = self
+        let mut rb = self
             .http
-            .post(OPENROUTER_URL)
+            .post(&self.base_url)
             .bearer_auth(self.api_key.trim())
-            .header("Content-Type", "application/json")
-            .header("HTTP-Referer", HTTP_REFERER)
-            .header("X-Title", X_TITLE)
+            .header("Content-Type", "application/json");
+        // Attribution headers are OpenRouter-specific: send them only for the
+        // openrouter preset, not for local/other OpenAI-compatible endpoints.
+        if self.send_openrouter_headers {
+            rb = rb.header("HTTP-Referer", HTTP_REFERER).header("X-Title", X_TITLE);
+        }
+
+        let resp = rb
             .json(req)
             .send()
             .map_err(|e| {
@@ -1244,10 +1263,78 @@ mod tests {
     // --- Real client key guard (no network) ---------------------------------
 
     #[test]
-    fn openrouter_client_with_empty_key_errors_before_network() {
-        let client = OpenRouterClient::new("   ");
+    fn chat_completions_client_with_empty_key_errors_before_network() {
+        // Per D5 the key is always mandatory: a blank key trips EC03 before any
+        // network call, regardless of the (arbitrary) base-URL configured.
+        let client = ChatCompletionsClient::new(
+            "http://127.0.0.1:9/v1/chat/completions",
+            "   ",
+            /* send_openrouter_headers = */ true,
+        );
         let req = build_request("openai/gpt-4o", build_messages("it", "x", "", "", "", false, 1000));
         assert_eq!(client.complete(&req), Err(LlmError::MissingApiKey));
+    }
+
+    // --- Base-URL routing + attribution-header gating (loopback, no internet) -
+
+    /// Spin up a one-shot loopback HTTP server, point the client at it, fire one
+    /// `complete()` and return the raw request bytes the client sent. Lets us
+    /// assert *where* the POST goes and *which* headers are attached without any
+    /// real provider or internet access.
+    #[cfg(test)]
+    fn capture_request(send_openrouter_headers: bool) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // Headers precede the body, so the first read carries them in full.
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let body =
+                r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"total_tokens":1}}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = tx.send(req);
+        });
+
+        let base_url = format!("http://{addr}/v1/chat/completions");
+        let client = ChatCompletionsClient::new(base_url, "test-key", send_openrouter_headers);
+        let req = build_request("openai/gpt-4o", build_messages("it", "x", "", "", "", false, 1000));
+        let _ = client.complete(&req);
+        let captured = rx.recv().unwrap();
+        handle.join().unwrap();
+        captured
+    }
+
+    #[test]
+    fn complete_posts_to_the_configured_base_url() {
+        // The request reaches the arbitrary base-URL (not the OpenRouter const),
+        // hitting the /v1/chat/completions path we configured.
+        let captured = capture_request(true);
+        assert!(captured.starts_with("POST /v1/chat/completions"));
+    }
+
+    #[test]
+    fn attribution_headers_sent_only_when_openrouter_flag_is_set() {
+        // openrouter preset -> attribution headers present.
+        let with = capture_request(true).to_lowercase();
+        assert!(with.contains("http-referer"));
+        assert!(with.contains("x-title"));
+
+        // Any other endpoint -> no OpenRouter-specific attribution headers.
+        let without = capture_request(false).to_lowercase();
+        assert!(!without.contains("http-referer"));
+        assert!(!without.contains("x-title"));
     }
 
     // --- Response helper -----------------------------------------------------
