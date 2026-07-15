@@ -760,9 +760,9 @@ pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        // Ticket 04: shell plugin used to spawn the app-managed llama-server
-        // (`app.shell().command(<abs_path>)`, see `sidecar.rs`).
-        .plugin(tauri_plugin_shell::init())
+        // Ticket 10: the app-managed llama-server is now spawned via the
+        // `command-group` crate (Job Object on Windows / process group on Unix,
+        // see `sidecar.rs`), so `tauri-plugin-shell` is no longer needed.
         .setup(|app| {
             // Initialise SQLite on first run (idempotent thereafter).
             let db_path = database_path(&app.handle())?;

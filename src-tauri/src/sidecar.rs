@@ -7,17 +7,39 @@
 //! the other local providers (`unsloth`/`lmstudio`/`ollama`) are launched by the
 //! user and must keep their pre-ticket behaviour.
 //!
-//! ## Spawn mechanism — `tauri-plugin-shell` (`app.shell().command(<abs_path>)`)
+//! ## Spawn mechanism — `command-group` (std) with per-OS lifetime binding (ticket 10)
 //!
 //! We spawn an **external** binary at a user-configured absolute path (D0/D1: no
-//! bundling, no target-triple sidecar). The shell plugin's `execute` *scope*
-//! (`shell:allow-execute`) only gates the **JS/IPC-facing** command; the
-//! **Rust-side** `app.shell().command(path).spawn()` is not restricted by that
-//! scope, so an arbitrary runtime absolute path works cleanly — no static scope
-//! wrangling, and **no `shell:allow-execute` capability entry is needed** in
-//! `capabilities/default.json` (the frontend never invokes the shell API). This
-//! keeps the `CommandChild` handle the ticket-02 kill-on-exit pattern needs
-//! (`.take()` + `.kill()` from `RunEvent`).
+//! bundling, no target-triple sidecar) with a plain blocking
+//! `std::process::Command` (this path already runs inside `spawn_blocking`),
+//! wrapped by the [`command-group`](https://docs.rs/command-group) crate so the
+//! child's lifetime is tied to the app and cannot be orphaned:
+//!
+//! - **Windows** — kernel-guaranteed. `.kill_on_drop(true)` makes the crate
+//!   create the child inside a Job Object with
+//!   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. The app process is the sole holder of
+//!   the job handle, so when it dies for *any* reason — clean exit, panic,
+//!   crash, Task Manager force-kill — the kernel closes the handle and
+//!   terminates every process in the job. The orphan hole is closed by the OS,
+//!   not by our code.
+//! - **macOS / Linux (Unix)** — reliable *explicit* tree-kill. The child is made
+//!   a process-group leader (`setpgid(0,0)`), so the kill on exit
+//!   ([`GroupChild::kill`] → `killpg(SIGKILL)`) tears down the whole tree. A
+//!   *hard crash* of the app does **not** auto-kill the child on Unix (no
+//!   Job-Object equivalent; a kqueue `NOTE_EXIT` watchdog is out of scope); that
+//!   case stays covered by [`reap_stale_llama_server_on_startup`] as before.
+//!
+//! Why `command-group` and not `process-wrap`: both are by the same author, but
+//! `process-wrap`'s **std** `JobObject` hard-codes the job flag to `false`
+//! (kill-on-close only reachable via its *tokio* API, which would force a tokio
+//! runtime context onto this blocking spawn path). `command-group`'s std builder
+//! exposes `.kill_on_drop(true)` directly, so it compiles cleanly here *and*
+//! guarantees kill-on-parent-death on Windows — the deciding criterion.
+//!
+//! Dropping `tauri-plugin-shell` loses its `CommandEvent` (stdout) stream, which
+//! is fine: readiness is detected over HTTP (`probe_reachable`/`probe_model_ready`
+//! on `/health`), never by parsing logs. The child's stdio is sent to
+//! `Stdio::null()` so the chatty server can never block on a full pipe.
 //!
 //! ## Testability
 //!
@@ -27,11 +49,17 @@
 //! poll / kill / reap) is a thin wrapper around them.
 
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use command_group::{CommandGroup, GroupChild};
 use tauri::Manager;
-use tauri_plugin_shell::process::CommandChild;
+
+/// `CREATE_NO_WINDOW` (winbase.h): keep console-mode child processes
+/// (llama-server.exe, tasklist, taskkill) from flashing a console window.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// What the on-demand path should do for a translation request, given the
 /// provider's locality, current reachability and whether its configured paths
@@ -149,8 +177,12 @@ pub fn binary_image_name(binary_path: &str) -> Option<String> {
 /// Tauri-managed handle to the app-spawned llama-server. Held in a `Mutex`
 /// (recovered on poison via `crate::lock_ignoring_poison`) next to
 /// `CurrentPage`/`LocalProviderSlot`. `None` until the first on-demand spawn;
-/// `.take()` + `.kill()` on exit (D1).
-pub struct LlamaServerProcess(pub Mutex<Option<CommandChild>>);
+/// `.take()` + `.kill()` on exit (D1). The [`GroupChild`] owns the OS handle
+/// that binds the child's lifetime to the app — on Windows keeping it alive here
+/// keeps the Job Object's `KILL_ON_JOB_CLOSE` armed until the app dies (ticket
+/// 10). `GroupChild` is `Send + Sync` (its Windows `JobPort` is explicitly so),
+/// which is what lets it live in Tauri-managed state.
+pub struct LlamaServerProcess(pub Mutex<Option<GroupChild>>);
 
 impl LlamaServerProcess {
     pub fn new() -> Self {
@@ -221,51 +253,59 @@ pub fn ensure_local_server_ready(
     }
 }
 
-/// Spawn `binary` with `args` via the shell plugin, store the `CommandChild` in
-/// managed state (killing any previously stored child first, to avoid a leak),
-/// persist its PID for orphan reaping, and drain its output stream so the chatty
-/// server never blocks on a full stdout/stderr pipe.
+/// Spawn `binary` with `args` as a **process group / Job Object** via
+/// `command-group` (see the module doc for the per-OS lifetime guarantees),
+/// store the [`GroupChild`] in managed state (killing any previously stored
+/// child first, to avoid a leak) and persist its PID for the startup-reap
+/// fallback. The child's stdio goes to `Stdio::null()`: readiness is detected by
+/// HTTP probing, so we neither need nor drain the server's (chatty) output, and
+/// with no pipe there is nothing that can fill and block it.
 fn spawn_llama_server(
     app: &tauri::AppHandle,
     binary: &Path,
     args: Vec<String>,
 ) -> Result<(), String> {
-    use tauri_plugin_shell::ShellExt;
-
     let program = binary.to_string_lossy().to_string();
-    // Rust-side spawn: not gated by the shell plugin's IPC `shell:allow-execute`
-    // scope, so no capability entry is needed for this runtime absolute path.
-    let (mut rx, child) = app
-        .shell()
-        .command(&program)
-        .args(args)
+
+    let mut command = Command::new(&program);
+    command
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    // `.group()` puts the child in a POSIX process group on Unix / a Job Object
+    // on Windows. `.spawn()` needs `&mut self`, so `builder` is always mutated.
+    let mut builder = command.group();
+    #[cfg(windows)]
+    {
+        // `CREATE_NO_WINDOW`: keep the console-mode llama-server.exe from
+        // flashing a console window (parity with the old shell-plugin spawn).
+        // Set via the builder (not the raw `Command`) because command-group
+        // overwrites the creation flags to add `CREATE_SUSPENDED` internally.
+        builder.creation_flags(CREATE_NO_WINDOW);
+        // Arm `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`: the kernel kills the whole
+        // job when the app (sole handle holder) dies for ANY reason — clean
+        // exit, panic, crash, or force-kill. This is the ticket-10 fix that
+        // closes the orphan hole on Windows. The method is Windows-only in
+        // command-group's std API, hence the `#[cfg(windows)]`.
+        builder.kill_on_drop(true);
+    }
+    let child = builder
         .spawn()
         .map_err(|e| format!("Impossibile avviare llama-server ({program}): {e}"))?;
 
-    let pid = child.pid();
+    let pid = child.id();
     if let Ok(pid_file) = llama_pid_file_path(app) {
         let _ = std::fs::write(&pid_file, pid.to_string());
     }
 
-    {
-        let state = app.state::<LlamaServerProcess>();
-        let mut guard = crate::lock_ignoring_poison(&state.0);
-        if let Some(old) = guard.take() {
-            let _ = old.kill();
-        }
-        *guard = Some(child);
+    let state = app.state::<LlamaServerProcess>();
+    let mut guard = crate::lock_ignoring_poison(&state.0);
+    if let Some(mut old) = guard.take() {
+        let _ = old.kill();
     }
-
-    // Drain events so the OS pipe buffer never fills (readiness is detected by
-    // probing, not by parsing logs); stop once the process terminates.
-    tauri::async_runtime::spawn(async move {
-        use tauri_plugin_shell::process::CommandEvent;
-        while let Some(event) = rx.recv().await {
-            if let CommandEvent::Terminated(_) = event {
-                break;
-            }
-        }
-    });
+    *guard = Some(child);
 
     Ok(())
 }
@@ -296,17 +336,20 @@ fn wait_until_ready(base_url: &str) -> Result<(), String> {
     }
 }
 
-/// Kill the app-managed llama-server on exit: `.take()` the `CommandChild` from
-/// managed state and `.kill()` it, then remove the PID file (a clean shutdown
-/// leaves no orphan to reap). Called from the `RunEvent::Exit | ExitRequested`
-/// callback (D1).
+/// Kill the app-managed llama-server on exit: `.take()` the [`GroupChild`] from
+/// managed state and `.kill()` it — on Windows this `TerminateJobObject`s the
+/// whole job, on Unix `killpg(SIGKILL)`s the whole process group — then remove
+/// the PID file (a clean shutdown leaves no orphan to reap). Called from the
+/// `RunEvent::Exit | ExitRequested` callback (D1). On Windows the OS would also
+/// reap the child on its own (KILL_ON_JOB_CLOSE) when the handle drops, but this
+/// explicit kill is the deterministic path for a clean shutdown on every OS.
 pub fn kill_llama_server_on_exit(app: &tauri::AppHandle) {
     let child = {
         let state = app.state::<LlamaServerProcess>();
         let mut guard = crate::lock_ignoring_poison(&state.0);
         guard.take()
     };
-    if let Some(child) = child {
+    if let Some(mut child) = child {
         match child.kill() {
             Ok(()) => eprintln!("[llama] server killed on exit"),
             Err(e) => eprintln!("[llama] failed to kill server on exit: {e}"),
@@ -400,7 +443,6 @@ fn read_pid_file(path: &Path) -> Option<u32> {
 #[cfg(windows)]
 fn pid_matches_running_image(pid: u32, image: &str) -> bool {
     use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let output = std::process::Command::new("tasklist")
         .args([
             "/FI",
@@ -432,7 +474,6 @@ fn pid_matches_running_image(_pid: u32, _image: &str) -> bool {
 #[cfg(windows)]
 fn kill_pid(pid: u32) {
     use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let _ = std::process::Command::new("taskkill")
         .args(["/F", "/PID", &pid.to_string()])
         .creation_flags(CREATE_NO_WINDOW)
