@@ -40,6 +40,14 @@
   let nCtx = $state(''); // context window (n_ctx) for the active provider (editable)
   let loadedNctx = $state(''); // last loaded n_ctx, to detect user changes
 
+  // --- llama.cpp diretto: path del binario + GGUF (ticket 05) ---
+  let binaryPath = $state(''); // resolved binary_path for the active provider
+  let loadedBinaryPath = $state('');
+  let modelPath = $state(''); // resolved model_path for the active provider
+  let loadedModelPath = $state('');
+  let binaryExists = $state<boolean | null>(null); // null = not yet checked
+  let modelExists = $state<boolean | null>(null);
+
   // --- Reading preferences ---
   let langSelect = $state('it'); // default target language dropdown ('__custom__' for free)
   let langFree = $state('');
@@ -63,6 +71,8 @@
   // OpenRouter (cloud) uses the curated dropdown; local providers use free text.
   const isCloud = $derived(activeProvider?.cloud ?? false);
   const providerLabel = $derived(activeProvider?.label ?? activeProviderId);
+  // Solo il provider llama.cpp diretto espone i path di binario + GGUF (ticket 05).
+  const showPaths = $derived(activeProviderId === 'llamaserver');
   // Key placeholder: suggest the dummy for local servers (D5), hint sk-or-… for
   // the cloud, and prompt for a replacement when a key is already stored.
   const keyPlaceholder = $derived(
@@ -95,6 +105,8 @@
       base_url: string;
       model: string;
       n_ctx: number;
+      binary_path: string;
+      model_path: string;
     }>('get_provider_config', { providerId: id });
     baseUrl = cfg.base_url ?? '';
     loadedBaseUrl = baseUrl;
@@ -102,6 +114,13 @@
     // Context window (ticket 07): il core lo risolve già con override+preset.
     nCtx = String(resolveNctx(cfg.n_ctx, id));
     loadedNctx = nCtx;
+
+    // Path del binario/GGUF (ticket 05): il core li risolve con override+preset.
+    binaryPath = cfg.binary_path ?? '';
+    loadedBinaryPath = binaryPath;
+    modelPath = cfg.model_path ?? '';
+    loadedModelPath = modelPath;
+    await refreshPathStatus(id);
 
     const storedModel = cfg.model ?? '';
     // Cloud provider: offer the curated dropdown when the model is a known id;
@@ -112,6 +131,31 @@
     } else {
       modelSelect = CUSTOM;
       modelFree = storedModel;
+    }
+  }
+
+  /**
+   * Refresh the "trovato/mancante" status for the binary + GGUF paths of `id`
+   * (ticket 05). Uses the core's `validate_provider_paths`, which resolves the
+   * effective paths (override + preset) and checks existence without spawning.
+   * Only meaningful for the direct llama.cpp provider; a no-op otherwise.
+   */
+  async function refreshPathStatus(id: string): Promise<void> {
+    if (id !== 'llamaserver') {
+      binaryExists = null;
+      modelExists = null;
+      return;
+    }
+    try {
+      const status = await invoke<{
+        binary_exists: boolean;
+        model_exists: boolean;
+      }>('validate_provider_paths', { providerId: id });
+      binaryExists = status.binary_exists;
+      modelExists = status.model_exists;
+    } catch {
+      binaryExists = null;
+      modelExists = null;
     }
   }
 
@@ -204,6 +248,27 @@
         loadedNctx = String(resolvedNctx);
       }
       nCtx = String(resolvedNctx);
+
+      // Path del binario/GGUF (ticket 05): scrivi gli override
+      // `provider.<id>.binary_path` / `.model_path` solo quando cambiati. Un
+      // valore vuoto è persistito così: il core ci ricade sul default del preset.
+      if (showPaths) {
+        if (binaryPath.trim() !== loadedBinaryPath.trim()) {
+          await invoke('set_setting', {
+            key: `provider.${activeProviderId}.binary_path`,
+            value: binaryPath.trim()
+          });
+          loadedBinaryPath = binaryPath.trim();
+        }
+        if (modelPath.trim() !== loadedModelPath.trim()) {
+          await invoke('set_setting', {
+            key: `provider.${activeProviderId}.model_path`,
+            value: modelPath.trim()
+          });
+          loadedModelPath = modelPath.trim();
+        }
+        await refreshPathStatus(activeProviderId);
+      }
 
       // Model override: write to `provider.<id>.model`. Cloud always has a
       // resolved model; for local providers only persist a non-empty free-text id.
@@ -389,6 +454,44 @@
           <span class="hint">Finestra del modello: guida il budget di traduzione. Locale ~4096; cloud molto ampio.</span>
         </div>
 
+        {#if showPaths}
+          <div class="field">
+            <span class="label">Path binario llama-server</span>
+            {#if binaryExists === true}
+              <span class="status present">● trovato</span>
+            {:else if binaryExists === false}
+              <span class="status missing">● mancante</span>
+            {/if}
+            <input
+              type="text"
+              placeholder="es. C:\\Users\\…\\llama.cpp\\llama-server.exe"
+              bind:value={binaryPath}
+              onblur={() => refreshPathStatus(activeProviderId)}
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <span class="hint">Release ufficiale llama.cpp (con le DLL CUDA nella stessa cartella).</span>
+          </div>
+
+          <div class="field">
+            <span class="label">Path modello GGUF</span>
+            {#if modelExists === true}
+              <span class="status present">● trovato</span>
+            {:else if modelExists === false}
+              <span class="status missing">● mancante</span>
+            {/if}
+            <input
+              type="text"
+              placeholder="es. C:\\Users\\…\\gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf"
+              bind:value={modelPath}
+              onblur={() => refreshPathStatus(activeProviderId)}
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <span class="hint">File GGUF del modello da caricare (path esplicito, non auto-detect).</span>
+          </div>
+        {/if}
+
         <div class="field">
           <span class="label">Lingua di destinazione predefinita</span>
           <select bind:value={langSelect}>
@@ -533,6 +636,11 @@
 
   .status.present {
     color: #1a7f37;
+    opacity: 1;
+  }
+
+  .status.missing {
+    color: #b3261e;
     opacity: 1;
   }
 

@@ -4,6 +4,7 @@ mod glossary;
 mod llm;
 mod secrets;
 mod settings;
+mod sidecar;
 mod translate;
 
 use std::collections::HashMap;
@@ -56,7 +57,7 @@ impl LocalProviderSlot {
 /// behaviour) would only turn one unrelated panic into a permanent, app-wide
 /// outage for local translation and cursor tracking. Recovering here is safe
 /// and keeps both features usable after a transient panic elsewhere.
-fn lock_ignoring_poison<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn lock_ignoring_poison<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
@@ -236,7 +237,7 @@ fn get_model(app: tauri::AppHandle) -> Result<String, String> {
     settings::get_model(&conn).map_err(|e| e.to_string())
 }
 
-/// Read the active provider id (D3: default "unsloth" when unset).
+/// Read the active provider id (D5: default "llamaserver" when unset).
 #[tauri::command]
 fn get_active_provider(app: tauri::AppHandle) -> Result<String, String> {
     let conn = open_db(&app)?;
@@ -266,6 +267,44 @@ fn get_provider_config(
 #[tauri::command]
 fn list_providers() -> Vec<settings::ProviderConfig> {
     settings::provider_presets()
+}
+
+/// Path-validation status for a provider's llama-server binary + GGUF model
+/// (ticket 05). Feeds the ⚙️ "trovato/mancante" indicator; `error` carries the
+/// actionable Italian message when either path is missing. Does NOT spawn.
+#[derive(serde::Serialize)]
+struct LlamaPathStatus {
+    /// Resolved binary path (preset default or user override).
+    binary_path: String,
+    /// Resolved GGUF model path (preset default or user override).
+    model_path: String,
+    /// Whether the resolved binary path exists on disk.
+    binary_exists: bool,
+    /// Whether the resolved model path exists on disk.
+    model_exists: bool,
+    /// Actionable error when a path is missing; `null` when both are present.
+    error: Option<String>,
+}
+
+/// Resolve a provider's binary/model paths (override + preset) and report whether
+/// each exists, plus the actionable error the ticket-04 spawner would surface.
+#[tauri::command]
+fn validate_provider_paths(
+    app: tauri::AppHandle,
+    provider_id: String,
+) -> Result<LlamaPathStatus, String> {
+    let conn = open_db(&app)?;
+    let cfg = settings::get_provider_config(&conn, &provider_id).map_err(|e| e.to_string())?;
+    let binary_exists = settings::path_configured_and_exists(&cfg.binary_path);
+    let model_exists = settings::path_configured_and_exists(&cfg.model_path);
+    let error = settings::validate_llama_paths(&cfg.binary_path, &cfg.model_path).err();
+    Ok(LlamaPathStatus {
+        binary_path: cfg.binary_path,
+        model_path: cfg.model_path,
+        binary_exists,
+        model_exists,
+        error,
+    })
 }
 
 /// Read the default target language for new documents (§3.5, D4), falling back
@@ -474,7 +513,7 @@ async fn translate_page(
             is_page_current(&cursor, document_id, page_number)
         };
 
-        // Risolvi il provider attivo (D3: default unsloth) e la sua config
+        // Risolvi il provider attivo (D5: default llamaserver) e la sua config
         // (base-URL + modello, con override e fallback legacy `model` per
         // openrouter). La chiave è provider-scoped (Ticket 06).
         let active_id = settings::get_active_provider(&conn).map_err(|e| e.to_string())?;
@@ -534,6 +573,16 @@ async fn translate_page(
         } else {
             None
         };
+
+        // Ticket 04 (D1/D4/D5): on-demand lifecycle for the app-managed
+        // llama.cpp provider. Held behind `LocalProviderSlot`, so two concurrent
+        // local requests (on-demand + prefetch) cannot both spawn — the first
+        // spawns and waits for readiness, the second reuses the now-healthy
+        // server. A cloud or non-managed local provider is a no-op here; a
+        // managed provider with missing paths surfaces the actionable ⚙️ error
+        // (D2) instead of translating against a server that will never come up.
+        sidecar::ensure_local_server_ready(&app, &cfg)?;
+
         translate::translate_page(&conn, &client, &params).map_err(|e| e.user_message())
     })
     .await
@@ -636,9 +685,12 @@ fn read_data_dir_pointer(app: &tauri::AppHandle) -> Option<String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        // Ticket 04: shell plugin used to spawn the app-managed llama-server
+        // (`app.shell().command(<abs_path>)`, see `sidecar.rs`).
+        .plugin(tauri_plugin_shell::init())
         .setup(|app| {
             // Initialise SQLite on first run (idempotent thereafter).
             let db_path = database_path(&app.handle())?;
@@ -649,6 +701,12 @@ pub fn run() {
             // doc comment near `CurrentPage`/`LocalProviderSlot` above.
             app.manage(CurrentPage::new());
             app.manage(LocalProviderSlot::new());
+            // Ticket 04 (D1): handle to the app-managed llama-server, killed on
+            // exit via the RunEvent callback below.
+            app.manage(sidecar::LlamaServerProcess::new());
+            // Ticket 04 (assumption 2): reap a llama-server orphaned by a prior
+            // hard crash (RunEvent never fired) before any new on-demand spawn.
+            sidecar::reap_stale_llama_server_on_startup(&app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -665,6 +723,7 @@ pub fn run() {
             set_active_provider,
             get_provider_config,
             list_providers,
+            validate_provider_paths,
             get_default_target_language,
             clear_translations_cache,
             get_data_dir,
@@ -684,6 +743,19 @@ pub fn run() {
             list_glossary,
             update_glossary_term
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        // Ticket 04 (D1): migrate from `.run(context)` to `.build(context)?.run(cb)`
+        // so we get the `RunEvent` callback for deterministic kill-on-exit.
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app_handle, event| match event {
+        // Deterministic kill of the app-managed llama-server when the app is
+        // closing: `.take()` the child from managed state + `.kill()` it, and
+        // clear the PID file. `Drop` is a backup, but does NOT fire on a
+        // force-kill of the app itself — hence the startup reap (assumption 2).
+        tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
+            sidecar::kill_llama_server_on_exit(app_handle);
+        }
+        _ => {}
+    });
 }

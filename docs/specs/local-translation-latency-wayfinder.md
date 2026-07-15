@@ -147,4 +147,6 @@ Dopo la build (04, 06):
 2. Aggiornare `SPECIFICATION.md` §3.2 se D1 cambia definitivamente (unità di chiamata = finestra da 512
    token, non più il singolo paragrafo).
 3. Se in futuro emerge un modello di traduzione locale compatibile con prompt system + glossario/summary,
-   riaprire L6 come nuova voce di Not Yet Specified.
+   riaprire L6 come nuova voce di Not Yet Specified. Nota: L6 come *problema di latenza* è **chiuso**
+   (vedi Not Yet Specified) — risolto bypassando il proxy di Studio con llama-server diretto
+   (`--reasoning off`), **non** cambiando modello. Mappa: [llamacpp-direct-wayfinder.md](./llamacpp-direct-wayfinder.md).
