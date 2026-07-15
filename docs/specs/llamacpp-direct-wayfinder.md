@@ -63,9 +63,20 @@ problema, non il modello.
   ("resta gemma-4") resta valida — qui NON si cambia modello, si cambia il modo di servirlo.
 - **Qualità senza reasoning = VALIDATA** (2026-07-15, ticket 07 HITL, `done/`): l'utente ha letto
   pagine reali col provider `llamaserver` + `--reasoning off` e ha giudicato la traduzione "molto
-  buona". Nessuna regressione bloccante rispetto alla resa con CoT. → il provider diretto può
-  diventare il default consigliato (D5 del grilling di fatto risolto in senso positivo). Lo
-  scivolone sintetico sugli articoli non si è ripresentato in pratica.
+  buona". Nessuna regressione bloccante rispetto alla resa con CoT. Lo scivolone sintetico sugli
+  articoli non si è ripresentato in pratica.
+- **Grilling 03 = DECISO** (2026-07-15, `done/`,
+  [decision-brief-llamacpp-direct-03.md](./decision-brief-llamacpp-direct-03.md)): sei decisioni
+  D0-D5.
+  - **D0 — Uso personale**: niente bundling/firma/download-manager; l'app lancia binario e modello
+    già sul disco. Se un giorno si distribuirà, D1/D2 si riaprono.
+  - **D1 — App-managed**: spawn on-demand + kill via `RunEvent`; binario e modello a path locali
+    configurabili, non impacchettati.
+  - **D2 — Path espliciti in ⚙️** (binario + GGUF) con default precompilati; errore azionabile se
+    mancano; niente auto-detect (hash di snapshot HF fragile).
+  - **D3 — Preset `unsloth` mantenuto** come opzione normale (non deprecato, nessuna migrazione).
+  - **D4 — Parametri**: `8080`, `-ngl 99`, `-c 4096`, `--reasoning off`, `--parallel 1`, overridabili.
+  - **D5 — Default = llama.cpp diretto, spawn on-demand** (prima traduzione, non all'avvio).
 
 ## Not Yet Specified
 
@@ -96,10 +107,10 @@ problema, non il modello.
 
 1. ~~Sourcing del binario (ticket 01)~~ → **RISOLTO**: release ufficiale llama.cpp CUDA.
 2. ~~Contratto sidecar Tauri (ticket 02)~~ → **RISOLTO**: externalBin + plugin-shell + kill via RunEvent.
-3. **Grilling 03 = FRONTIERA ATTUALE** (ready: 01+02 chiusi): distribuzione (D1: bundle ~1.1 GB vs
-   download vs build slim), gestione GGUF (D2), destino preset unsloth (D3), parametri default (D4),
-   come rendere default il provider (D5, lato qualità già ok). È l'unico edge aperto.
-4. **Build** (ticket 04, 05, 06 — blocked dal grilling).
+3. ~~Grilling 03~~ → **DECISO** (D0-D5, decision brief).
+4. **Build = FRONTIERA ATTUALE** (ticket 04, 05, 06 — ready, grilling chiuso):
+   - **05** (path binario+GGUF) e **06** (default + docs) possono partire subito.
+   - **04** (lifecycle) dipende dai path del 05 → coordinare 04+05.
 5. ~~**Qualità HITL** (ticket 07)~~ → **CHIUSA**: qualità "molto buona" senza reasoning (2026-07-15).
 
 ## Ticket Plan
@@ -110,16 +121,17 @@ Cartella: `docs/tickets/llamacpp-direct/`
 |---|------|--------|-------|
 | 01 | research | Sourcing del binario llama-server (Unsloth build vs release ufficiale) | ✅ done (`done/`) — release ufficiale CUDA, ~1.1 GB |
 | 02 | research | Contratto sidecar Tauri 2 (spawn/kill, env, bundling, porta) | ✅ done (`done/`) — externalBin + plugin-shell + RunEvent |
-| 03 | grilling | Decisioni: distribuzione, modello GGUF, preset unsloth, parametri default | **ready** (01, 02 chiusi) |
-| 04 | task | Sidecar lifecycle: spawn/health/kill di llama-server dall'app | blocked (03) |
-| 05 | task | Gestione del modello GGUF (path/download secondo grilling) | blocked (03) |
-| 06 | task | Cleanup preset unsloth + documentazione | blocked (03) |
+| 03 | grilling | Decisioni: distribuzione, modello GGUF, preset unsloth, parametri default | ✅ done (`done/`) — D0-D5, decision brief |
+| 04 | task | Sidecar lifecycle: spawn/health/kill di llama-server dall'app | **ready** (coord. con 05) |
+| 05 | task | Gestione path binario + GGUF (default espliciti) | **ready** |
+| 06 | task | Preset unsloth invariato + default llamaserver + docs | **ready** |
 | 07 | task (HITL) | Validazione qualità traduzione senza reasoning su pagine reali | ✅ done (`done/`) — qualità "molto buona", D5 risolto |
 
 ## Next Review
 
-**Prossimo passo: grilling 03 con l'utente** (01, 02, 07 chiusi). Le decisioni aperte sono di
-distribuzione/ingegneria, non più di qualità del modello: D1 (bundle ~1.1 GB vs download-on-first-run
-vs build slim sm_89), D2 (gestione GGUF), D3 (destino preset unsloth), D4 (parametri server), D5
-(come rendere default il provider diretto — lato qualità già ok). Dopo la build (04-06): misura di
-conferma col protocollo del ticket 04 latenza (pagina densa reale, prima/dopo).
+**Prossimo passo: build (ticket 04-06)**, grilling chiuso. Ordine consigliato: **05** (path binario
+stabile + GGUF, con default) → **04** (lifecycle che consuma quei path) → **06** (default provider +
+docs), oppure 05+04 insieme. Prerequisito d'implementazione dal decision brief: installare la release
+ufficiale llama.cpp in una **dir stabile** (il binario di test è in scratchpad temporaneo). Dopo la
+build: misura di conferma col protocollo del ticket 04 latenza (pagina densa reale, prima/dopo) e
+chiusura definitiva della nota L6 nella mappa latenza.

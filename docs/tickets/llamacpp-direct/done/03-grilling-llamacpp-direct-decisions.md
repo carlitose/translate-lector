@@ -4,6 +4,14 @@
 
 [llamacpp-direct-wayfinder.md](../../specs/llamacpp-direct-wayfinder.md)
 
+## Status
+
+**Done** (2026-07-15). Decisioni D0-D5 registrate in
+[decision-brief-llamacpp-direct-03.md](../../specs/decision-brief-llamacpp-direct-03.md). Sintesi:
+uso personale (niente bundling/firma); app-managed spawn/kill; path binario+GGUF espliciti in ⚙️ con
+default; preset `unsloth` mantenuto normale; parametri `8080/-ngl 99/-c 4096/--reasoning off/
+--parallel 1`; default = llama.cpp diretto con spawn on-demand. Ticket 04-06 aggiornati con le scelte.
+
 ## Type
 
 grilling
