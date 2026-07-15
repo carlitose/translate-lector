@@ -6,7 +6,8 @@ Wayfinding spec
 
 ## Status
 
-Active
+**Build completata** (2026-07-15) — tutti i 7 ticket in `done/`, suite 274 verde, 3 PR di build
+aperti (impilati). Restano solo: merge dei PR + verifica e2e GUI del ticket 04.
 
 ## Destination
 
@@ -108,10 +109,13 @@ problema, non il modello.
 1. ~~Sourcing del binario (ticket 01)~~ → **RISOLTO**: release ufficiale llama.cpp CUDA.
 2. ~~Contratto sidecar Tauri (ticket 02)~~ → **RISOLTO**: externalBin + plugin-shell + kill via RunEvent.
 3. ~~Grilling 03~~ → **DECISO** (D0-D5, decision brief).
-4. **Build = FRONTIERA ATTUALE** (ticket 04, 05, 06 — ready, grilling chiuso):
-   - **05** (path binario+GGUF) e **06** (default + docs) possono partire subito.
-   - **04** (lifecycle) dipende dai path del 05 → coordinare 04+05.
+4. ~~Build (ticket 04, 05, 06)~~ → **FATTA** (2026-07-15, autopilot): tre PR aperti su branch
+   impilati (`autopilot/05-model-management` → `04-sidecar-lifecycle` → `06-default-and-docs`),
+   suite 274 verde. Non ancora mergiati in main.
 5. ~~**Qualità HITL** (ticket 07)~~ → **CHIUSA**: qualità "molto buona" senza reasoning (2026-07-15).
+6. **Unica frontiera rimasta = verifica e2e umana con GUI** dei comportamenti runtime del ticket 04
+   (spawn reale on-demand, kill senza orfani alla chiusura, reap, reuse) — non verificabili AFK;
+   checklist nel ticket `done/04-task-sidecar-lifecycle.md`. + merge dei PR.
 
 ## Ticket Plan
 
@@ -122,16 +126,24 @@ Cartella: `docs/tickets/llamacpp-direct/`
 | 01 | research | Sourcing del binario llama-server (Unsloth build vs release ufficiale) | ✅ done (`done/`) — release ufficiale CUDA, ~1.1 GB |
 | 02 | research | Contratto sidecar Tauri 2 (spawn/kill, env, bundling, porta) | ✅ done (`done/`) — externalBin + plugin-shell + RunEvent |
 | 03 | grilling | Decisioni: distribuzione, modello GGUF, preset unsloth, parametri default | ✅ done (`done/`) — D0-D5, decision brief |
-| 04 | task | Sidecar lifecycle: spawn/health/kill di llama-server dall'app | **ready** (coord. con 05) |
-| 05 | task | Gestione path binario + GGUF (default espliciti) | **ready** |
-| 06 | task | Preset unsloth invariato + default llamaserver + docs | **ready** |
+| 04 | task | Sidecar lifecycle: spawn/health/kill di llama-server dall'app | ✅ done (`done/`) — PR `autopilot/04-sidecar-lifecycle`, e2e GUI da confermare |
+| 05 | task | Gestione path binario + GGUF (default espliciti) | ✅ done (`done/`) — PR `autopilot/05-model-management` |
+| 06 | task | Preset unsloth invariato + default llamaserver + docs | ✅ done (`done/`) — PR `autopilot/06-default-and-docs` |
 | 07 | task (HITL) | Validazione qualità traduzione senza reasoning su pagine reali | ✅ done (`done/`) — qualità "molto buona", D5 risolto |
 
 ## Next Review
 
-**Prossimo passo: build (ticket 04-06)**, grilling chiuso. Ordine consigliato: **05** (path binario
-stabile + GGUF, con default) → **04** (lifecycle che consuma quei path) → **06** (default provider +
-docs), oppure 05+04 insieme. Prerequisito d'implementazione dal decision brief: installare la release
-ufficiale llama.cpp in una **dir stabile** (il binario di test è in scratchpad temporaneo). Dopo la
-build: misura di conferma col protocollo del ticket 04 latenza (pagina densa reale, prima/dopo) e
-chiusura definitiva della nota L6 nella mappa latenza.
+**Tutti i ticket sono in `done/`; build completata dall'autopilot** (2026-07-15). Restano due passi
+umani:
+
+1. **Merge dei PR** (impilati, in quest'ordine): `autopilot/05-model-management` →
+   `autopilot/04-sidecar-lifecycle` → `autopilot/06-default-and-docs` (base: il branch della mappa
+   `docs/llamacpp-direct-wayfinder`). La release ufficiale llama.cpp è già installata nella dir
+   stabile `C:\Users\CGS03\.translate-lector\llama.cpp\`.
+2. **Verifica e2e con GUI** (checklist nel ticket `done/04-task-sidecar-lifecycle.md`): spawn
+   on-demand alla prima traduzione, kill senza orfani alla chiusura, reap all'avvio, reuse di un
+   server già sano, errori azionabili su path mancante / base_url senza porta. Poi misura di
+   conferma latenza su pagina reale.
+
+Follow-up noto (non bloccante): assunzione single-instance (PID file condiviso) → valutare
+`tauri-plugin-single-instance`.
