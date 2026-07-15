@@ -92,6 +92,48 @@ const OUTPUT_TOKENS_PER_INPUT: u32 = 2;
 /// dell'headroom di output per unità, così `prompt + output ≤ n_ctx` (guardia EC08).
 const OUTPUT_HEADROOM_SAFETY_TOKENS: u32 = 64;
 
+/// Taglia FISSA (token) delle finestre di packing delle unità (decisione L1,
+/// decision-brief-latency-03 §L1): le unità-paragrafo di [`split_into_units`]
+/// vengono impacchettate da [`pack_units`] in finestre da ~512 token PRIMA
+/// della traduzione, così il CoT del modello locale (~500 token per chiamata,
+/// misure ticket 01) si paga 1-2 volte per pagina invece di una volta per
+/// paragrafo. La taglia è una COSTANTE, NON derivata dal `budget_unit_text`
+/// dinamico: è la proprietà che rende la cache per-unità stabile ai "repack"
+/// (ticket 02: 2/2 finestre stabili a taglia fissa vs 0/2 col budget dinamico)
+/// — il packing dipende solo dal testo della pagina e da questa costante.
+/// Clampata al `budget_unit_text` corrente SOLO quando questo è più stretto di
+/// 512 (edge case: summary/glossario enormi che restringono il budget).
+const PACK_TARGET_TOKENS: u32 = 512;
+
+/// Riserva di output (token) per il **chain-of-thought** nel cap di una
+/// finestra multi-unità ([`window_output_cap`], ticket 04). Il modello locale
+/// genera ~500 token di CoT per chiamata PRIMA della traduzione (misure ticket
+/// 01): con le finestre da ~[`PACK_TARGET_TOKENS`] il solo fattore
+/// [`OUTPUT_TOKENS_PER_INPUT`] (2× l'input, l'espansione EN→IT) non basta più
+/// a coprire CoT + traduzione, e ogni troncamento pagherebbe un'intera
+/// chiamata di retry. La riserva è sommata al fattore scalato, sempre bounded
+/// da `p.max_tokens` e dall'headroom del contesto; il retry-troncamento
+/// ([`TRUNCATION_MAX_RETRIES`]) resta l'ultima rete di sicurezza.
+const COT_RESERVE_TOKENS: u32 = 512;
+
+/// Cap INIZIALE di output per una **finestra multi-unità** (ticket 04): scala
+/// col corpo (`body_tokens × OUTPUT_TOKENS_PER_INPUT`, l'espansione della
+/// traduzione) PIÙ la riserva CoT ([`COT_RESERVE_TOKENS`]), mai sotto
+/// [`OUT_UNIT_TOKENS`], sempre bounded dal `max_tokens` del provider e
+/// dall'headroom residuo del contesto (`prompt + output ≤ n_ctx`, guardia
+/// EC08). Con una finestra piena (~512 token) e i default locali (max_tokens
+/// 2048, n_ctx 4096) il cap risulta ~1536: spazio per CoT (~500) + traduzione
+/// (fino a ~2× input) senza pagare il giro extra del retry-troncamento.
+/// Funzione pura, unit-testabile.
+fn window_output_cap(body_tokens: u32, max_tokens: u32, headroom: u32) -> u32 {
+    body_tokens
+        .saturating_mul(OUTPUT_TOKENS_PER_INPUT)
+        .saturating_add(COT_RESERVE_TOKENS)
+        .max(OUT_UNIT_TOKENS)
+        .min(max_tokens)
+        .min(headroom)
+}
+
 /// Calcola `budget_unit_text` (token), la dimensione massima di un'unità di
 /// traduzione (STC-01). `budget_input = floor((n_ctx − out_unit) × (1 − margine))`,
 /// da cui si sottraggono le stime di system minimale, riassunto compatto e
@@ -284,9 +326,11 @@ fn pack_sentences(body: &str, budget: u32, ratio: f64) -> Vec<String> {
     units
 }
 
-/// PROTOTIPO (local-translation-latency ticket 02, **NON cablato** nel flusso):
-/// impacchetta unità adiacenti prodotte da [`split_into_units`] in **finestre**
-/// entro `budget` token, greedy e deterministico. Motivazione (misure ticket 01):
+/// Impacchetta unità adiacenti prodotte da [`split_into_units`] in **finestre**
+/// entro `budget` token, greedy e deterministico. Prototipata nel ticket 02 e
+/// **cablata** nel flusso di [`translate_page`] dal ticket 04, con budget
+/// [`PACK_TARGET_TOKENS`] clampato al `budget_unit_text` corrente (L1).
+/// Motivazione (misure ticket 01):
 /// il costo dominante sul provider locale è il CoT del modello, pagato **per
 /// chiamata** (~500 token scartati); ridurre il numero di chiamate riduce la
 /// latenza quasi linearmente, mentre il prefill è prefix-cached e costa ~0.
@@ -612,9 +656,12 @@ fn storage<E: std::fmt::Display>(e: E) -> LlmError {
 ///    whole page, D6);
 /// 2. `budget_unit_text` is derived from the provider `n_ctx` and the per-unit
 ///    output cap [`OUT_UNIT_TOKENS`] (STC-01) and the page is split into units
-///    with [`split_into_units`] (paragraph, sentence fallback; STC-02). A large
-///    `n_ctx` (cloud) makes the budget non-binding → **one unit = whole page**
-///    (degrade to the previous behaviour, D2);
+///    with [`split_into_units`] (paragraph, sentence fallback; STC-02), then
+///    adjacent units are **packed into fixed-size windows** with [`pack_units`]
+///    at [`PACK_TARGET_TOKENS`] clamped to the budget (ticket 04, L1) — the
+///    per-call unit is the packed window. A large `n_ctx` (cloud) makes the
+///    budget non-binding → **one unit = whole page** (degrade to the previous
+///    behaviour, D2);
 /// 3. each unit is translated with a **minimal translate-only call** — a tiny
 ///    system prompt, the compact read-only summary and only the glossary
 ///    **selected** for that unit ([`glossary::select_glossary`], locked-first,
@@ -683,12 +730,21 @@ pub fn translate_page(
     let budget_unit_text =
         compute_budget_unit_text(p.n_ctx, out_unit, system_est, summary_est, glossary_est, BUDGET_MARGIN);
 
-    // Split the page into budget-sized units (STC-02). `split_into_units` always
-    // splits blank-line paragraphs into separate units; the budget only forces
-    // further sentence-splitting of an oversized paragraph. With a single-
-    // paragraph page and a large n_ctx (cloud) this yields ONE unit = whole page
-    // → the previous whole-page behaviour (degrade, D2).
-    let units = split_into_units(p.page_text, budget_unit_text, ratio);
+    // Split the page into budget-sized units (STC-02), then PACK adjacent units
+    // into fixed-size windows (ticket 04, L1): the per-call unit becomes the
+    // packed window, so a dense page costs 1-2 LLM calls instead of one per
+    // paragraph (the local model's ~500-token CoT is paid per call). The pack
+    // budget is the FIXED constant, clamped to `budget_unit_text` only when the
+    // dynamic budget is tighter (L1 clamp) — so the windows depend only on the
+    // page text and the constant, keeping the per-unit cache stable across
+    // repacks. With a single-paragraph page and a large n_ctx (cloud) this
+    // still yields ONE unit = whole page → the previous whole-page behaviour
+    // (degrade, D2).
+    let units = pack_units(
+        split_into_units(p.page_text, budget_unit_text, ratio),
+        PACK_TARGET_TOKENS.min(budget_unit_text),
+        ratio,
+    );
 
     let mut translated_units: Vec<String> = Vec::with_capacity(units.len());
     let mut total_tokens_sum: i64 = 0;
@@ -762,17 +818,18 @@ pub fn translate_page(
         // page is strictly worse than a retried one; equivalence is preserved for
         // the common case by starting at `p.max_tokens`, and truncation there now
         // triggers a bounded retry (grown budget) rather than accepting a partial.
-        // On the multi-unit path the cap defaults to the small `out_unit`, grows
-        // for a large unit (translation may expand, e.g. EN→IT), and is always
-        // bounded by the remaining context window so `prompt + output ≤ n_ctx` —
-        // a large paragraph on cloud is NOT truncated (huge headroom), while local
-        // units stay small.
+        // On the multi-unit path the cap scales with the packed window's body
+        // (translation may expand, e.g. EN→IT) PLUS the CoT reserve (ticket 04:
+        // ~500 reasoning tokens are emitted before the translation on the local
+        // model, so 2× input alone would truncate a full 512-token window), is
+        // never below `out_unit`, and is always bounded by the remaining context
+        // window so `prompt + output ≤ n_ctx` — a large window on cloud is NOT
+        // truncated (huge headroom), while local windows stay bounded
+        // (~1536 ≤ max_tokens 2048 with the local defaults).
         let initial_max_tokens = if units.len() == 1 {
             p.max_tokens
         } else {
-            let body_tokens = est_tokens(body, ratio);
-            let scaled = body_tokens.saturating_mul(OUTPUT_TOKENS_PER_INPUT).max(out_unit);
-            scaled.min(p.max_tokens).min(headroom)
+            window_output_cap(est_tokens(body, ratio), p.max_tokens, headroom)
         };
 
         // Translate the unit, RETRYING a truncated completion with a larger output
@@ -1095,11 +1152,44 @@ mod tests {
         }
     }
 
-    /// A two-paragraph page (blank-line separated) → two units under any budget.
-    /// Each paragraph mentions a different glossary term so per-unit selection is
-    /// observable.
-    fn two_paragraphs() -> &'static str {
-        "The board met today.\n\nEvery shareholder was paid."
+    /// Un paragrafo "grande" (~340 token) con una frase-guida in testa. Col
+    /// packing cablato (ticket 04) due paragrafi piccoli collasserebbero in UNA
+    /// finestra da [`PACK_TARGET_TOKENS`]: due paragrafi così superano insieme
+    /// i 512 token, quindi restano finestre separate e le fixture multi-unità
+    /// continuano a esercitare il percorso multi-finestra. Il riempimento non
+    /// contiene termini di glossario né confini di paragrafo.
+    fn big_para(lead: &str) -> String {
+        format!(
+            "{lead} {}",
+            "Testo di riempimento neutro che tiene il paragrafo sopra la soglia di packing. "
+                .repeat(17)
+        )
+        .trim_end()
+        .to_string()
+    }
+
+    /// A two-paragraph page (blank-line separated) → two units under any budget
+    /// AND two packed windows (each paragraph is ~340 tokens, so the pair
+    /// exceeds `PACK_TARGET_TOKENS`). Each paragraph mentions a different
+    /// glossary term so per-unit selection is observable.
+    fn two_paragraphs() -> String {
+        format!(
+            "{}\n\n{}",
+            big_para("The board met today."),
+            big_para("Every shareholder was paid.")
+        )
+    }
+
+    /// A three-paragraph page whose paragraphs stay THREE separate packed
+    /// windows (each ~340 tokens, any adjacent pair exceeds
+    /// `PACK_TARGET_TOKENS`), with distinct AAA/BBB/CCC markers.
+    fn three_paragraphs() -> String {
+        format!(
+            "{}\n\n{}\n\n{}",
+            big_para("AAA uno."),
+            big_para("BBB due."),
+            big_para("CCC tre.")
+        )
     }
 
     /// A response with empty content and `finish_reason == "length"` — the EC08
@@ -1436,11 +1526,12 @@ mod tests {
     fn degraded_shape_is_reused_by_later_units_no_reprobe() {
         let c = conn();
         seed_session(&c);
-        // Two paragraphs + small n_ctx -> two translate-only units.
+        // Two big paragraphs + small n_ctx -> two packed translate-only windows.
         let page = two_paragraphs();
-        assert!(
-            split_into_units(page, 4096, RATIO).len() >= 2,
-            "precondition: multiple units"
+        assert_eq!(
+            pack_units(split_into_units(&page, 4096, RATIO), PACK_TARGET_TOKENS, RATIO).len(),
+            2,
+            "precondition: two packed windows"
         );
 
         let client = MockClient::new(vec![
@@ -1453,7 +1544,7 @@ mod tests {
             Ok(resp(&content_with("ignored", "s", &[]), 10)),
         ]);
 
-        let out = translate_page(&c, &client, &params_small(page)).unwrap();
+        let out = translate_page(&c, &client, &params_small(&page)).unwrap();
 
         assert_eq!(client.calls(), 4, "unit1: 2 calls; unit2: 1 call; perceptor: 1 call");
         assert!(out.translated_text.contains("PART0") && out.translated_text.contains("PART1"));
@@ -1678,16 +1769,18 @@ mod tests {
         assert_eq!(compute_budget_unit_text(100, 768, 50, 50, 50, BUDGET_MARGIN), MIN_BUDGET_UNIT_TEXT);
     }
 
-    /// Small context + a multi-paragraph page → several translate-only units, one
-    /// call each, plus a single perceptor call; the translated units recompose in
-    /// order (AC: split → translate → reassemble).
+    /// Small context + a multi-paragraph page → several translate-only calls
+    /// (one per PACKED window since ticket 04, not per paragraph), plus a single
+    /// perceptor call; the translated windows recompose in order (AC: split →
+    /// pack → translate → reassemble). The three big paragraphs stay three
+    /// windows here, so the multi-window path is exercised.
     #[test]
     fn small_context_splits_page_into_units_and_recomposes() {
         let c = conn();
         seed_session(&c);
-        let page = "AAA primo paragrafo.\n\nBBB secondo paragrafo.\n\nCCC terzo paragrafo.";
-        let n = split_into_units(page, 4096, RATIO).len();
-        assert!(n >= 3, "precondition: three paragraph units, got {n}");
+        let page = three_paragraphs();
+        let n = pack_units(split_into_units(&page, 4096, RATIO), PACK_TARGET_TOKENS, RATIO).len();
+        assert_eq!(n, 3, "precondition: three packed windows, got {n}");
 
         // One plain translation per unit + one perceptor-update for the page.
         let mut responses: Vec<_> = (0..n)
@@ -1696,9 +1789,9 @@ mod tests {
         responses.push(Ok(resp(&content_with("ignored", "riassunto finale", &[]), 7)));
         let client = MockClient::new(responses);
 
-        let out = translate_page(&c, &client, &params_small(page)).unwrap();
+        let out = translate_page(&c, &client, &params_small(&page)).unwrap();
 
-        assert_eq!(client.calls(), n + 1, "one call per unit + one perceptor call");
+        assert_eq!(client.calls(), n + 1, "one call per packed window + one perceptor call");
         for i in 0..n {
             assert!(out.translated_text.contains(&format!("T{i}")), "T{i} present");
         }
@@ -1738,13 +1831,25 @@ mod tests {
             Ok(resp("T due", 10)),  // unit 1
             Ok(resp(&content_with("ignored", "s", &[]), 5)), // perceptor
         ]);
-        translate_page(&c, &client, &params_small(two_paragraphs())).unwrap();
+        let page = two_paragraphs();
+        translate_page(&c, &client, &params_small(&page)).unwrap();
 
-        assert_eq!(client.calls(), 3, "two units + one perceptor");
+        assert_eq!(client.calls(), 3, "two windows + one perceptor");
         let reqs = client.requests.borrow();
-        // Multi-unit path → the small out_unit cap on every unit request.
-        assert_eq!(reqs[0].max_tokens, OUT_UNIT_TOKENS, "unit 0 uses the small out_unit cap");
-        assert_eq!(reqs[1].max_tokens, OUT_UNIT_TOKENS, "unit 1 uses the small out_unit cap");
+        // Multi-window path (ticket 04): il cap per finestra scala col corpo
+        // della finestra (2×) PIÙ la riserva CoT — non più il piccolo out_unit
+        // fisso — e resta ben sotto il max_tokens di pagina (2048) e n_ctx.
+        let windows = pack_units(split_into_units(&page, 4096, RATIO), PACK_TARGET_TOKENS, RATIO);
+        for (i, w) in windows.iter().enumerate() {
+            // Stesso calcolo del flusso reale (window_output_cap), con headroom
+            // volutamente non vincolante in questo scenario (prompt piccolo vs
+            // n_ctx 4096) — così il test non duplica la formula in lockstep.
+            let expected = window_output_cap(est_tokens(w.trim_end(), RATIO), 2048, u32::MAX);
+            assert_eq!(
+                reqs[i].max_tokens, expected,
+                "finestra {i}: cap dal window_output_cap (corpo×2 + riserva CoT)"
+            );
+        }
         // The invariant that actually prevents EC08: prompt + output <= n_ctx.
         for r in [&reqs[0], &reqs[1]] {
             let prompt_est: u32 = r.messages.iter().map(|m| est_tokens(&m.content, RATIO)).sum();
@@ -1851,7 +1956,8 @@ lines, so it stays a single translation unit even though it is not short.";
             Ok(resp("T due", 10)),
             Ok(resp(&content_with("ignored", "s", &[]), 10)),
         ]);
-        translate_page(&c, &client, &params_small(two_paragraphs())).unwrap();
+        let page = two_paragraphs();
+        translate_page(&c, &client, &params_small(&page)).unwrap();
         let perceptor_calls = client
             .requests
             .borrow()
@@ -1868,7 +1974,7 @@ lines, so it stays a single translation unit even though it is not short.";
             document_id: 1,
             page_number: 5,
             target_language: "it",
-            page_text: two_paragraphs(),
+            page_text: &page,
             model: "local-model",
             max_tokens: 2048,
             n_ctx: 4096,
@@ -1899,7 +2005,8 @@ lines, so it stays a single translation unit even though it is not short.";
             // Perceptor advances the summary — this must NOT leak into the units.
             Ok(resp(&content_with("ignored", "RIASSUNTO-AVANZATO.", &[]), 10)),
         ]);
-        translate_page(&c, &client, &params_small(two_paragraphs())).unwrap();
+        let page = two_paragraphs();
+        translate_page(&c, &client, &params_small(&page)).unwrap();
 
         let p0 = client.user_prompt(0);
         let p1 = client.user_prompt(1);
@@ -1916,7 +2023,8 @@ lines, so it stays a single translation unit even though it is not short.";
         seed_session(&c);
         let client = MockClient::new(vec![Ok(resp_length())]); // first unit exhausts the budget
 
-        let err = translate_page(&c, &client, &params_small(two_paragraphs())).unwrap_err();
+        let page = two_paragraphs();
+        let err = translate_page(&c, &client, &params_small(&page)).unwrap_err();
         assert!(matches!(err, LlmError::OutputBudgetExhausted(_)), "EC08 surfaces per unit");
         assert!(err.user_message().contains("EC08"));
 
@@ -1981,7 +2089,8 @@ lines, so it stays a single translation unit even though it is not short.";
             Ok(resp_truncated("part 1 e 2 e 3", 10)),
         ]);
 
-        let err = translate_page(&c, &client, &params_small(two_paragraphs())).unwrap_err();
+        let page = two_paragraphs();
+        let err = translate_page(&c, &client, &params_small(&page)).unwrap_err();
         assert!(
             matches!(err, LlmError::OutputBudgetExhausted(_)),
             "persistent truncation escalates to EC08, got {err:?}"
@@ -2008,7 +2117,8 @@ lines, so it stays a single translation unit even though it is not short.";
             Ok(resp("PART1", 10)),                    // unit 1
             Ok(resp(&content_with("ignored", "s", &[]), 10)), // perceptor
         ]);
-        translate_page(&c, &client, &params_small(two_paragraphs())).unwrap();
+        let page = two_paragraphs();
+        translate_page(&c, &client, &params_small(&page)).unwrap();
 
         let reqs = client.requests.borrow();
         // The retried request (index 1) grew but still fits within n_ctx=4096.
@@ -2397,6 +2507,195 @@ fixed({fixed}) windows: a={} b={} stable={fixed_stable}",
         );
     }
 
+    // --- Ticket 04: packing cablato nella pipeline ---------------------------
+
+    /// Le finestre che la pipeline produrrà per `page` coi parametri locali di
+    /// `params_small`: split a un budget ampio (ogni paragrafo delle fixture è
+    /// ben sotto il `budget_unit_text` interno ~2200, quindi lo split è
+    /// identico) e packing alla costante L1.
+    fn expected_windows(page: &str) -> Vec<String> {
+        pack_units(split_into_units(page, 4096, RATIO), PACK_TARGET_TOKENS, RATIO)
+    }
+
+    /// Pagina densa (18 paragrafi piccoli) + n_ctx locale → le chiamate LLM sono
+    /// UNA PER FINESTRA impacchettata (1-2 per pagina) + il perceptor, NON una
+    /// per paragrafo (le ~18+1 di prima del ticket 04).
+    #[test]
+    fn dense_page_translates_in_few_packed_windows_not_one_call_per_paragraph() {
+        let c = conn();
+        seed_session(&c);
+        let page = sample_dense_page();
+        let windows = expected_windows(&page);
+        assert!(
+            (1..=2).contains(&windows.len()),
+            "precondition L1: la pagina densa impacchetta in 1-2 finestre, got {}",
+            windows.len()
+        );
+
+        let mut responses: Vec<_> = (0..windows.len())
+            .map(|i| Ok(resp(&format!("W{i}"), 10)))
+            .collect();
+        responses.push(Ok(resp(&content_with("ignored", "s", &[]), 7)));
+        let client = MockClient::new(responses);
+
+        let out = translate_page(&c, &client, &params_small(&page)).unwrap();
+
+        assert_eq!(
+            client.calls(),
+            windows.len() + 1,
+            "una chiamata per FINESTRA impacchettata + il perceptor (non 18+1)"
+        );
+        for i in 0..windows.len() {
+            assert!(out.translated_text.contains(&format!("W{i}")), "W{i} presente");
+        }
+    }
+
+    /// Round-trip strutturale: il mock "traduce" ogni finestra restituendo il
+    /// corpo ricevuto (echo) → il testo ricomposto è byte-identico alla pagina:
+    /// i separatori di paragrafo DENTRO le finestre viaggiano col testo e tutti
+    /// i 18 paragrafi restano nell'ordine giusto.
+    #[test]
+    fn packed_windows_roundtrip_preserves_all_paragraphs_in_order() {
+        let c = conn();
+        seed_session(&c);
+        let page = sample_dense_page();
+        let windows = expected_windows(&page);
+
+        let mut responses: Vec<_> = windows
+            .iter()
+            .map(|w| Ok(resp(split_unit_body_sep(w).0, 10)))
+            .collect();
+        responses.push(Ok(resp(&content_with("ignored", "s", &[]), 7)));
+        let client = MockClient::new(responses);
+
+        let out = translate_page(&c, &client, &params_small(&page)).unwrap();
+
+        assert_eq!(out.translated_text, page, "echo → ricomposizione byte-identica");
+        let mut last = 0usize;
+        for i in 1..=18 {
+            let marker = format!("Paragrafo {i}:");
+            let pos = out
+                .translated_text
+                .find(&marker)
+                .unwrap_or_else(|| panic!("{marker} deve essere presente"));
+            assert!(pos >= last, "{marker} nell'ordine originale");
+            last = pos;
+        }
+    }
+
+    /// Transizione dalla cache PER-PARAGRAFO (scritta dalla versione precedente
+    /// del flusso) alla cache PER-FINESTRA: le vecchie righe (18 unit_index con
+    /// l'hash dei singoli paragrafi) NON vengono mai servite (hash diverso →
+    /// MISS), le finestre vengono tradotte e sovrascritte via UPSERT, e
+    /// `unit_cache_prune` elimina le righe in coda oltre il nuovo unit_count.
+    #[test]
+    fn per_paragraph_cache_rows_transition_to_per_window_rows() {
+        let c = conn();
+        seed_session(&c);
+        let page = sample_dense_page();
+
+        // Semina la cache come l'avrebbe scritta la versione per-paragrafo.
+        let paragraphs = split_into_units(&page, 4096, RATIO);
+        assert!(paragraphs.len() >= 15, "precondition: molte unità per-paragrafo");
+        for (i, u) in paragraphs.iter().enumerate() {
+            let body = split_unit_body_sep(u).0;
+            c.execute(
+                "INSERT INTO unit_translations
+                     (document_id, page_number, unit_index, target_language, source_hash, translated_text, created_at)
+                 VALUES (1, 3, ?1, 'it', ?2, ?3, '2026-01-01T00:00:00Z')",
+                params![i as i64, source_hash(body), format!("OLD{i}")],
+            )
+            .unwrap();
+        }
+        assert_eq!(unit_rows(&c), paragraphs.len() as i64, "cache per-paragrafo seminata");
+
+        let windows = expected_windows(&page);
+        let mut responses: Vec<_> = (0..windows.len())
+            .map(|i| Ok(resp(&format!("NEW{i}"), 10)))
+            .collect();
+        responses.push(Ok(resp(&content_with("ignored", "s", &[]), 7)));
+        let client = MockClient::new(responses);
+
+        let out = translate_page(&c, &client, &params_small(&page)).unwrap();
+
+        assert_eq!(
+            client.calls(),
+            windows.len() + 1,
+            "le vecchie righe per-paragrafo sono MISS per hash: ogni finestra è tradotta"
+        );
+        assert!(!out.translated_text.contains("OLD"), "nessuna riga stale servita");
+        for i in 0..windows.len() {
+            assert!(out.translated_text.contains(&format!("NEW{i}")), "NEW{i} presente");
+        }
+        assert_eq!(
+            unit_rows(&c),
+            windows.len() as i64,
+            "UPSERT sulle prime finestre + prune delle righe oltre il nuovo unit_count"
+        );
+    }
+
+    /// Clamp L1: quando `budget_unit_text` è più stretto di PACK_TARGET_TOKENS
+    /// (qui n_ctx minuscolo → il budget degenera al floor MIN_BUDGET_UNIT_TEXT
+    /// = 256 < 512), le finestre rispettano il budget più stretto, non la
+    /// costante: due paragrafi da ~195 token (assieme ~390 ≤ 512 ma > 256) NON
+    /// vengono impacchettati insieme.
+    #[test]
+    fn pack_budget_is_clamped_to_a_tighter_unit_budget() {
+        let c = conn();
+        seed_session(&c);
+        let filler =
+            "testo di prova che riempie il paragrafo fino a circa duecento token stimati. "
+                .repeat(10);
+        let page = format!("Alfa. {}\n\nBeta. {}", filler.trim_end(), filler.trim_end());
+        // Sanity: la coppia sta sotto la costante 512 ma sopra il floor 256.
+        let pair_tokens = est_tokens(page.trim(), RATIO);
+        assert!(
+            pair_tokens > MIN_BUDGET_UNIT_TEXT && pair_tokens <= PACK_TARGET_TOKENS,
+            "fixture calibrata male: {pair_tokens} token"
+        );
+
+        let client = MockClient::new(vec![
+            Ok(resp("W0", 10)),
+            Ok(resp("W1", 10)),
+            Ok(resp(&content_with("ignored", "s", &[]), 7)),
+        ]);
+        let p = TranslateParams {
+            document_id: 1,
+            page_number: 3,
+            target_language: "it",
+            page_text: &page,
+            model: "local-model",
+            max_tokens: 2048,
+            n_ctx: 1200, // budget_unit_text degenera al floor 256 (< 512)
+            update_context: true,
+        };
+        let out = translate_page(&c, &client, &p).unwrap();
+
+        assert_eq!(
+            client.calls(),
+            3,
+            "due finestre (budget clampato a 256) + perceptor; senza clamp sarebbero 1+1"
+        );
+        assert!(out.translated_text.contains("W0") && out.translated_text.contains("W1"));
+    }
+
+    /// Dimensionamento output per finestra (ticket 04): con una finestra piena
+    /// (~512 token) il cap iniziale lascia spazio a CoT (~500 misurati) +
+    /// traduzione (~2× input) — ≥ ~1500 quando headroom e max_tokens lo
+    /// consentono — e resta sempre ≤ headroom e ≤ max_tokens; le finestre
+    /// piccole tengono il floor out_unit.
+    #[test]
+    fn window_output_cap_reserves_cot_and_respects_bounds() {
+        // Finestra piena, default locali: 512×2 + 512 = 1536 ≥ ~1500.
+        assert_eq!(window_output_cap(512, 2048, 3000), 1536);
+        // Bounded dall'headroom residuo del contesto (prompt+output ≤ n_ctx)...
+        assert_eq!(window_output_cap(512, 2048, 1200), 1200);
+        // ...e dal max_tokens del provider.
+        assert_eq!(window_output_cap(512, 1024, 3000), 1024);
+        // Finestra piccola: mai sotto il floor OUT_UNIT_TOKENS.
+        assert_eq!(window_output_cap(10, 2048, 3000), OUT_UNIT_TOKENS);
+    }
+
     // --- STC-09: per-unit resume cache --------------------------------------
 
     fn unit_rows(c: &Connection) -> i64 {
@@ -2424,8 +2723,12 @@ fixed({fixed}) windows: a={} b={} stable={fixed_stable}",
     fn perceptor_failure_caches_page_and_units_retry_is_a_cache_hit() {
         let c = conn();
         seed_session(&c);
-        let page = two_paragraphs(); // two units under small n_ctx
-        assert_eq!(split_into_units(page, 4096, RATIO).len(), 2, "precondition: two units");
+        let page = two_paragraphs(); // two packed windows under small n_ctx
+        assert_eq!(
+            pack_units(split_into_units(&page, 4096, RATIO), PACK_TARGET_TOKENS, RATIO).len(),
+            2,
+            "precondition: two packed windows"
+        );
 
         // Run 1: both units OK, then the perceptor fails twice -> soft-swallowed.
         let client1 = MockClient::new(vec![
@@ -2434,7 +2737,7 @@ fixed({fixed}) windows: a={} b={} stable={fixed_stable}",
             Ok(resp("not json", 10)),       // perceptor malformed
             Ok(resp("still not json", 10)), // correction still malformed
         ]);
-        let out1 = translate_page(&c, &client1, &params_small(page)).unwrap();
+        let out1 = translate_page(&c, &client1, &params_small(&page)).unwrap();
         assert!(out1.translated_text.contains("UNO") && out1.translated_text.contains("DUE"));
         assert_eq!(out1.updated_summary, None, "summary not advanced by the failed perceptor");
 
@@ -2445,7 +2748,7 @@ fixed({fixed}) windows: a={} b={} stable={fixed_stable}",
 
         // Run 2 (retry): the page is a cache HIT -> ZERO model calls.
         let client2 = MockClient::new(vec![]); // any call panics on the empty queue
-        let out2 = translate_page(&c, &client2, &params_small(page)).unwrap();
+        let out2 = translate_page(&c, &client2, &params_small(&page)).unwrap();
         assert!(out2.from_cache, "healed page served from the page-level cache");
         assert_eq!(client2.calls(), 0, "retry makes no model call");
         assert_eq!(
@@ -2467,7 +2770,7 @@ fixed({fixed}) windows: a={} b={} stable={fixed_stable}",
             Ok(resp("UNO", 10)),
             Err(LlmError::Http("boom".into())),
         ]);
-        let err = translate_page(&c, &client1, &params_small(page)).unwrap_err();
+        let err = translate_page(&c, &client1, &params_small(&page)).unwrap_err();
         assert!(matches!(err, LlmError::Http(_)));
         assert_eq!(unit_rows(&c), 1, "only the first (successful) unit is cached");
         assert_eq!(page_rows(&c), 0, "page not cached");
@@ -2477,7 +2780,7 @@ fixed({fixed}) windows: a={} b={} stable={fixed_stable}",
             Ok(resp("DUE", 10)),
             Ok(resp(&content_with("ignored", "s", &[]), 10)),
         ]);
-        let out = translate_page(&c, &client2, &params_small(page)).unwrap();
+        let out = translate_page(&c, &client2, &params_small(&page)).unwrap();
         assert_eq!(client2.calls(), 2, "unit 0 reused; only unit 1 + perceptor called");
         assert!(out.translated_text.contains("UNO") && out.translated_text.contains("DUE"));
         assert!(out.translated_text.find("UNO").unwrap() < out.translated_text.find("DUE").unwrap());
@@ -2489,8 +2792,12 @@ fixed({fixed}) windows: a={} b={} stable={fixed_stable}",
     fn changing_one_unit_source_invalidates_only_that_unit() {
         let c = conn();
         seed_session(&c);
-        let page1 = "AAA uno.\n\nBBB due.\n\nCCC tre.";
-        assert_eq!(split_into_units(page1, 4096, RATIO).len(), 3, "precondition: three units");
+        let page1 = three_paragraphs();
+        assert_eq!(
+            pack_units(split_into_units(&page1, 4096, RATIO), PACK_TARGET_TOKENS, RATIO).len(),
+            3,
+            "precondition: three packed windows"
+        );
 
         let client1 = MockClient::new(vec![
             Ok(resp("T0", 10)),
@@ -2498,16 +2805,21 @@ fixed({fixed}) windows: a={} b={} stable={fixed_stable}",
             Ok(resp("T2", 10)),
             Ok(resp(&content_with("ignored", "s1", &[]), 10)),
         ]);
-        translate_page(&c, &client1, &params_small(page1)).unwrap();
-        assert_eq!(client1.calls(), 4, "first run: three units + perceptor");
+        translate_page(&c, &client1, &params_small(&page1)).unwrap();
+        assert_eq!(client1.calls(), 4, "first run: three windows + perceptor");
 
         // Only the middle paragraph changes; boundaries (and thus indices) hold.
-        let page2 = "AAA uno.\n\nXXX due modificato.\n\nCCC tre.";
+        let page2 = format!(
+            "{}\n\n{}\n\n{}",
+            big_para("AAA uno."),
+            big_para("XXX due modificato."),
+            big_para("CCC tre.")
+        );
         let client2 = MockClient::new(vec![
             Ok(resp("T1-nuovo", 10)),                          // only the changed unit
             Ok(resp(&content_with("ignored", "s2", &[]), 10)), // perceptor re-runs
         ]);
-        let out = translate_page(&c, &client2, &params_small(page2)).unwrap();
+        let out = translate_page(&c, &client2, &params_small(&page2)).unwrap();
 
         assert_eq!(client2.calls(), 2, "only the changed unit + perceptor; unchanged units reused");
         assert!(out.translated_text.contains("T0"), "unit 0 reused from cache");
@@ -2529,7 +2841,7 @@ fixed({fixed}) windows: a={} b={} stable={fixed_stable}",
             Ok(resp("DUE", 10)),
             Ok(resp(&content_with("ignored", "s", &[]), 10)),
         ]);
-        translate_page(&c, &it, &params_small(page)).unwrap();
+        translate_page(&c, &it, &params_small(&page)).unwrap();
 
         // Same page/indices but a different target language -> all units miss.
         let fr = MockClient::new(vec![
@@ -2539,7 +2851,7 @@ fixed({fixed}) windows: a={} b={} stable={fixed_stable}",
         ]);
         let p_fr = TranslateParams {
             target_language: "fr",
-            ..params_small(page)
+            ..params_small(&page)
         };
         let out = translate_page(&c, &fr, &p_fr).unwrap();
 
@@ -2568,7 +2880,7 @@ fixed({fixed}) windows: a={} b={} stable={fixed_stable}",
     /// full run.
     #[test]
     fn cached_reassembly_matches_the_uncached_result() {
-        let page = "AAA uno.\n\nBBB due.\n\nCCC tre.";
+        let page = three_paragraphs();
 
         // Fresh full run (no per-unit reuse).
         let ca = conn();
@@ -2579,7 +2891,7 @@ fixed({fixed}) windows: a={} b={} stable={fixed_stable}",
             Ok(resp("T2", 10)),
             Ok(resp(&content_with("ignored", "s", &[]), 10)),
         ]);
-        let out_a = translate_page(&ca, &a, &params_small(page)).unwrap();
+        let out_a = translate_page(&ca, &a, &params_small(&page)).unwrap();
 
         // A run where a UNIT fails mid-page (earlier units cached, page NOT
         // cached), then a retry that re-translates only the missing unit and
@@ -2591,12 +2903,12 @@ fixed({fixed}) windows: a={} b={} stable={fixed_stable}",
             Ok(resp("T1", 10)),
             Err(LlmError::Http("boom".into())), // unit 2 fails -> page aborts
         ]);
-        translate_page(&cb, &b1, &params_small(page)).unwrap_err();
+        translate_page(&cb, &b1, &params_small(&page)).unwrap_err();
         let b2 = MockClient::new(vec![
             Ok(resp("T2", 10)),                               // only the missing unit
             Ok(resp(&content_with("ignored", "s", &[]), 10)), // perceptor
         ]);
-        let out_b = translate_page(&cb, &b2, &params_small(page)).unwrap();
+        let out_b = translate_page(&cb, &b2, &params_small(&page)).unwrap();
 
         assert_eq!(
             out_b.translated_text, out_a.translated_text,
@@ -2609,20 +2921,20 @@ fixed({fixed}) windows: a={} b={} stable={fixed_stable}",
     fn shrinking_page_prunes_orphan_unit_rows() {
         let c = conn();
         seed_session(&c);
-        let page3 = "AAA uno.\n\nBBB due.\n\nCCC tre.";
+        let page3 = three_paragraphs();
         let client1 = MockClient::new(vec![
             Ok(resp("T0", 10)),
             Ok(resp("T1", 10)),
             Ok(resp("T2", 10)),
             Ok(resp(&content_with("ignored", "s", &[]), 10)),
         ]);
-        translate_page(&c, &client1, &params_small(page3)).unwrap();
+        translate_page(&c, &client1, &params_small(&page3)).unwrap();
         assert_eq!(unit_rows(&c), 3, "three units cached");
 
         // The page now has only two paragraphs (same first two bodies -> HITs).
-        let page2 = "AAA uno.\n\nBBB due.";
+        let page2 = format!("{}\n\n{}", big_para("AAA uno."), big_para("BBB due."));
         let client2 = MockClient::new(vec![Ok(resp(&content_with("ignored", "s", &[]), 10))]);
-        translate_page(&c, &client2, &params_small(page2)).unwrap();
+        translate_page(&c, &client2, &params_small(&page2)).unwrap();
         assert_eq!(client2.calls(), 1, "two units reused; only the perceptor called");
         assert_eq!(unit_rows(&c), 2, "the orphan third unit row was pruned");
     }
