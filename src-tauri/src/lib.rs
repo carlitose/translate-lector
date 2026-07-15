@@ -268,6 +268,44 @@ fn list_providers() -> Vec<settings::ProviderConfig> {
     settings::provider_presets()
 }
 
+/// Path-validation status for a provider's llama-server binary + GGUF model
+/// (ticket 05). Feeds the ⚙️ "trovato/mancante" indicator; `error` carries the
+/// actionable Italian message when either path is missing. Does NOT spawn.
+#[derive(serde::Serialize)]
+struct LlamaPathStatus {
+    /// Resolved binary path (preset default or user override).
+    binary_path: String,
+    /// Resolved GGUF model path (preset default or user override).
+    model_path: String,
+    /// Whether the resolved binary path exists on disk.
+    binary_exists: bool,
+    /// Whether the resolved model path exists on disk.
+    model_exists: bool,
+    /// Actionable error when a path is missing; `null` when both are present.
+    error: Option<String>,
+}
+
+/// Resolve a provider's binary/model paths (override + preset) and report whether
+/// each exists, plus the actionable error the ticket-04 spawner would surface.
+#[tauri::command]
+fn validate_provider_paths(
+    app: tauri::AppHandle,
+    provider_id: String,
+) -> Result<LlamaPathStatus, String> {
+    let conn = open_db(&app)?;
+    let cfg = settings::get_provider_config(&conn, &provider_id).map_err(|e| e.to_string())?;
+    let binary_exists = settings::path_configured_and_exists(&cfg.binary_path);
+    let model_exists = settings::path_configured_and_exists(&cfg.model_path);
+    let error = settings::validate_llama_paths(&cfg.binary_path, &cfg.model_path).err();
+    Ok(LlamaPathStatus {
+        binary_path: cfg.binary_path,
+        model_path: cfg.model_path,
+        binary_exists,
+        model_exists,
+        error,
+    })
+}
+
 /// Read the default target language for new documents (§3.5, D4), falling back
 /// to the default ("it") when unset.
 #[tauri::command]
@@ -665,6 +703,7 @@ pub fn run() {
             set_active_provider,
             get_provider_config,
             list_providers,
+            validate_provider_paths,
             get_default_target_language,
             clear_translations_cache,
             get_data_dir,

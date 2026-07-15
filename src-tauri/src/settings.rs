@@ -156,6 +156,31 @@ pub const DEFAULT_TIMEOUT_SECS_CLOUD: u32 = 30;
 /// (`provider.<id>.timeout_secs`).
 pub const DEFAULT_TIMEOUT_SECS_LOCAL: u32 = 180;
 
+/// Default `binary_path` per il preset `llamaserver` (ticket 05, assunzione 1).
+/// Casa **stabile** del binario: FUORI dalla dir temporanea e dal repo git. La
+/// release ufficiale llama.cpp (llama-server.exe + DLL CUDA sorelle) va copiata
+/// qui una volta sola. NON puntare al build Unsloth: dipende dalle DLL del venv
+/// di Studio, la dipendenza che questa mappa sta rimuovendo.
+pub const DEFAULT_LLAMASERVER_BINARY_PATH: &str =
+    r"C:\Users\CGS03\.translate-lector\llama.cpp\llama-server.exe";
+
+/// Default `model_path` per il preset `llamaserver` (ticket 05, D2). Path
+/// **esplicito** al GGUF gemma-4 già in cache HuggingFace — NON auto-glob: l'hash
+/// di snapshot nel path è fragile (cambia se si ri-scarica il modello) e in cache
+/// può esserci più di un GGUF, quindi un default esplicito rende chiaro quale file
+/// è in uso.
+pub const DEFAULT_LLAMASERVER_MODEL_PATH: &str =
+    r"C:\Users\CGS03\.cache\huggingface\hub\models--unsloth--gemma-4-E2B-it-qat-GGUF\snapshots\2ea637031baa8dc847d64b5dbb7011fd6a445849\gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf";
+
+/// Messaggio d'errore azionabile (ticket 05) quando il binario llama-server
+/// configurato non esiste sul disco: indirizza l'utente a ⚙️ invece di uno spawn
+/// opaco (D2).
+pub const LLAMA_BINARY_MISSING_MSG: &str = "Binario llama-server non trovato: imposta il path in ⚙️";
+
+/// Messaggio d'errore azionabile (ticket 05) quando il file GGUF configurato non
+/// esiste sul disco.
+pub const LLAMA_MODEL_MISSING_MSG: &str = "Modello GGUF non trovato: imposta il path in ⚙️";
+
 /// A selectable LLM provider: identità + endpoint + modello. `base_url` e `model`
 /// hanno default built-in ma sono overridabili (persistiti in `settings`); per i
 /// provider locali `model` parte vuoto ed è scelto poi a mano (free-text).
@@ -181,6 +206,15 @@ pub struct ProviderConfig {
     /// = default implicito reqwest invariato; locale 180s, generoso per
     /// l'inferenza lenta).
     pub timeout_secs: u32,
+    /// Path locale del binario `llama-server` (ticket 05, provider `llamaserver`).
+    /// Default precompilato alla casa stabile del binario ufficiale; vuoto per gli
+    /// altri provider. Override utente in `provider.<id>.binary_path`. Consumato
+    /// dallo spawner del ticket 04 (`-m` + binario), non lanciato qui.
+    pub binary_path: String,
+    /// Path locale del file GGUF (ticket 05, provider `llamaserver`). Default
+    /// precompilato al GGUF esplicito in cache HF (D2, niente auto-glob); vuoto per
+    /// gli altri provider. Override utente in `provider.<id>.model_path`.
+    pub model_path: String,
 }
 
 /// Built-in provider presets (design §2, research §5/§Q3). Le base-URL locali
@@ -197,6 +231,8 @@ pub fn provider_presets() -> Vec<ProviderConfig> {
             max_tokens: DEFAULT_MAX_TOKENS_CLOUD,
             n_ctx: DEFAULT_N_CTX_CLOUD,
             timeout_secs: DEFAULT_TIMEOUT_SECS_CLOUD,
+            binary_path: String::new(),
+            model_path: String::new(),
         },
         ProviderConfig {
             id: "unsloth".to_string(),
@@ -206,6 +242,8 @@ pub fn provider_presets() -> Vec<ProviderConfig> {
             max_tokens: DEFAULT_MAX_TOKENS_LOCAL,
             n_ctx: DEFAULT_N_CTX_LOCAL,
             timeout_secs: DEFAULT_TIMEOUT_SECS_LOCAL,
+            binary_path: String::new(),
+            model_path: String::new(),
         },
         ProviderConfig {
             id: "lmstudio".to_string(),
@@ -215,6 +253,8 @@ pub fn provider_presets() -> Vec<ProviderConfig> {
             max_tokens: DEFAULT_MAX_TOKENS_LOCAL,
             n_ctx: DEFAULT_N_CTX_LOCAL,
             timeout_secs: DEFAULT_TIMEOUT_SECS_LOCAL,
+            binary_path: String::new(),
+            model_path: String::new(),
         },
         ProviderConfig {
             id: "ollama".to_string(),
@@ -224,6 +264,8 @@ pub fn provider_presets() -> Vec<ProviderConfig> {
             max_tokens: DEFAULT_MAX_TOKENS_LOCAL,
             n_ctx: DEFAULT_N_CTX_LOCAL,
             timeout_secs: DEFAULT_TIMEOUT_SECS_LOCAL,
+            binary_path: String::new(),
+            model_path: String::new(),
         },
         ProviderConfig {
             id: "llamaserver".to_string(),
@@ -233,6 +275,10 @@ pub fn provider_presets() -> Vec<ProviderConfig> {
             max_tokens: DEFAULT_MAX_TOKENS_LOCAL,
             n_ctx: DEFAULT_N_CTX_LOCAL,
             timeout_secs: DEFAULT_TIMEOUT_SECS_LOCAL,
+            // Ticket 05: default precompilati (D2 + assunzione 1). Solo questo
+            // preset ha path significativi.
+            binary_path: DEFAULT_LLAMASERVER_BINARY_PATH.to_string(),
+            model_path: DEFAULT_LLAMASERVER_MODEL_PATH.to_string(),
         },
     ]
 }
@@ -270,6 +316,18 @@ pub fn provider_timeout_key(id: &str) -> String {
     format!("provider.{id}.timeout_secs")
 }
 
+/// Settings key holding a provider's llama-server binary-path override:
+/// `provider.{id}.binary_path` (ticket 05).
+pub fn provider_binary_path_key(id: &str) -> String {
+    format!("provider.{id}.binary_path")
+}
+
+/// Settings key holding a provider's GGUF model-path override:
+/// `provider.{id}.model_path` (ticket 05).
+pub fn provider_model_path_key(id: &str) -> String {
+    format!("provider.{id}.model_path")
+}
+
 /// Read the active provider id, falling back to [`DEFAULT_PROVIDER_ID`] (D3:
 /// unsloth) when unset or stored blank.
 pub fn get_active_provider(conn: &Connection) -> rusqlite::Result<String> {
@@ -305,6 +363,72 @@ fn resolve_u32_override(conn: &Connection, key: &str, default: u32) -> rusqlite:
     )
 }
 
+/// Resolve a per-provider `String` override stored under `key`, falling back to
+/// `default` when the setting is absent or blank. Trims surrounding whitespace.
+/// Shared by `binary_path`/`model_path` in [`get_provider_config`] (ticket 05),
+/// mirroring the get → trim → non-blank fallback used for `base_url`/`model`.
+fn resolve_string_override(conn: &Connection, key: &str, default: &str) -> rusqlite::Result<String> {
+    Ok(match get_setting(conn, key)? {
+        Some(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => default.to_string(),
+    })
+}
+
+/// Validated local paths for the direct llama.cpp provider (ticket 05).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedLlamaPaths {
+    /// Existing path to the `llama-server` binary.
+    pub binary_path: PathBuf,
+    /// Existing path to the GGUF model file.
+    pub model_path: PathBuf,
+}
+
+/// Whether a configured path is non-blank and exists on disk. Single source of
+/// truth for the "does this configured path point at a real file" predicate
+/// (ticket 05): used by the `validate_provider_paths` command for its
+/// `binary_exists`/`model_exists` flags. Pure w.r.t. its `&str` input; touches
+/// the filesystem via `Path::exists`.
+pub fn path_configured_and_exists(path: &str) -> bool {
+    let p = path.trim();
+    !p.is_empty() && std::path::Path::new(p).exists()
+}
+
+/// Validate the configured binary + model paths, returning the resolved paths or
+/// an **actionable Italian error** (`LLAMA_BINARY_MISSING_MSG` /
+/// `LLAMA_MODEL_MISSING_MSG`). The `exists` predicate is injected so this seam is
+/// unit-testable without touching the filesystem; [`validate_llama_paths`] wires
+/// the real `Path::exists`. Checks the binary first, then the model. Does **not**
+/// spawn any process — that is the ticket 04 spawner's job (D1).
+pub fn validate_llama_paths_with<F>(
+    binary_path: &str,
+    model_path: &str,
+    exists: F,
+) -> Result<ResolvedLlamaPaths, String>
+where
+    F: Fn(&Path) -> bool,
+{
+    let binary = PathBuf::from(binary_path.trim());
+    if binary_path.trim().is_empty() || !exists(&binary) {
+        return Err(LLAMA_BINARY_MISSING_MSG.to_string());
+    }
+    let model = PathBuf::from(model_path.trim());
+    if model_path.trim().is_empty() || !exists(&model) {
+        return Err(LLAMA_MODEL_MISSING_MSG.to_string());
+    }
+    Ok(ResolvedLlamaPaths {
+        binary_path: binary,
+        model_path: model,
+    })
+}
+
+/// Filesystem-backed [`validate_llama_paths_with`] using `Path::exists`.
+pub fn validate_llama_paths(
+    binary_path: &str,
+    model_path: &str,
+) -> Result<ResolvedLlamaPaths, String> {
+    validate_llama_paths_with(binary_path, model_path, |p| p.exists())
+}
+
 pub fn get_provider_config(conn: &Connection, id: &str) -> rusqlite::Result<ProviderConfig> {
     let preset = provider_preset(id).unwrap_or_else(|| ProviderConfig {
         id: id.to_string(),
@@ -320,12 +444,12 @@ pub fn get_provider_config(conn: &Connection, id: &str) -> rusqlite::Result<Prov
         // Idem per il timeout: un id sconosciuto è trattato come locale, quindi
         // generoso invece del breve default cloud.
         timeout_secs: DEFAULT_TIMEOUT_SECS_LOCAL,
+        // Un id sconosciuto non ha default di path: solo `llamaserver` li usa.
+        binary_path: String::new(),
+        model_path: String::new(),
     });
 
-    let base_url = match get_setting(conn, &provider_base_url_key(id))? {
-        Some(v) if !v.trim().is_empty() => v.trim().to_string(),
-        _ => preset.base_url,
-    };
+    let base_url = resolve_string_override(conn, &provider_base_url_key(id), &preset.base_url)?;
 
     let model = match get_setting(conn, &provider_model_key(id))? {
         Some(v) if !v.trim().is_empty() => v.trim().to_string(),
@@ -348,6 +472,14 @@ pub fn get_provider_config(conn: &Connection, id: &str) -> rusqlite::Result<Prov
     // Un valore invalido o 0 è ignorato.
     let timeout_secs = resolve_u32_override(conn, &provider_timeout_key(id), preset.timeout_secs)?;
 
+    // binary_path / model_path override (ticket 05): stringa non vuota, altrimenti
+    // il default del preset (precompilato solo per `llamaserver`). Consumati dallo
+    // spawner del ticket 04; la validazione dell'esistenza è in validate_llama_paths.
+    let binary_path =
+        resolve_string_override(conn, &provider_binary_path_key(id), &preset.binary_path)?;
+    let model_path =
+        resolve_string_override(conn, &provider_model_path_key(id), &preset.model_path)?;
+
     Ok(ProviderConfig {
         id: preset.id,
         label: preset.label,
@@ -356,6 +488,8 @@ pub fn get_provider_config(conn: &Connection, id: &str) -> rusqlite::Result<Prov
         max_tokens,
         n_ctx,
         timeout_secs,
+        binary_path,
+        model_path,
     })
 }
 
@@ -825,5 +959,160 @@ mod tests {
             get_provider_config(&c, "mystery").unwrap().timeout_secs,
             DEFAULT_TIMEOUT_SECS_LOCAL
         );
+    }
+
+    // --- Ticket 05: llamaserver binary_path + model_path (path management) ----
+
+    #[test]
+    fn provider_binary_path_key_formats_scoped_key() {
+        assert_eq!(
+            provider_binary_path_key("llamaserver"),
+            "provider.llamaserver.binary_path"
+        );
+        assert_eq!(provider_binary_path_key("unsloth"), "provider.unsloth.binary_path");
+    }
+
+    #[test]
+    fn provider_model_path_key_formats_scoped_key() {
+        assert_eq!(
+            provider_model_path_key("llamaserver"),
+            "provider.llamaserver.model_path"
+        );
+        assert_eq!(provider_model_path_key("ollama"), "provider.ollama.model_path");
+    }
+
+    #[test]
+    fn llamaserver_preset_has_default_binary_and_model_paths() {
+        // D2 / assunzione 1: default precompilati alla casa stabile del binario
+        // e al GGUF esplicito in cache HF (niente auto-glob).
+        let p = provider_preset("llamaserver").unwrap();
+        assert_eq!(p.binary_path, DEFAULT_LLAMASERVER_BINARY_PATH);
+        assert_eq!(p.model_path, DEFAULT_LLAMASERVER_MODEL_PATH);
+    }
+
+    #[test]
+    fn llamaserver_binary_default_is_outside_temp_and_repo() {
+        // Assunzione 1: la casa stabile del binario NON è la dir temporanea di
+        // scratch né il build Unsloth (dipendente dal venv di Studio).
+        let b = DEFAULT_LLAMASERVER_BINARY_PATH.to_lowercase();
+        assert!(!b.contains("\\temp\\"), "binary default must not live in temp");
+        assert!(!b.contains("unsloth"), "binary default must not be the Unsloth build");
+        assert!(b.ends_with("llama-server.exe"));
+    }
+
+    #[test]
+    fn other_presets_default_to_empty_binary_and_model_paths() {
+        // Solo llamaserver ha default significativi; gli altri partono vuoti.
+        for id in ["openrouter", "unsloth", "lmstudio", "ollama"] {
+            let p = provider_preset(id).unwrap();
+            assert_eq!(p.binary_path, "", "{id} binary_path default is empty");
+            assert_eq!(p.model_path, "", "{id} model_path default is empty");
+        }
+    }
+
+    #[test]
+    fn get_provider_config_returns_preset_paths_by_default() {
+        let c = conn();
+        let cfg = get_provider_config(&c, "llamaserver").unwrap();
+        assert_eq!(cfg.binary_path, DEFAULT_LLAMASERVER_BINARY_PATH);
+        assert_eq!(cfg.model_path, DEFAULT_LLAMASERVER_MODEL_PATH);
+    }
+
+    #[test]
+    fn get_provider_config_applies_binary_and_model_path_overrides() {
+        let c = conn();
+        set_setting(&c, &provider_binary_path_key("llamaserver"), "  D:\\bin\\llama-server.exe  ")
+            .unwrap();
+        set_setting(&c, &provider_model_path_key("llamaserver"), "D:\\models\\custom.gguf").unwrap();
+        let cfg = get_provider_config(&c, "llamaserver").unwrap();
+        assert_eq!(cfg.binary_path, "D:\\bin\\llama-server.exe");
+        assert_eq!(cfg.model_path, "D:\\models\\custom.gguf");
+    }
+
+    #[test]
+    fn get_provider_config_ignores_blank_path_overrides() {
+        let c = conn();
+        set_setting(&c, &provider_binary_path_key("llamaserver"), "   ").unwrap();
+        let cfg = get_provider_config(&c, "llamaserver").unwrap();
+        assert_eq!(cfg.binary_path, DEFAULT_LLAMASERVER_BINARY_PATH);
+    }
+
+    #[test]
+    fn get_provider_config_unknown_id_has_empty_paths() {
+        let c = conn();
+        let cfg = get_provider_config(&c, "mystery").unwrap();
+        assert_eq!(cfg.binary_path, "");
+        assert_eq!(cfg.model_path, "");
+    }
+
+    #[test]
+    fn path_configured_and_exists_is_false_when_blank() {
+        assert!(!path_configured_and_exists(""));
+        assert!(!path_configured_and_exists("   "));
+    }
+
+    #[test]
+    fn path_configured_and_exists_is_false_when_missing() {
+        assert!(!path_configured_and_exists("C:\\definitely\\not\\here.gguf"));
+    }
+
+    #[test]
+    fn path_configured_and_exists_is_true_for_a_real_file() {
+        // The crate manifest is guaranteed to exist on disk; a surrounding-space
+        // variant must still resolve (the predicate trims first).
+        let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+        assert!(path_configured_and_exists(manifest));
+        assert!(path_configured_and_exists(&format!("  {manifest}  ")));
+    }
+
+    #[test]
+    fn validate_llama_paths_ok_when_both_exist() {
+        let res = validate_llama_paths_with("C:\\bin\\llama-server.exe", "C:\\m\\g.gguf", |_| true)
+            .unwrap();
+        assert_eq!(res.binary_path, PathBuf::from("C:\\bin\\llama-server.exe"));
+        assert_eq!(res.model_path, PathBuf::from("C:\\m\\g.gguf"));
+    }
+
+    #[test]
+    fn validate_llama_paths_errors_when_binary_missing() {
+        let bin = "C:\\bin\\llama-server.exe";
+        let err = validate_llama_paths_with(bin, "C:\\m\\g.gguf", |p| p != Path::new(bin))
+            .unwrap_err();
+        assert_eq!(err, LLAMA_BINARY_MISSING_MSG);
+    }
+
+    #[test]
+    fn validate_llama_paths_errors_when_model_missing() {
+        let model = "C:\\m\\g.gguf";
+        let err = validate_llama_paths_with("C:\\bin\\llama-server.exe", model, |p| {
+            p != Path::new(model)
+        })
+        .unwrap_err();
+        assert_eq!(err, LLAMA_MODEL_MISSING_MSG);
+    }
+
+    #[test]
+    fn validate_llama_paths_errors_when_binary_path_blank() {
+        let err = validate_llama_paths_with("   ", "C:\\m\\g.gguf", |_| true).unwrap_err();
+        assert_eq!(err, LLAMA_BINARY_MISSING_MSG);
+    }
+
+    #[test]
+    fn validate_llama_paths_applies_resolved_override_paths() {
+        // Override-applied case: la validazione gira sui path risolti da
+        // get_provider_config (override utente), non sui default del preset.
+        let c = conn();
+        let overridden_bin = "D:\\bin\\llama-server.exe";
+        let overridden_model = "D:\\models\\custom.gguf";
+        set_setting(&c, &provider_binary_path_key("llamaserver"), overridden_bin).unwrap();
+        set_setting(&c, &provider_model_path_key("llamaserver"), overridden_model).unwrap();
+        let cfg = get_provider_config(&c, "llamaserver").unwrap();
+        // Only the overridden paths "exist"; the preset defaults do not.
+        let exists = |p: &Path| {
+            p == Path::new(overridden_bin) || p == Path::new(overridden_model)
+        };
+        let res = validate_llama_paths_with(&cfg.binary_path, &cfg.model_path, exists).unwrap();
+        assert_eq!(res.binary_path, PathBuf::from(overridden_bin));
+        assert_eq!(res.model_path, PathBuf::from(overridden_model));
     }
 }
