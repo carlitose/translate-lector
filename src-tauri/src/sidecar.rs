@@ -158,8 +158,9 @@ impl LlamaServerProcess {
     }
 }
 
-/// Bounded readiness wait after a spawn: `probe_reachable` (1.5 s each) is polled
-/// until the server answers or this deadline elapses.
+/// Bounded readiness wait after a spawn: `probe_model_ready` (1.5 s each) is
+/// polled until the model is loaded (llama.cpp `/health` → 200) or this deadline
+/// elapses.
 const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Pause between readiness probes.
 const SERVER_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -170,7 +171,8 @@ const SERVER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 ///   path handles reachability as before).
 /// - Managed + already reachable → `Ok(())` (reuse; **no double-spawn**).
 /// - Managed + not reachable + paths valid → spawn with the D4 args and poll
-///   `probe_reachable` until ready (bounded ~30 s).
+///   `probe_model_ready` (llama.cpp `/health` → 200, i.e. model loaded, not just
+///   the socket) until ready (bounded ~30 s).
 /// - Managed + not reachable + paths invalid → the actionable path error (D2).
 ///
 /// Must be called from a blocking context (it sleeps and does blocking probes);
@@ -268,13 +270,19 @@ fn spawn_llama_server(
     Ok(())
 }
 
-/// Poll `probe_reachable(base_url)` until the freshly spawned server answers or
-/// [`SERVER_READY_TIMEOUT`] elapses. On timeout, an actionable message (not the
-/// generic "non raggiungibile").
+/// Poll `probe_model_ready(base_url)` until the freshly spawned server has the
+/// **model loaded** (llama.cpp `/health` → 200) or [`SERVER_READY_TIMEOUT`]
+/// elapses. Waiting on model-readiness rather than bare socket reachability
+/// (`probe_reachable`) is the ticket-08 fix: llama.cpp answers `/v1/models` (so
+/// `probe_reachable` is already `true`) while `chat/completions` still returns
+/// `503 "Loading model"`, so probing the socket let the first cold translation
+/// hit a 503. `/health` stays `503` until the model is in VRAM, so this loop only
+/// returns `Ok` once the very first translation can actually succeed. On timeout,
+/// an actionable message (not the generic "non raggiungibile").
 fn wait_until_ready(base_url: &str) -> Result<(), String> {
     let deadline = Instant::now() + SERVER_READY_TIMEOUT;
     loop {
-        if crate::llm::probe_reachable(base_url) {
+        if crate::llm::probe_model_ready(base_url) {
             return Ok(());
         }
         if Instant::now() >= deadline {

@@ -837,7 +837,14 @@ pub fn models_probe_url(base_url: &str) -> String {
 /// surfaces an error: "down" is simply `false`. It performs no cloud fallback and
 /// never translates — it only checks whether the endpoint is listening.
 pub fn probe_reachable(base_url: &str) -> bool {
-    let url = models_probe_url(base_url);
+    probe(&models_probe_url(base_url), |_| true)
+}
+
+/// Shared boilerplate for the reachability/readiness probes: a short-timeout
+/// (1500 ms) blocking `GET` to `url`, whose response is judged by `accept`.
+/// Returns `false` (never an error) on client-build failure, connection refused,
+/// timeout or DNS error, so callers treat "down"/"not ready" as simply `false`.
+fn probe(url: &str, accept: impl Fn(reqwest::blocking::Response) -> bool) -> bool {
     let client = match reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_millis(1500))
         .build()
@@ -845,7 +852,38 @@ pub fn probe_reachable(base_url: &str) -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
-    client.get(&url).send().is_ok()
+    match client.get(url).send() {
+        Ok(resp) => accept(resp),
+        Err(_) => false,
+    }
+}
+
+/// Derive llama.cpp's `/health` URL from a chat-completions `base_url` (ticket 08).
+/// Unlike [`models_probe_url`], `/health` lives at the **server root**, not under
+/// `/v1`, so we rebuild `scheme://authority/health` from the shared
+/// [`authority_host_port`] helper (no ad-hoc URL parsing). `…/v1/chat/completions`
+/// → `…/health`. Pure and unit-testable.
+pub fn health_probe_url(base_url: &str) -> String {
+    let trimmed = base_url.trim();
+    let scheme = match trimmed.split_once("://") {
+        Some((s, _)) => s,
+        None => "http",
+    };
+    let authority = authority_host_port(trimmed);
+    format!("{scheme}://{authority}/health")
+}
+
+/// Model-readiness probe (ticket 08): a short-timeout blocking `GET` to
+/// llama.cpp's [`health_probe_url`]. Unlike [`probe_reachable`] (which is `true`
+/// as soon as the socket answers with *any* status), this returns `true` **only
+/// on HTTP 200** — the signal llama.cpp uses to say the model is loaded and the
+/// server is ready. While the model loads, `/health` answers `503` (body
+/// `{"error":{"message":"Loading model","type":"unavailable_error"}}`), so this
+/// stays `false` and the readiness poll keeps waiting. Connection refused /
+/// timeout / DNS error → `false`. Never surfaces an error: "not ready" is simply
+/// `false`.
+pub fn probe_model_ready(base_url: &str) -> bool {
+    probe(&health_probe_url(base_url), |r| r.status() == reqwest::StatusCode::OK)
 }
 
 /// Extract a human-readable error string from an OpenRouter error body. Handles
@@ -2534,6 +2572,110 @@ E così, senza fretta, l'argomentazione si chiude.";
         handle.join().unwrap();
     }
 
+    // --- health_probe_url / probe_model_ready (ticket 08) --------------------
+
+    #[test]
+    fn health_probe_url_targets_the_server_root() {
+        // /health lives at the root, NOT under /v1 (llama.cpp contract).
+        assert_eq!(
+            health_probe_url("http://localhost:8888/v1/chat/completions"),
+            "http://localhost:8888/health"
+        );
+        assert_eq!(
+            health_probe_url("http://127.0.0.1:8080/v1/chat/completions/"),
+            "http://127.0.0.1:8080/health"
+        );
+        // IPv6 authority is preserved verbatim.
+        assert_eq!(
+            health_probe_url("http://[::1]:1234/v1/chat/completions"),
+            "http://[::1]:1234/health"
+        );
+        // https scheme is preserved.
+        assert_eq!(
+            health_probe_url("https://host:443/v1/chat/completions"),
+            "https://host:443/health"
+        );
+    }
+
+    /// Spawn a one-shot loopback HTTP server that answers the first request with
+    /// the given status line + JSON body, then closes. Returns its `base_url` and
+    /// the join handle. Mirrors the `probe_reachable` test style (no real server).
+    fn one_shot_http(status_line: &'static str, body: &'static str)
+        -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                // Fully drain the request (headers + Content-Length body) before
+                // replying: a POST body can exceed one read, and closing early
+                // would break the client's send (broken pipe) instead of letting
+                // it read our response.
+                let mut reader = BufReader::new(&stream);
+                let mut content_length = 0usize;
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let trimmed = line.trim_end();
+                    if let Some(v) = trimmed.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = v.trim().parse().unwrap_or(0);
+                    }
+                    if trimmed.is_empty() {
+                        break; // end of headers
+                    }
+                }
+                if content_length > 0 {
+                    let mut body_buf = vec![0u8; content_length];
+                    let _ = reader.read_exact(&mut body_buf);
+                }
+                let mut stream = stream;
+                let resp = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{addr}/v1/chat/completions"), handle)
+    }
+
+    #[test]
+    fn probe_model_ready_is_true_on_200() {
+        // /health → 200 {"status":"ok"} means the model is loaded and ready.
+        let (base, handle) = one_shot_http("HTTP/1.1 200 OK", r#"{"status":"ok"}"#);
+        assert!(probe_model_ready(&base), "200 from /health means model ready");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn probe_model_ready_is_false_on_503_loading_model() {
+        // /health → 503 while the model is still loading: NOT ready yet, keep
+        // waiting (the whole point vs. probe_reachable, which would say "up").
+        let (base, handle) = one_shot_http(
+            "HTTP/1.1 503 Service Unavailable",
+            r#"{"error":{"code":503,"message":"Loading model","type":"unavailable_error"}}"#,
+        );
+        assert!(!probe_model_ready(&base), "503 Loading model is not ready");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn probe_model_ready_is_false_when_nothing_is_listening() {
+        // Connection refused → not ready (never panics, just false).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let base = format!("http://127.0.0.1:{port}/v1/chat/completions");
+        assert!(!probe_model_ready(&base), "a closed port is not ready");
+    }
+
     #[test]
     fn backoff_is_exponential_from_the_base_delay() {
         let p = RetryPolicy {
@@ -2658,6 +2800,39 @@ E così, senza fretta, l'argomentazione si chiude.";
         );
         let req = build_request("openai/gpt-4o", build_messages("it", "x", "", "", "", false, 1000), 4096);
         assert_eq!(client.complete(&req), Err(LlmError::MissingApiKey));
+    }
+
+    #[test]
+    fn chat_completions_503_loading_model_is_classified_transient() {
+        // Ticket 08 safety net: if a "Loading model" 503 slips past the readiness
+        // gate and reaches chat/completions, it must be TRANSIENT so
+        // RetryingChatClient retries it within budget instead of surfacing it.
+        let (base, handle) = one_shot_http(
+            "HTTP/1.1 503 Service Unavailable",
+            r#"{"error":{"code":503,"message":"Loading model","type":"unavailable_error"}}"#,
+        );
+        let client = ChatCompletionsClient::new(base, "test-key", false, 5);
+        let req = build_request("m", build_messages("it", "x", "", "", "", false, 1000), 4096);
+        let err = client.complete(&req).unwrap_err();
+        assert!(matches!(err, LlmError::ServerError(_)), "503 → ServerError, got {err:?}");
+        assert!(err.is_transient(), "a Loading-model 503 must be retryable");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn chat_completions_unrelated_503_keeps_transient_classification() {
+        // Regression lock: an unrelated 503 stays a transient ServerError exactly
+        // as before — the safety net does not narrow other 5xx handling.
+        let (base, handle) = one_shot_http(
+            "HTTP/1.1 503 Service Unavailable",
+            r#"{"error":{"message":"upstream overloaded"}}"#,
+        );
+        let client = ChatCompletionsClient::new(base, "test-key", false, 5);
+        let req = build_request("m", build_messages("it", "x", "", "", "", false, 1000), 4096);
+        let err = client.complete(&req).unwrap_err();
+        assert!(matches!(err, LlmError::ServerError(_)), "other 503 → ServerError, got {err:?}");
+        assert!(err.is_transient(), "other 5xx stay transient/retryable, unchanged");
+        handle.join().unwrap();
     }
 
     #[test]
