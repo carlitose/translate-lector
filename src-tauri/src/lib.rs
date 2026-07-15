@@ -74,6 +74,18 @@ fn should_check_is_current(base_url: &str) -> bool {
     llm::is_local_url(base_url)
 }
 
+/// Whether `translate::TranslateParams::is_current` should be *attached* to a
+/// concrete request (Ticket 01). It is only attached for a local, **on-demand**
+/// request (`update_context == true`). A prefetch (`update_context == false`)
+/// targets page N+1 while the current-page cursor holds N, so its `is_current`
+/// closure would be false at the very first unit and the pipeline would cancel
+/// it before translating (and before warming the cache). Prefetch therefore
+/// gets `None`, mirroring the cloud provider. Pure so the truth table is
+/// directly unit-testable.
+fn should_attach_is_current(base_url: &str, update_context: bool) -> bool {
+    should_check_is_current(base_url) && update_context
+}
+
 /// Whether `page_number` is still the current page for `document_id`,
 /// according to `cursor` (`document_id -> page_number`, written only by
 /// on-demand requests). No cursor recorded yet for that document (the
@@ -183,6 +195,50 @@ mod cursor_tests {
         // by the time they finish.
         assert!(!should_check_is_current("https://openrouter.ai/api/v1/chat/completions"));
         assert!(!should_check_is_current("https://api.example.com/v1/chat/completions"));
+    }
+
+    // --- should_attach_is_current ---------------------------------------------
+
+    #[test]
+    fn should_attach_is_current_local_on_demand_is_true() {
+        // On-demand navigation on the local provider is the ONLY case that
+        // wires up the staleness check (ticket 06): the request targets the
+        // page the cursor points at, so `is_current` gates cancellation of a
+        // job the user has navigated away from.
+        assert!(should_attach_is_current(
+            "http://localhost:8888/v1/chat/completions",
+            /* update_context = */ true
+        ));
+    }
+
+    #[test]
+    fn should_attach_is_current_local_prefetch_is_false() {
+        // Ticket 01 fix: a prefetch (`update_context == false`) targets page
+        // N+1 while the cursor holds N, so `is_page_current` is false at idx 0
+        // and the pipeline would cancel before translating. Prefetch must NOT
+        // attach `is_current`, mirroring the cloud `None`.
+        assert!(!should_attach_is_current(
+            "http://localhost:8888/v1/chat/completions",
+            /* update_context = */ false
+        ));
+    }
+
+    #[test]
+    fn should_attach_is_current_cloud_on_demand_is_false() {
+        // Cloud never attaches `is_current` (see `should_check_is_current`);
+        // that holds for on-demand too.
+        assert!(!should_attach_is_current(
+            "https://openrouter.ai/api/v1/chat/completions",
+            /* update_context = */ true
+        ));
+    }
+
+    #[test]
+    fn should_attach_is_current_cloud_prefetch_is_false() {
+        assert!(!should_attach_is_current(
+            "https://openrouter.ai/api/v1/chat/completions",
+            /* update_context = */ false
+        ));
     }
 }
 
@@ -564,7 +620,15 @@ async fn translate_page(
             // their pre-ticket behaviour unchanged — they always run to
             // completion and populate the page cache, even if the page is no
             // longer current by the time they finish.
-            is_current: if should_check_is_current(&cfg.base_url) { Some(&is_current) } else { None },
+            // Ticket 01: also exempt local **prefetch** (`update_context ==
+            // false`) — its target page N+1 never matches the cursor (N), so
+            // attaching `is_current` would cancel it at idx 0 before it can
+            // warm the cache. See `should_attach_is_current`.
+            is_current: if should_attach_is_current(&cfg.base_url, update_context) {
+                Some(&is_current)
+            } else {
+                None
+            },
         };
 
         // Serialize the local provider (L3/L4): one in-flight translation at a
