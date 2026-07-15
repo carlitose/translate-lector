@@ -37,8 +37,22 @@ problema, non il modello.
 - **Dipendenza DLL CUDA**: il binario Unsloth da solo NON vede la GPU (`--list-devices` vuoto);
   funziona mettendo nel PATH le DLL CUDA 13 del venv di Studio
   (`~/.unsloth/studio/unsloth_studio/Lib/site-packages/torch/lib`). Fragile: dipende
-  dall'installazione di Studio che vogliamo rimuovere → il sourcing del binario è la prima frontiera
-  (ticket 01).
+  dall'installazione di Studio che vogliamo rimuovere.
+- **Sourcing binario = RISOLTO** (2026-07-15, ticket 01, `done/`): la **release ufficiale llama.cpp
+  Windows CUDA** (b10016, build cuda-12.4) vede la GPU standalone (cudart affiancato, nessuna DLL di
+  Studio) con resa identica (3.5 s/paragrafo, ~20 s/pagina densa, zero CoT). MIT, aggiornamento via
+  tag GitHub. **Costo: ~1.1 GB** di runtime CUDA (ggml-cuda 509 MB + cublasLt 452 + cublas 95) —
+  scelto build 12.4 perché il driver arriva a CUDA 13.2. Il build Unsloth è escluso (è la dipendenza
+  da rimuovere); build proprio slim (solo sm_89) = opzione futura se la dimensione diventa il
+  vincolo. → decisione bundle-vs-download al grilling (D1).
+- **Contratto sidecar Tauri = RISOLTO** (2026-07-15, ticket 02, `done/`): `externalBin` per l'exe
+  (suffisso target-triple obbligatorio) + DLL CUDA via `bundle.resources` o, più robusto,
+  `current_dir`/`PATH` risolto in Rust da `resource_dir()`. Lifecycle con `tauri-plugin-shell`
+  (da aggiungere): spawn `app.shell().sidecar(...)`, kill deterministico via
+  `.build()?.run(|_, RunEvent::Exit|ExitRequested| child.kill())` con `CommandChild` in managed
+  state (stesso pattern di `CurrentPage`/`LocalProviderSlot` già presenti). Health = riuso di
+  `probe_reachable` (`llm.rs:809`). Orfani su hard-crash → pid persistito o Job Object (rischio per
+  il grilling). Permesso `shell:allow-execute` col sidecar in `capabilities/default.json`.
 - **L'app è già pronta lato client**: esiste il preset `llamaserver`
   (`http://127.0.0.1:8080/v1/chat/completions`, `settings.rs:229-236`), e `is_local_url`
   (`llm.rs:775-788`) copre `127.0.0.1` → timeout 180 s, 0 retry-on-timeout, serializzazione
@@ -55,15 +69,12 @@ problema, non il modello.
 
 ## Not Yet Specified
 
-- **Sourcing del binario** (ticket 01): riusare il build Unsloth (già sul disco ma legato alle DLL
-  del venv di Studio) vs release ufficiale llama.cpp Windows CUDA (zip `cudart` incluso, licenza
-  MIT) vs build proprio. Dimensioni del bundle, story di aggiornamento.
-- **Contratto sidecar Tauri 2** (ticket 02): `externalBin`/plugin shell, spawn/kill lifecycle,
-  passaggio env/PATH, gestione porta occupata, health probe (l'app ha già il probe di reachability
-  a 1.5 s), riavvio su crash.
-- **Distribuzione** (grilling 03): sidecar impacchettato nell'installer (bundle più pesante:
-  ggml-cuda ~170 MB + cudart) vs "gestito ma esterno" (l'app scarica/avvia un binario in una dir
-  dati) vs solo script documentato.
+- ~~Sourcing del binario~~ → **RISOLTO** (ticket 01): release ufficiale llama.cpp CUDA.
+- ~~Contratto sidecar Tauri 2~~ → **RISOLTO** (ticket 02): externalBin + plugin-shell + kill via
+  RunEvent.
+- **Distribuzione** (grilling 03, D1): sidecar impacchettato nell'installer (**+~1.1 GB** di runtime
+  CUDA) vs "gestito ma esterno" (l'app scarica il pacchetto binari da GitHub al primo uso) vs build
+  proprio slim (solo sm_89). Trade-off misurato: dimensione installer vs semplicità offline.
 - **Gestione del modello GGUF** (grilling 03 + ticket 05): puntare alla cache HuggingFace esistente
   (`~/.cache/huggingface/hub/...Q4_K_XL.gguf`, 2.5 GB) vs download gestito dall'app vs path
   configurabile in ⚙️.
@@ -83,11 +94,11 @@ problema, non il modello.
 
 ## Frontier / Blocking Edges
 
-1. **Sourcing del binario** (ticket 01, ready): senza una fonte del binario indipendente da Studio,
-   "togliere Unsloth" è solo a metà. Sblocca il grilling.
-2. **Contratto sidecar Tauri** (ticket 02, ready, parallelo a 01): serve sapere cosa Tauri 2
-   permette (bundling, lifecycle, env) prima di decidere la distribuzione nel grilling.
-3. **Grilling 03** (blocked da 01+02): distribuzione, modello, preset unsloth, parametri.
+1. ~~Sourcing del binario (ticket 01)~~ → **RISOLTO**: release ufficiale llama.cpp CUDA.
+2. ~~Contratto sidecar Tauri (ticket 02)~~ → **RISOLTO**: externalBin + plugin-shell + kill via RunEvent.
+3. **Grilling 03 = FRONTIERA ATTUALE** (ready: 01+02 chiusi): distribuzione (D1: bundle ~1.1 GB vs
+   download vs build slim), gestione GGUF (D2), destino preset unsloth (D3), parametri default (D4),
+   come rendere default il provider (D5, lato qualità già ok). È l'unico edge aperto.
 4. **Build** (ticket 04, 05, 06 — blocked dal grilling).
 5. ~~**Qualità HITL** (ticket 07)~~ → **CHIUSA**: qualità "molto buona" senza reasoning (2026-07-15).
 
@@ -97,9 +108,9 @@ Cartella: `docs/tickets/llamacpp-direct/`
 
 | # | Tipo | Titolo | Stato |
 |---|------|--------|-------|
-| 01 | research | Sourcing del binario llama-server (Unsloth build vs release ufficiale) | ready |
-| 02 | research | Contratto sidecar Tauri 2 (spawn/kill, env, bundling, porta) | ready |
-| 03 | grilling | Decisioni: distribuzione, modello GGUF, preset unsloth, parametri default | blocked (01, 02) |
+| 01 | research | Sourcing del binario llama-server (Unsloth build vs release ufficiale) | ✅ done (`done/`) — release ufficiale CUDA, ~1.1 GB |
+| 02 | research | Contratto sidecar Tauri 2 (spawn/kill, env, bundling, porta) | ✅ done (`done/`) — externalBin + plugin-shell + RunEvent |
+| 03 | grilling | Decisioni: distribuzione, modello GGUF, preset unsloth, parametri default | **ready** (01, 02 chiusi) |
 | 04 | task | Sidecar lifecycle: spawn/health/kill di llama-server dall'app | blocked (03) |
 | 05 | task | Gestione del modello GGUF (path/download secondo grilling) | blocked (03) |
 | 06 | task | Cleanup preset unsloth + documentazione | blocked (03) |
@@ -107,7 +118,8 @@ Cartella: `docs/tickets/llamacpp-direct/`
 
 ## Next Review
 
-Dopo i ticket 01-02: eseguire il grilling 03 con l'utente. Dopo la build (04-06): misura di
-conferma col protocollo del ticket 04 latenza (pagina densa reale, prima/dopo) e chiusura della
-nota "riaprire L6" nella mappa latenza. Il ticket 07 (HITL) decide se il provider diretto diventa
-il default consigliato nel README.
+**Prossimo passo: grilling 03 con l'utente** (01, 02, 07 chiusi). Le decisioni aperte sono di
+distribuzione/ingegneria, non più di qualità del modello: D1 (bundle ~1.1 GB vs download-on-first-run
+vs build slim sm_89), D2 (gestione GGUF), D3 (destino preset unsloth), D4 (parametri server), D5
+(come rendere default il provider diretto — lato qualità già ok). Dopo la build (04-06): misura di
+conferma col protocollo del ticket 04 latenza (pagina densa reale, prima/dopo).

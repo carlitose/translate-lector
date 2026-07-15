@@ -33,8 +33,11 @@ su:
 
 ## Blocked By
 
-- [01-research-binary-sourcing.md](./01-research-binary-sourcing.md)
-- [02-research-tauri-sidecar-contract.md](./02-research-tauri-sidecar-contract.md)
+- ~~[01-research-binary-sourcing.md](./done/01-research-binary-sourcing.md)~~ → **done** (release
+  ufficiale llama.cpp CUDA, ~1.1 GB).
+- ~~[02-research-tauri-sidecar-contract.md](./done/02-research-tauri-sidecar-contract.md)~~ →
+  **done** (externalBin + plugin-shell + kill via RunEvent).
+- **Nessun blocco residuo: ready per il grilling.**
 
 ## Frontier
 
