@@ -47,9 +47,11 @@ problema, non il modello.
 - **Ereditate dalla mappa latenza** (decision-brief-latency-03): L1 packing 512 (in main), L3
   serializzazione (in main), L4 0 retry (in main), L5 target ≤2 min ora largamente battuto. L6
   ("resta gemma-4") resta valida — qui NON si cambia modello, si cambia il modo di servirlo.
-- **Qualità senza reasoning: da validare a occhio** (HITL). Nel test sintetico un piccolo
-  scivolone grammaticale ("I scienziati" invece di "Gli scienziati"); serve lettura umana di pagine
-  reali prima di fare del provider diretto il default (ticket 07).
+- **Qualità senza reasoning = VALIDATA** (2026-07-15, ticket 07 HITL, `done/`): l'utente ha letto
+  pagine reali col provider `llamaserver` + `--reasoning off` e ha giudicato la traduzione "molto
+  buona". Nessuna regressione bloccante rispetto alla resa con CoT. → il provider diretto può
+  diventare il default consigliato (D5 del grilling di fatto risolto in senso positivo). Lo
+  scivolone sintetico sugli articoli non si è ripresentato in pratica.
 
 ## Not Yet Specified
 
@@ -87,7 +89,7 @@ problema, non il modello.
    permette (bundling, lifecycle, env) prima di decidere la distribuzione nel grilling.
 3. **Grilling 03** (blocked da 01+02): distribuzione, modello, preset unsloth, parametri.
 4. **Build** (ticket 04, 05, 06 — blocked dal grilling).
-5. **Qualità HITL** (ticket 07, ready da subito: il server è avviabile a mano oggi stesso).
+5. ~~**Qualità HITL** (ticket 07)~~ → **CHIUSA**: qualità "molto buona" senza reasoning (2026-07-15).
 
 ## Ticket Plan
 
@@ -101,7 +103,7 @@ Cartella: `docs/tickets/llamacpp-direct/`
 | 04 | task | Sidecar lifecycle: spawn/health/kill di llama-server dall'app | blocked (03) |
 | 05 | task | Gestione del modello GGUF (path/download secondo grilling) | blocked (03) |
 | 06 | task | Cleanup preset unsloth + documentazione | blocked (03) |
-| 07 | task (HITL) | Validazione qualità traduzione senza reasoning su pagine reali | ready |
+| 07 | task (HITL) | Validazione qualità traduzione senza reasoning su pagine reali | ✅ done (`done/`) — qualità "molto buona", D5 risolto |
 
 ## Next Review
 

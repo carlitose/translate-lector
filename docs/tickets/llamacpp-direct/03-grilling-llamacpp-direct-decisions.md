@@ -21,8 +21,9 @@ su:
   override utente.
 - **D4 — Parametri default del server**: porta (8080?), `-ngl`, `-c` (allineato a n_ctx 4096),
   `--reasoning off` sempre?, `--parallel`.
-- **D5 — Quando il provider diretto diventa il default consigliato** (dipende dall'esito del
-  ticket 07 HITL qualità).
+- **D5 — Come rendere il provider diretto il default consigliato**: il prerequisito di qualità è
+  soddisfatto (ticket 07 HITL chiuso positivo, 2026-07-15). Resta da decidere *come*: solo
+  raccomandazione nel README vs default automatico all'avvio, in funzione di D1-D4.
 
 ## Acceptance Criteria
 

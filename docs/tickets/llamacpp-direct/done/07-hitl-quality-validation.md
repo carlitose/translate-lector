@@ -4,6 +4,15 @@
 
 [llamacpp-direct-wayfinder.md](../../specs/llamacpp-direct-wayfinder.md)
 
+## Status
+
+**Done** (2026-07-15) — esito: **accettabile, qualità buona**. L'utente ha letto pagine reali col
+provider `llamaserver` + `--reasoning off` e ha giudicato la traduzione "molto buona". Nessuna
+regressione bloccante rispetto alla resa con CoT via Studio. → sblocca D5 del grilling (il provider
+diretto può diventare il default consigliato). Lo scivolone sintetico sugli articoli
+("I scienziati") non si è rivelato un problema pratico sulle pagine reali; resta come nota di
+sorveglianza leggera.
+
 ## Type
 
 task (HITL — richiede lettura umana)
