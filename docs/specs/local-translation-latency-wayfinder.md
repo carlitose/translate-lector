@@ -85,9 +85,9 @@ diagnosi [local-translation-latency-diagnosis.md](./local-translation-latency-di
 - ~~Resa reale di GemmaX2-28-2B~~ → **VALIDATA nel grilling 03**: incompatibile con la pipeline (L6),
   nessun cambio modello.
 - ~~Decisioni umane L1-L6~~ → **TUTTE DECISE** nel grilling 03 (vedi Decisions So Far).
-- **Riaprire L6 in futuro**: se un modello di traduzione locale supporterà prompt system + JSON contract
-  in modo affidabile, rivalutare il cambio modello (nessun ticket aperto ora — è una nota per la
-  prossima volta che la mappa viene ripresa).
+- ~~Riaprire L6 in futuro~~ → **SUPERATA** (2026-07-15): non serve cambiare modello — bypassando il
+  proxy di Studio, llama-server diretto con `--reasoning off` elimina il CoT di gemma-4 (pagina
+  densa ~21 s vs ~99 s). Nuova mappa: [llamacpp-direct-wayfinder.md](./llamacpp-direct-wayfinder.md).
 - **Conferma e2e del ticket 04**: la stima "CoT pagato 1-2 volte per pagina invece di 18" è su finestre
   sintetiche; va verificata su pagine reali durante la build (criterio d'accettazione L5).
 

@@ -1,0 +1,55 @@
+# 03 — Grilling: decisioni su distribuzione, modello, preset e parametri
+
+## Parent Spec
+
+[llamacpp-direct-wayfinder.md](../../specs/llamacpp-direct-wayfinder.md)
+
+## Type
+
+grilling
+
+## Outcome
+
+Decisioni umane registrate (decision brief in `docs/specs/decision-brief-llamacpp-direct-03.md`)
+su:
+
+- **D1 — Distribuzione**: sidecar impacchettato nell'installer vs binario gestito in app-data
+  (scaricato/copiato al primo uso) vs solo script/docs per lancio manuale.
+- **D2 — Modello GGUF**: riuso della cache HuggingFace esistente vs download gestito dall'app vs
+  path configurabile in ⚙️ (e cosa succede se il file manca).
+- **D3 — Preset `unsloth`**: tenerlo, rimuoverlo, o tenerlo deprecato; migrazione di eventuali
+  override utente.
+- **D4 — Parametri default del server**: porta (8080?), `-ngl`, `-c` (allineato a n_ctx 4096),
+  `--reasoning off` sempre?, `--parallel`.
+- **D5 — Quando il provider diretto diventa il default consigliato** (dipende dall'esito del
+  ticket 07 HITL qualità).
+
+## Acceptance Criteria
+
+- [ ] Ogni decisione D1-D5 ha una scelta esplicita, la motivazione e le alternative scartate.
+- [ ] Decision brief scritto e linkato dalla mappa; "Not Yet Specified" della mappa ripulita.
+- [ ] I ticket di build 04-06 sono aggiornati/ri-scoperti in base alle scelte.
+
+## Blocked By
+
+- [01-research-binary-sourcing.md](./01-research-binary-sourcing.md)
+- [02-research-tauri-sidecar-contract.md](./02-research-tauri-sidecar-contract.md)
+
+## Frontier
+
+Le decisioni D1-D2 cambiano radicalmente la forma dei ticket di build (installer vs downloader vs
+docs): procedere senza grilling significherebbe costruire al buio.
+
+## Work Plan
+
+1. Presentare le evidenze dei ticket 01-02 (tabella binari, contratto Tauri).
+2. Una domanda alla volta (skill grilling), con raccomandazione per ciascuna.
+3. Scrivere il decision brief e aggiornare mappa + ticket di build.
+
+## Evidence to Capture
+
+- Risposte dell'utente, trade-off accettati, assunzioni residue.
+
+## Out of Scope
+
+- Implementazione (ticket 04-06).
