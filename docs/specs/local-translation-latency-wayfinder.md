@@ -6,7 +6,8 @@ Wayfinding spec
 
 ## Status
 
-Active
+**Completed** (2026-07-15 — build 13/04/06 mergiata in main, destinazione raggiunta; resta solo la
+verifica GUI del ticket 10 di local-llm-provider, HITL)
 
 ## Destination
 
@@ -123,9 +124,12 @@ Cartella: `docs/tickets/local-translation-latency/`
 | 01 | research | Baseline misurata: prefill/decode e secondi per chiamata sul server locale | ✅ done (`done/`) — C3 smentita, C1 corretta, CoT è il collo di bottiglia |
 | 02 | prototype | Packing di paragrafi per finestra entro budget + semantica cache | ✅ done (`done/`) — `pack_units`, ≥9×, raccomandata taglia fissa |
 | 03 | grilling | Decisioni: packing/D1, cambio modello (L6), prefetch locale, retry-on-timeout, target | ✅ done (`done/`) — L1-L6 tutte decise |
-| 04 | task | Cablare il packing nella pipeline (`PACK_TARGET_TOKENS=512`) | blocked by ticket 13 |
+| 04 | task | Cablare il packing nella pipeline (`PACK_TARGET_TOKENS=512`) | ✅ done (`done/`) — **misura reale: 18 chiamate/~9 min → 2 chiamate/99 s, zero timeout, L5 PASS** |
 | 05 | task | Cap del summary nelle chiamate translate-only | ✅ done (`done/`) — **chiuso senza implementazione** (L2) |
-| 06 | task | Serializzare prefetch (priorità on-demand) + cancellare i job stantii | blocked by nulla — **ready** |
+| 06 | task | Serializzare prefetch (priorità on-demand) + cancellare i job stantii | ✅ done (`done/`) — slot singolo + cursore, serializzazione dimostrata live |
+
+Anche il ticket 13 (timeout, epica local-llm-provider) è ✅ done. Tutto mergiato in main il 2026-07-15
+(commit `6b645e8`), suite 239/239 verde.
 
 Fuori cartella ma correlato: [13-local-inference-timeout.md](../tickets/local-llm-provider/13-local-inference-timeout.md)
 (ready, **prioritario**: è il fix diretto del sintomo e prerequisito del ticket 04; la sua ipotesi
