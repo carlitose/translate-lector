@@ -30,6 +30,10 @@ keyring = "4"
 sha2 = "0.10"
 # Native file picker for "Apri PDF" (ticket 06, SPECIFICATION §3.1).
 tauri-plugin-dialog = "2"
+# Spawn/kill the app-managed llama-server on-demand (ticket 04, D1/D5). Used
+# from Rust via `app.shell().command(<abs_path>)` for the external binary at the
+# user-configured path (not a bundled sidecar); `CommandChild` drives kill-on-exit.
+tauri-plugin-shell = "2"
 # OpenRouter HTTP transport (ticket 08, §4.4). Blocking client used inside a
 # `spawn_blocking` task; rustls-tls avoids a system OpenSSL dependency.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }

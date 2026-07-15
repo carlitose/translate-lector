@@ -768,16 +768,26 @@ pub fn classify_send_error(
     }
 }
 
+/// The `host[:port]` authority slice of `url`, i.e. everything after the scheme
+/// and before the path, with any `user:pass@` userinfo stripped. Shared by
+/// [`is_local_url`] and [`port_from_base_url`] so the scheme-strip /
+/// authority-split / userinfo-strip steps live in one place. Pure string parsing
+/// (no DNS). Note: bracketed IPv6 literals keep their brackets here (`[::1]:8080`);
+/// the callers unwrap them as needed.
+fn authority_host_port(url: &str) -> &str {
+    // Drop the scheme, then keep only the authority (up to the first '/').
+    let after_scheme = url.split("://").nth(1).unwrap_or(url);
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    // Strip any userinfo ("user:pass@host").
+    authority.rsplit('@').next().unwrap_or(authority)
+}
+
 /// Whether `url`'s host is a loopback/local address (`localhost`, `127.x.x.x`,
 /// `::1`, `0.0.0.0`). Used to tell a **local server down** ([`LlmError::Unreachable`])
 /// apart from a **remote endpoint unreachable** ([`LlmError::Offline`], EC02) on
 /// a connection failure. Pure string parsing (no DNS), unit-testable.
 pub fn is_local_url(url: &str) -> bool {
-    // Drop the scheme, then keep only the authority (up to the first '/').
-    let after_scheme = url.split("://").nth(1).unwrap_or(url);
-    let authority = after_scheme.split('/').next().unwrap_or("");
-    // Strip any userinfo ("user:pass@host").
-    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    let host_port = authority_host_port(url);
     // Strip the port, honouring bracketed IPv6 literals ("[::1]:8080").
     let host = if let Some(rest) = host_port.strip_prefix('[') {
         rest.split(']').next().unwrap_or(rest)
@@ -786,6 +796,26 @@ pub fn is_local_url(url: &str) -> bool {
     };
     let h = host.to_ascii_lowercase();
     h == "localhost" || h == "::1" || h == "0.0.0.0" || h.starts_with("127.")
+}
+
+/// Extract the explicit TCP port from a chat-completions `base_url`, honouring
+/// bracketed IPv6 literals (`http://[::1]:8080/v1` → `8080`). Returns `None`
+/// when the authority carries no explicit `:port` — the scheme default is
+/// deliberately **not** inferred: the llama-server spawner (ticket 04) needs a
+/// concrete `--port`, and falling back to a hardcoded default is the caller's
+/// choice, not this parser's. Pure string parsing (no DNS), unit-testable.
+pub fn port_from_base_url(url: &str) -> Option<u16> {
+    let host_port = authority_host_port(url);
+    let port_str = if let Some(rest) = host_port.strip_prefix('[') {
+        // "[::1]:8080" → after the closing bracket, drop the leading ':'.
+        rest.split(']').nth(1)?.strip_prefix(':')?
+    } else {
+        // "host:port" → the part after the single ':'. No ':' → no port.
+        let mut parts = host_port.splitn(2, ':');
+        let _host = parts.next();
+        parts.next()?
+    };
+    port_str.parse::<u16>().ok()
 }
 
 /// Derive a cheap `/v1/models` reachability-probe URL from a chat-completions
@@ -2395,6 +2425,19 @@ E così, senza fretta, l'argomentazione si chiude.";
     }
 
     #[test]
+    fn authority_host_port_isolates_the_authority_slice() {
+        // Shared by is_local_url + port_from_base_url: scheme-strip, path-split,
+        // userinfo-strip. IPv6 brackets are preserved for the callers to unwrap.
+        assert_eq!(authority_host_port("http://127.0.0.1:8080/v1/chat/completions"), "127.0.0.1:8080");
+        assert_eq!(authority_host_port("http://localhost/v1"), "localhost");
+        assert_eq!(authority_host_port("http://[::1]:1234/v1"), "[::1]:1234");
+        // Userinfo is dropped, so the host (not the credentials) is what remains.
+        assert_eq!(authority_host_port("http://user:pass@host:9000/v1"), "host:9000");
+        // No scheme: the whole string is treated as the authority+path.
+        assert_eq!(authority_host_port("localhost:8080/v1"), "localhost:8080");
+    }
+
+    #[test]
     fn is_local_url_recognises_loopback_hosts_only() {
         assert!(is_local_url("http://localhost:8888/v1/chat/completions"));
         assert!(is_local_url("http://127.0.0.1:8080/v1/chat/completions"));
@@ -2405,6 +2448,24 @@ E così, senza fretta, l'argomentazione si chiude.";
         assert!(!is_local_url(OPENROUTER_URL));
         assert!(!is_local_url("https://api.example.com/v1/chat/completions"));
         assert!(!is_local_url("http://192.168.1.10:8888/v1")); // LAN IP, not loopback
+    }
+
+    #[test]
+    fn port_from_base_url_reads_the_explicit_port() {
+        assert_eq!(port_from_base_url("http://127.0.0.1:8080/v1/chat/completions"), Some(8080));
+        assert_eq!(port_from_base_url("http://localhost:8888/v1"), Some(8888));
+        assert_eq!(port_from_base_url("http://[::1]:1234/v1/chat/completions"), Some(1234));
+        assert_eq!(port_from_base_url("https://host:443/"), Some(443));
+    }
+
+    #[test]
+    fn port_from_base_url_is_none_without_an_explicit_port() {
+        // No scheme default is inferred: the spawner must decide the fallback.
+        assert_eq!(port_from_base_url("http://localhost/v1/chat/completions"), None);
+        assert_eq!(port_from_base_url("https://openrouter.ai/api/v1/chat/completions"), None);
+        // Out-of-range / non-numeric ports do not parse.
+        assert_eq!(port_from_base_url("http://localhost:99999/v1"), None);
+        assert_eq!(port_from_base_url("http://localhost:abc/v1"), None);
     }
 
     #[test]

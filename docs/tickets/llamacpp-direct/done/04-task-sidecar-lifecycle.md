@@ -68,3 +68,44 @@ PowerShell da ricordare.
 
 - Risoluzione dei path binario/GGUF e loro default (ticket 05).
 - Preset unsloth e docs (ticket 06).
+
+## Esito implementazione (2026-07-15)
+
+**Meccanismo di spawn scelto**: `tauri-plugin-shell` (`app.shell().command(<abs_path>)`).
+Confermato via ctx7 (`/websites/v2_tauri_app`) che l'API Rust accetta un programma
+esterno arbitrario (es. `cargo`/`echo`) e che la *scope* `shell:allow-execute` vincola solo
+la superficie IPC/JS, non lo spawn lato Rust → un path assoluto runtime funziona senza
+scope-wrangling, e resta il `CommandChild` per il kill-on-exit (pattern ticket 02).
+
+**Logica pura TDD** (in `src-tauri/src/sidecar.rs`, 13 test + 2 in `llm.rs`):
+- `spawn_decision(is_local, reachable, paths_ok) -> SpawnAction` (Spawn / ReuseExisting /
+  SkipRemote / ErrorMissingPaths).
+- `is_managed_local_provider(is_local, binary_blank)` — solo `llamaserver` è gestito; unsloth/
+  lmstudio/ollama (senza `binary_path`) restano lanciati dall'utente.
+- `build_llama_args(port, n_ctx, model)` — asseriti `-m`, `--port`, `-ngl 99`, `-c`,
+  `--reasoning off`, `--parallel 1` (D4).
+- `port_from_base_url` (in `llm.rs`, IPv6-aware) per la porta dello spawn.
+- `reap_decision(persisted_pid, alive)` + `binary_image_name` per il reap conservativo.
+
+**Shell imperativo (sottile, non testato con processi reali)**: `ensure_local_server_ready`
+(spawn on-demand dietro `LocalProviderSlot` → niente doppio spawn concorrente; poll
+`probe_reachable` fino a ~30s; messaggi azionabili), `kill_llama_server_on_exit`
+(`RunEvent::Exit | ExitRequested` → `.take()` + `.kill()`), `reap_stale_llama_server_on_startup`
+(PID persistito in app-config, guardia per nome immagine via `tasklist`/`taskkill` su Windows).
+
+**Verifica automatica**: `cargo build` OK; `cargo test` **271 passed, 0 failed** (era 256 dopo
+ticket 05; +15). Frontend non toccato (nessun `npm run check` necessario).
+
+**Criteri che richiedono conferma e2e umana** (non lanciabili AFK — serve la GUI + llama-server
+reale, e c'era un llama-server manuale su :8080 da non toccare):
+- Spawn reale del server alla prima traduzione (logica testata; processo reale no).
+- Kill affidabile alla chiusura senza orfani (serve `RunEvent` con GUI reale).
+- Reap di un orfano dopo hard-crash (serve simulare il crash con la GUI).
+- Riuso di un server sano già in ascolto (probe→ReuseExisting) — verificabile puntando al :8080
+  esistente senza rilanciare.
+
+## Open follow-ups
+
+- **Istanza singola**: l'app assume una sola istanza in esecuzione. Il PID file è condiviso, quindi
+  lanciare una seconda istanza potrebbe reapare il server app-managed della prima. Fix futuro
+  consigliato: registrare `tauri-plugin-single-instance` (non aggiunto ora).
