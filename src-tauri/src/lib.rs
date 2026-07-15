@@ -522,12 +522,20 @@ async fn translate_page(
             .map_err(|e| e.to_string())?
             .unwrap_or_default();
         // Costruisci il client sull'endpoint del provider attivo; le attribution
-        // header OpenRouter partono solo per openrouter (Ticket 05).
+        // header OpenRouter partono solo per openrouter (Ticket 05). `app_managed`
+        // (ticket 09) marca il provider llama.cpp che l'app avvia da sé — stessa
+        // nozione di `sidecar::is_managed_local_provider` — così un errore di
+        // connessione produce il messaggio "Unreachable" provider-aware.
+        let app_managed = sidecar::is_managed_local_provider(
+            llm::is_local_url(&cfg.base_url),
+            cfg.binary_path.trim().is_empty(),
+        );
         let base = llm::ChatCompletionsClient::new(
             cfg.base_url.clone(),
             api_key,
             /* send_openrouter_headers = */ active_id == "openrouter",
             cfg.timeout_secs,
+            app_managed,
         );
         // Retry transient failures (5xx/429/offline) with backoff (NFR06). A
         // Timeout is retried too on cloud (unchanged), but NOT on a local

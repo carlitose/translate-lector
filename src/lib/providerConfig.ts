@@ -159,13 +159,50 @@ export function shouldShowLocalHint(
 }
 
 /**
- * Onboarding hint shown when the active local provider is not reachable (D3/D7).
- * Mirrors the core `LlmError::Unreachable` copy but stays generic (no base_url),
- * since it fires proactively from a health check, not from a failed translation.
+ * Whether `id` is the **app-managed** local provider — the direct llama.cpp
+ * `llamaserver` preset, which the app itself spawns and stops (D5). Mirrors the
+ * core's `sidecar::is_managed_local_provider` notion, but the UI only needs the
+ * provider id: the core owns the `binary_path` detail that actually drives the
+ * classification. Single frontend source of truth for the distinction so the
+ * "which providers are app-managed" notion is not duplicated (ticket 09).
  */
-export const LOCAL_UNREACHABLE_HINT =
+export function isAppManagedProvider(id: string | null | undefined): boolean {
+  return id === 'llamaserver';
+}
+
+/**
+ * Onboarding hint for the **app-managed** local provider (`llamaserver`): the
+ * app spawns llama-server itself, so an unreachable probe usually means it is
+ * still starting / not ready yet — never tell the user to launch it by hand and
+ * never mention Unsloth Studio (ticket 09). Points at ⚙️ for the paths. Kept in
+ * sync with the core `LlmError::Unreachable` app-managed copy.
+ */
+export const LOCAL_UNREACHABLE_HINT_APP_MANAGED =
+  'Il server locale llama.cpp si sta avviando o non è ancora pronto. ' +
+  'Attendi qualche secondo e riprova; se persiste, verifica i path in ⚙️.';
+
+/**
+ * Onboarding hint for **user-launched** local providers (Unsloth / LM Studio /
+ * Ollama): the user runs the server, so the actionable copy is to start it or
+ * check the address in ⚙️ (ticket 09 — unchanged from the original hint). Kept
+ * in sync with the core `LlmError::Unreachable` user-launched copy.
+ */
+export const LOCAL_UNREACHABLE_HINT_USER_LAUNCHED =
   'Server locale non raggiungibile. Avvia il server (es. Unsloth Studio) ' +
   'oppure apri ⚙️ Impostazioni per verificarne l’indirizzo o passare a OpenRouter.';
+
+/**
+ * Select the correct "local server unreachable" hint for the active provider:
+ * the app-managed copy for `llamaserver` (starting up — no manual launch, no
+ * Unsloth), the user-launched copy for the other local providers (ticket 09).
+ * Keeps the message provider-aware in one place; the banner just passes the
+ * active provider id.
+ */
+export function localUnreachableHint(id: string | null | undefined): string {
+  return isAppManagedProvider(id)
+    ? LOCAL_UNREACHABLE_HINT_APP_MANAGED
+    : LOCAL_UNREACHABLE_HINT_USER_LAUNCHED;
+}
 
 /**
  * Resolve the effective base-URL for a provider: the stored override when it is a

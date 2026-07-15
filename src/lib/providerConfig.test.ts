@@ -11,7 +11,10 @@ import {
   keyAcceptable,
   isLocalProvider,
   shouldShowLocalHint,
-  LOCAL_UNREACHABLE_HINT,
+  isAppManagedProvider,
+  localUnreachableHint,
+  LOCAL_UNREACHABLE_HINT_APP_MANAGED,
+  LOCAL_UNREACHABLE_HINT_USER_LAUNCHED,
   DEFAULT_N_CTX_LOCAL,
   DEFAULT_N_CTX_CLOUD,
   resolveNctx
@@ -199,7 +202,41 @@ describe('shouldShowLocalHint', () => {
   });
 
   it('has actionable Italian copy pointing at the server and ⚙️', () => {
-    expect(LOCAL_UNREACHABLE_HINT).toContain('Server locale non raggiungibile');
-    expect(LOCAL_UNREACHABLE_HINT).toContain('⚙️');
+    // The user-launched hint is the default (non-llamaserver) branch.
+    expect(localUnreachableHint('unsloth')).toContain('Server locale non raggiungibile');
+    expect(localUnreachableHint('unsloth')).toContain('⚙️');
+  });
+});
+
+describe('isAppManagedProvider', () => {
+  it('is true only for the app-managed llamaserver preset', () => {
+    expect(isAppManagedProvider('llamaserver')).toBe(true);
+    expect(isAppManagedProvider('unsloth')).toBe(false);
+    expect(isAppManagedProvider('lmstudio')).toBe(false);
+    expect(isAppManagedProvider('ollama')).toBe(false);
+    expect(isAppManagedProvider('openrouter')).toBe(false);
+    expect(isAppManagedProvider('mystery')).toBe(false);
+    expect(isAppManagedProvider(null)).toBe(false);
+    expect(isAppManagedProvider(undefined)).toBe(false);
+  });
+});
+
+describe('localUnreachableHint (provider-aware, ticket 09)', () => {
+  it('for the app-managed provider (llamaserver): says starting/not ready, no manual launch, no Unsloth', () => {
+    const hint = localUnreachableHint('llamaserver');
+    expect(hint).toBe(LOCAL_UNREACHABLE_HINT_APP_MANAGED);
+    expect(hint).not.toContain('Unsloth Studio');
+    expect(hint).not.toContain('Avvia il server');
+    expect(hint).toMatch(/si sta avviando|non è ancora pronto/);
+    expect(hint).toContain('⚙️');
+  });
+
+  it('for user-launched local providers: keeps the manual-launch copy', () => {
+    for (const id of ['unsloth', 'lmstudio', 'ollama']) {
+      const hint = localUnreachableHint(id);
+      expect(hint).toBe(LOCAL_UNREACHABLE_HINT_USER_LAUNCHED);
+      expect(hint).toContain('Avvia il server (es. Unsloth Studio)');
+      expect(hint).toContain('⚙️');
+    }
   });
 });

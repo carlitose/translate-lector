@@ -7,7 +7,7 @@
   import { reconstruct, type TextItem } from '$lib/pdfExtract';
   import ProviderConfig from '$lib/ProviderConfig.svelte';
   import GlossaryPanel from '$lib/GlossaryPanel.svelte';
-  import { isLocalProvider, shouldShowLocalHint, LOCAL_UNREACHABLE_HINT } from '$lib/providerConfig';
+  import { isLocalProvider, shouldShowLocalHint, localUnreachableHint } from '$lib/providerConfig';
   import {
     translationErrorMessage,
     pageStatusLabel,
@@ -319,7 +319,7 @@
       const reachable = await invoke<boolean>('check_provider_reachable', {
         providerId: activeId
       });
-      providerHint = shouldShowLocalHint(activeId, reachable) ? LOCAL_UNREACHABLE_HINT : '';
+      providerHint = shouldShowLocalHint(activeId, reachable) ? localUnreachableHint(activeId) : '';
     } catch {
       providerHint = ''; // never block on a health-check failure
     }

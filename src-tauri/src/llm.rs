@@ -288,7 +288,14 @@ pub enum LlmError {
     /// cloud (decision D4).
     ///
     /// [`Offline`]: LlmError::Offline
-    Unreachable(String),
+    ///
+    /// `app_managed` distinguishes the **app-managed** local provider (the direct
+    /// llama.cpp `llamaserver` preset, which the app spawns itself — mirrors
+    /// `sidecar::is_managed_local_provider`) from **user-launched** ones
+    /// (Unsloth / LM Studio / Ollama). It drives a provider-aware message: for
+    /// the app-managed server "it's starting / not ready yet" (no manual-launch
+    /// invite), for user-launched ones the "start the server" copy (ticket 09).
+    Unreachable { base_url: String, app_managed: bool },
     /// The response came back with empty/`null` `content` **and**
     /// `finish_reason == "length"`: the model exhausted its completion-token
     /// budget before emitting any text — typically a **reasoning** model whose
@@ -393,11 +400,25 @@ impl LlmError {
                      leggibili dalla cache. {m}"
                 )
             }
-            LlmError::Unreachable(base_url) => {
-                format!(
-                    "Server locale non raggiungibile a {base_url}. \
-                     Avvia il server (es. Unsloth Studio) o verifica l'indirizzo in ⚙️."
-                )
+            LlmError::Unreachable { base_url, app_managed } => {
+                if *app_managed {
+                    // App-managed llama.cpp (`llamaserver`): the app spawns the
+                    // server itself, so telling the user to launch it by hand —
+                    // or to open Unsloth Studio — is misleading. An unreachable
+                    // probe here means it's still starting / not ready (ticket 09).
+                    format!(
+                        "Il server locale llama.cpp a {base_url} si sta avviando o non è \
+                         ancora pronto. Attendi qualche secondo e riprova; se persiste, \
+                         verifica i path in ⚙️."
+                    )
+                } else {
+                    // User-launched local providers (Unsloth / LM Studio / Ollama):
+                    // the user runs the server, so the manual-launch copy is correct.
+                    format!(
+                        "Server locale non raggiungibile a {base_url}. \
+                         Avvia il server (es. Unsloth Studio) o verifica l'indirizzo in ⚙️."
+                    )
+                }
             }
             LlmError::OutputBudgetExhausted(_) => {
                 "EC08: il modello locale ha esaurito il budget di token \
@@ -581,6 +602,12 @@ pub struct ChatCompletionsClient {
     base_url: String,
     api_key: String,
     send_openrouter_headers: bool,
+    /// Whether `base_url` is the **app-managed** local provider (the direct
+    /// llama.cpp `llamaserver` preset the app spawns — see
+    /// `sidecar::is_managed_local_provider`). Threaded into
+    /// [`LlmError::Unreachable`] so a connection-refused failure yields a
+    /// provider-aware message (ticket 09).
+    app_managed: bool,
     http: reqwest::blocking::Client,
 }
 
@@ -589,17 +616,28 @@ impl ChatCompletionsClient {
     /// per-provider (ticket 13): explicit rather than relying on reqwest's
     /// undocumented-in-app 30s default. Falls back to an untimed client (never
     /// panics) if the builder were to fail, mirroring [`probe_reachable`]'s style.
+    ///
+    /// `app_managed` marks the app-spawned llama.cpp `llamaserver` provider (see
+    /// `sidecar::is_managed_local_provider`), so a connection-refused failure
+    /// produces the provider-aware [`LlmError::Unreachable`] message (ticket 09).
     pub fn new(
         base_url: impl Into<String>,
         api_key: impl Into<String>,
         send_openrouter_headers: bool,
         timeout_secs: u32,
+        app_managed: bool,
     ) -> Self {
         let http = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(timeout_secs.into()))
             .build()
             .unwrap_or_else(|_| reqwest::blocking::Client::new());
-        Self { base_url: base_url.into(), api_key: api_key.into(), send_openrouter_headers, http }
+        Self {
+            base_url: base_url.into(),
+            api_key: api_key.into(),
+            send_openrouter_headers,
+            app_managed,
+            http,
+        }
     }
 }
 
@@ -629,7 +667,13 @@ impl ChatClient for ChatCompletionsClient {
                 // Classify transport failures so the retry layer can react
                 // (timeout = transient; connection refused to a local server =
                 // fail-fast Unreachable; to a remote endpoint = offline EC02).
-                classify_send_error(e.is_timeout(), e.is_connect(), &self.base_url, e.to_string())
+                classify_send_error(
+                    e.is_timeout(),
+                    e.is_connect(),
+                    &self.base_url,
+                    self.app_managed,
+                    e.to_string(),
+                )
             })?;
 
         let status = resp.status();
@@ -723,9 +767,12 @@ pub fn is_unsupported_params_error(status: u16, body: &str) -> bool {
 ///
 /// - **timeout** → [`Timeout`] (transient, retried with backoff, NFR06).
 /// - **connect** (connection refused / cannot connect to host): for a **local**
-///   endpoint → [`Unreachable`] carrying the `base_url` (the local server is
-///   down — fail-fast, no retry, no cloud fallback, D4); for a **remote**
-///   endpoint → [`Offline`] (EC02, no connection).
+///   endpoint → [`Unreachable`] carrying the `base_url` and `is_app_managed`
+///   (the local server is down — fail-fast, no retry, no cloud fallback, D4).
+///   `is_app_managed` (from `sidecar::is_managed_local_provider`) makes the
+///   message provider-aware: "starting / not ready" for the app-managed
+///   llama.cpp server vs "start the server" for user-launched ones (ticket 09).
+///   For a **remote** endpoint → [`Offline`] (EC02, no connection).
 /// - anything else → [`Http`] (permanent).
 ///
 /// [`Timeout`]: LlmError::Timeout
@@ -736,6 +783,7 @@ pub fn classify_send_error(
     is_timeout: bool,
     is_connect: bool,
     base_url: &str,
+    is_app_managed: bool,
     msg: String,
 ) -> LlmError {
     if is_timeout {
@@ -759,7 +807,7 @@ pub fn classify_send_error(
         }
     } else if is_connect {
         if is_local_url(base_url) {
-            LlmError::Unreachable(base_url.to_string())
+            LlmError::Unreachable { base_url: base_url.to_string(), app_managed: is_app_managed }
         } else {
             LlmError::Offline(msg)
         }
@@ -2358,13 +2406,48 @@ E così, senza fretta, l'argomentazione si chiude.";
             /* is_timeout = */ false,
             /* is_connect = */ true,
             base,
+            /* is_app_managed = */ false,
             "connection refused".into(),
         );
-        assert_eq!(err, LlmError::Unreachable(base.to_string()));
+        assert_eq!(err, LlmError::Unreachable { base_url: base.to_string(), app_managed: false });
         let msg = err.user_message();
         assert!(msg.contains(base), "message names the configured base_url");
         assert!(msg.contains("Server locale non raggiungibile"), "clear local-down copy");
         assert!(msg.contains("⚙️"), "actionable: points at settings");
+
+        // The app-managed flag threads through to the variant so the message can
+        // be provider-aware (ticket 09).
+        let managed = classify_send_error(false, true, base, /* is_app_managed = */ true, "x".into());
+        assert_eq!(managed, LlmError::Unreachable { base_url: base.to_string(), app_managed: true });
+    }
+
+    #[test]
+    fn unreachable_message_is_provider_aware() {
+        // Ticket 09: the "local server unreachable" copy depends on whether the
+        // app spawns the server (llamaserver) or the user does (unsloth/…).
+        let base = "http://127.0.0.1:8080/v1/chat/completions";
+
+        // App-managed (llamaserver): the app spawns it — so NO "avvia il server"
+        // and NO "Unsloth Studio"; it conveys "starting / not ready yet".
+        let managed = LlmError::Unreachable { base_url: base.to_string(), app_managed: true };
+        let m = managed.user_message();
+        assert!(!m.contains("Unsloth Studio"), "app-managed must not mention Unsloth Studio: {m}");
+        assert!(!m.contains("Avvia il server"), "app-managed must not tell the user to launch it: {m}");
+        assert!(
+            m.contains("si sta avviando") || m.contains("non è ancora pronto"),
+            "app-managed conveys starting/not-ready: {m}"
+        );
+        assert!(m.contains(base), "still names the base_url: {m}");
+        assert!(m.contains("⚙️"), "points at settings for the paths: {m}");
+
+        // User-launched (unsloth/lmstudio/ollama): keep the manual-launch copy.
+        let user = LlmError::Unreachable { base_url: base.to_string(), app_managed: false };
+        let u = user.user_message();
+        assert!(
+            u.contains("Avvia il server (es. Unsloth Studio)"),
+            "user-launched keeps the manual-launch copy: {u}"
+        );
+        assert!(u.contains("⚙️"), "points at settings: {u}");
     }
 
     #[test]
@@ -2375,6 +2458,7 @@ E così, senza fretta, l'argomentazione si chiude.";
             false,
             true,
             OPENROUTER_URL,
+            /* is_app_managed = */ false,
             "dns error".into(),
         );
         assert_eq!(err, LlmError::Offline("dns error".into()));
@@ -2387,7 +2471,7 @@ E così, senza fretta, l'argomentazione si chiude.";
         // *message* is what differs by host — ticket 13, see the dedicated
         // tests below); a non-timeout/non-connect failure stays Http either way.
         assert!(matches!(
-            classify_send_error(true, false, "http://localhost:8888/v1/chat/completions", "t".into()),
+            classify_send_error(true, false, "http://localhost:8888/v1/chat/completions", false, "t".into()),
             LlmError::Timeout(_)
         ));
         // The generic/remote branch now owns its final message (including the
@@ -2395,11 +2479,11 @@ E così, senza fretta, l'argomentazione si chiude.";
         // `user_message` never has to guess whether a prefix is still needed
         // (ticket 13 review: avoids double-prefixing the local message).
         assert_eq!(
-            classify_send_error(true, false, OPENROUTER_URL, "t".into()),
+            classify_send_error(true, false, OPENROUTER_URL, false, "t".into()),
             LlmError::Timeout("Errore di rete/servizio LLM (timeout): t".into())
         );
         assert_eq!(
-            classify_send_error(false, false, "http://localhost:8888/v1/chat/completions", "x".into()),
+            classify_send_error(false, false, "http://localhost:8888/v1/chat/completions", false, "x".into()),
             LlmError::Http("x".into())
         );
     }
@@ -2410,7 +2494,7 @@ E così, senza fretta, l'argomentazione si chiude.";
         // is too slow (or the server dropped the connection) — the message must
         // point the user at raising the timeout / a faster model / smaller
         // n_ctx, not the generic cloud-y copy.
-        let err = classify_send_error(true, false, "http://localhost:8888/v1/chat/completions", "t".into());
+        let err = classify_send_error(true, false, "http://localhost:8888/v1/chat/completions", false, "t".into());
         let msg = err.user_message();
         assert!(
             msg.contains("server locale") || msg.contains("Server locale"),
@@ -2425,14 +2509,17 @@ E così, senza fretta, l'argomentazione si chiude.";
 
     #[test]
     fn timeout_on_a_remote_url_keeps_the_generic_message() {
-        let err = classify_send_error(true, false, OPENROUTER_URL, "t".into());
+        let err = classify_send_error(true, false, OPENROUTER_URL, false, "t".into());
         let msg = err.user_message();
         assert_eq!(msg, "Errore di rete/servizio LLM (timeout): t");
     }
 
     #[test]
     fn unreachable_is_fail_fast_not_transient_and_not_degradable() {
-        let e = LlmError::Unreachable("http://localhost:8888/v1/chat/completions".into());
+        let e = LlmError::Unreachable {
+            base_url: "http://localhost:8888/v1/chat/completions".into(),
+            app_managed: false,
+        };
         // Must NOT be retried with backoff (would spin on a down server), and is
         // not a param-relaxation case either — it surfaces immediately.
         assert!(!e.is_transient(), "a down local server fails fast, no backoff retry");
@@ -2443,12 +2530,13 @@ E così, senza fretta, l'argomentazione si chiude.";
     fn retry_layer_returns_unreachable_immediately_without_spinning() {
         // A down local server (Unreachable) must fail fast: the RetryingChatClient
         // returns it on the first attempt, never looping/hanging (ticket 09).
-        let inner = SeqClient::new(vec![Err(LlmError::Unreachable(
-            "http://localhost:8888/v1/chat/completions".into(),
-        ))]);
+        let inner = SeqClient::new(vec![Err(LlmError::Unreachable {
+            base_url: "http://localhost:8888/v1/chat/completions".into(),
+            app_managed: false,
+        })]);
         let client = RetryingChatClient::new(&inner, RetryPolicy::no_delay(5));
         let err = client.complete(&a_request()).unwrap_err();
-        assert!(matches!(err, LlmError::Unreachable(_)));
+        assert!(matches!(err, LlmError::Unreachable { .. }));
         assert_eq!(inner.calls.get(), 1, "no retry on a fail-fast Unreachable");
     }
 
@@ -2456,9 +2544,12 @@ E così, senza fretta, l'argomentazione si chiude.";
     fn complete_with_fallback_passes_unreachable_through_without_cloud_fallback() {
         // D4: an unreachable local server must NOT trigger any fallback — the
         // error surfaces unchanged (no second, cloud-bound attempt).
-        let inner = SeqClient::new(vec![Err(LlmError::Unreachable("http://127.0.0.1:8080".into()))]);
+        let inner = SeqClient::new(vec![Err(LlmError::Unreachable {
+            base_url: "http://127.0.0.1:8080".into(),
+            app_managed: false,
+        })]);
         let err = complete_with_fallback(&inner, &a_request()).unwrap_err();
-        assert!(matches!(err, LlmError::Unreachable(_)));
+        assert!(matches!(err, LlmError::Unreachable { .. }));
         assert_eq!(inner.calls.get(), 1, "no degrade/fallback attempt on Unreachable");
     }
 
@@ -2797,6 +2888,7 @@ E così, senza fretta, l'argomentazione si chiude.";
             "   ",
             /* send_openrouter_headers = */ true,
             30,
+            /* app_managed = */ false,
         );
         let req = build_request("openai/gpt-4o", build_messages("it", "x", "", "", "", false, 1000), 4096);
         assert_eq!(client.complete(&req), Err(LlmError::MissingApiKey));
@@ -2811,7 +2903,7 @@ E così, senza fretta, l'argomentazione si chiude.";
             "HTTP/1.1 503 Service Unavailable",
             r#"{"error":{"code":503,"message":"Loading model","type":"unavailable_error"}}"#,
         );
-        let client = ChatCompletionsClient::new(base, "test-key", false, 5);
+        let client = ChatCompletionsClient::new(base, "test-key", false, 5, false);
         let req = build_request("m", build_messages("it", "x", "", "", "", false, 1000), 4096);
         let err = client.complete(&req).unwrap_err();
         assert!(matches!(err, LlmError::ServerError(_)), "503 → ServerError, got {err:?}");
@@ -2827,7 +2919,7 @@ E così, senza fretta, l'argomentazione si chiude.";
             "HTTP/1.1 503 Service Unavailable",
             r#"{"error":{"message":"upstream overloaded"}}"#,
         );
-        let client = ChatCompletionsClient::new(base, "test-key", false, 5);
+        let client = ChatCompletionsClient::new(base, "test-key", false, 5, false);
         let req = build_request("m", build_messages("it", "x", "", "", "", false, 1000), 4096);
         let err = client.complete(&req).unwrap_err();
         assert!(matches!(err, LlmError::ServerError(_)), "other 503 → ServerError, got {err:?}");
@@ -2857,7 +2949,7 @@ E così, senza fretta, l'argomentazione si chiude.";
         });
 
         let base_url = format!("http://{addr}/v1/chat/completions");
-        let client = ChatCompletionsClient::new(base_url, "test-key", false, 1);
+        let client = ChatCompletionsClient::new(base_url, "test-key", false, 1, false);
         let req = build_request("openai/gpt-4o", build_messages("it", "x", "", "", "", false, 1000), 4096);
 
         let start = std::time::Instant::now();
@@ -2906,7 +2998,7 @@ E così, senza fretta, l'argomentazione si chiude.";
         });
 
         let base_url = format!("http://{addr}/v1/chat/completions");
-        let client = ChatCompletionsClient::new(base_url, "test-key", send_openrouter_headers, 30);
+        let client = ChatCompletionsClient::new(base_url, "test-key", send_openrouter_headers, 30, false);
         let req = build_request("openai/gpt-4o", build_messages("it", "x", "", "", "", false, 1000), 4096);
         let _ = client.complete(&req);
         let captured = rx.recv().unwrap();
