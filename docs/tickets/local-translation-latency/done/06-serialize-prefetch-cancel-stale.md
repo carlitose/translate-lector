@@ -25,14 +25,25 @@ pagina interrompe (o al più tardi al confine di unità) il job backend in corso
 
 ## Acceptance Criteria
 
-- [ ] Con navigazione rapida, mai più di una richiesta in volo verso il provider locale (verificabile dai
+- [x] Con navigazione rapida, mai più di una richiesta in volo verso il provider locale (verificabile dai
       log del server): un solo slot per provider locale, priorità sempre all'on-demand (L3).
-- [ ] Un job di traduzione stantio (pagina non più corrente) o un prefetch ceduto per priorità si
+      Implementato con `LocalProviderSlot(Mutex<()>)` (`lib.rs`), acquisito per l'intera durata di
+      `translate::translate_page` solo quando `llm::is_local_url(&cfg.base_url)` è vero — garanzia
+      strutturale (mutex), non solo probabilistica. Il cloud non acquisisce nulla (invariato). Non è stata
+      eseguita una verifica manuale con log di un server locale reale (nessun Unsloth Studio disponibile in
+      sandbox); la garanzia è comunque data dal mutex stesso, verificabile per ispezione del codice.
+- [x] Un job di traduzione stantio (pagina non più corrente) o un prefetch ceduto per priorità si
       interrompe al confine della finestra in corso: niente nuove chiamate LLM per pagine abbandonate; le
       finestre già completate restano in cache (comportamento cache parziale invariato).
-- [ ] L'interruzione non produce errori visibili all'utente né righe di cache corrotte.
-- [ ] Test Rust sulla logica di cancellazione/priorità (flag/token controllabile nei test); frontend
+      Test: `translate::tests::is_current_false_before_second_unit_cancels_without_extra_calls_and_keeps_prior_cache`.
+- [x] L'interruzione non produce errori visibili all'utente né righe di cache corrotte.
+      `LlmError::Cancelled` ha un messaggio a basso profilo (nessun "Errore"/codice EC0x allarmante,
+      verificato da `llm::tests::cancelled_is_neither_transient_nor_param_degradable_and_has_a_low_key_message`)
+      e il frontend scarta già i risultati di richieste non più correnti (`translation.ts`, invariato).
+- [x] Test Rust sulla logica di cancellazione/priorità (flag/token controllabile nei test); frontend
       invariato o con modifiche minime a `translation.ts`/`+page.svelte`.
+      Frontend non toccato. Test aggiunti: `llm.rs` (1), `translate.rs` (1), `lib.rs` (7, funzioni pure
+      `is_page_current`/`update_current_page` senza Tauri/Mutex).
 
 ## Blocked By
 
@@ -62,6 +73,19 @@ visibile nella navigazione rapida.
 
 - Diff, output test, log del server locale che mostrano una sola richiesta in volo durante navigazione
   rapida.
+
+### Evidenza raccolta (implementazione)
+
+- `cargo test` (da `src-tauri`): 219 passed (baseline pre-ticket: 210 su questo branch).
+- Design realizzato leggermente diverso dal Work Plan iniziale: invece di un token di cancellazione
+  `AtomicU64`/generazione per documento, si usa un cursore `document_id -> page_number` (`CurrentPage`,
+  `HashMap<i64,i64>` dietro `Mutex`) scritto solo dalle richieste on-demand e letto da un predicato
+  `is_current` passato a `TranslateParams`. Stessa proprietà (un job nota di essere stantio al confine di
+  unità), ma più leggibile e testabile in modo puro (`is_page_current`/`update_current_page`, senza
+  Tauri/Mutex, in `lib.rs`).
+- Nessuna verifica manuale con log di un vero server locale (Unsloth Studio) — non disponibile in questo
+  ambiente sandboxed. La proprietà "una sola richiesta in volo verso il provider locale" è comunque una
+  garanzia strutturale del `Mutex` (`LocalProviderSlot`), non solo osservata a runtime.
 
 ## Out of Scope
 

@@ -326,6 +326,18 @@ pub enum LlmError {
     ParseFailed(String),
     /// A local storage error while reading/writing the cache.
     Storage(String),
+    /// The job was interrupted at a unit boundary because it is no longer
+    /// relevant: either the page it targets is no longer the current one (the
+    /// user navigated away) or it is a prefetch that yielded the local-provider
+    /// slot to a higher-priority on-demand request (ticket 06, L3/L4). This is
+    /// **not** a real failure: it is checked only between units (never mid
+    /// in-flight HTTP call), and the units already translated in this same run
+    /// stay cached. **Permanent** (not transient — retrying a cancellation
+    /// would just introduce an implicit retry the decision brief forbids) and
+    /// not param-degradable. Its message is deliberately low-key: the frontend
+    /// already discards stale results on its own, so this text is not expected
+    /// to reach the user in practice.
+    Cancelled,
 }
 
 impl LlmError {
@@ -406,6 +418,9 @@ impl LlmError {
                 format!("Risposta del modello non valida (JSON non conforme): {m}")
             }
             LlmError::Storage(m) => format!("Errore della cache locale: {m}"),
+            LlmError::Cancelled => {
+                "Traduzione annullata: la pagina non è più quella corrente.".into()
+            }
         }
     }
 }
@@ -2248,6 +2263,19 @@ E così, senza fretta, l'argomentazione si chiude.";
     fn rate_limit_and_offline_carry_their_edge_case_codes() {
         assert!(LlmError::RateLimited("".into()).user_message().contains("EC07"));
         assert!(LlmError::Offline("".into()).user_message().contains("EC02"));
+    }
+
+    #[test]
+    fn cancelled_is_neither_transient_nor_param_degradable_and_has_a_low_key_message() {
+        // Ticket 06: a stale/superseded job stopping at a unit boundary is not a
+        // real failure — it must never be retried (no implicit retry from the
+        // cancellation path) and its message must stay low-key, not alarming.
+        let e = LlmError::Cancelled;
+        assert!(!e.is_transient(), "cancellation is not worth retrying");
+        assert!(!e.is_param_unsupported(), "not a param-relaxation case");
+        let msg = e.user_message();
+        assert!(!msg.contains("Errore"), "low-key message, not framed as a real error");
+        assert!(!msg.to_uppercase().contains("EC0"), "no alarming error code for a routine cancellation");
     }
 
     // --- Local server unreachable (ticket 09, D3/D4/D7, EC02 local case) ------
