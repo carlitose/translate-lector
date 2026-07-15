@@ -237,7 +237,7 @@ fn get_model(app: tauri::AppHandle) -> Result<String, String> {
     settings::get_model(&conn).map_err(|e| e.to_string())
 }
 
-/// Read the active provider id (D3: default "unsloth" when unset).
+/// Read the active provider id (D5: default "llamaserver" when unset).
 #[tauri::command]
 fn get_active_provider(app: tauri::AppHandle) -> Result<String, String> {
     let conn = open_db(&app)?;
@@ -513,7 +513,7 @@ async fn translate_page(
             is_page_current(&cursor, document_id, page_number)
         };
 
-        // Risolvi il provider attivo (D3: default unsloth) e la sua config
+        // Risolvi il provider attivo (D5: default llamaserver) e la sua config
         // (base-URL + modello, con override e fallback legacy `model` per
         // openrouter). La chiave è provider-scoped (Ticket 06).
         let active_id = settings::get_active_provider(&conn).map_err(|e| e.to_string())?;

@@ -116,9 +116,12 @@ pub fn get_prefetch_enabled(conn: &Connection) -> rusqlite::Result<bool> {
 
 /// Settings key holding the id of the active provider.
 pub const ACTIVE_PROVIDER_KEY: &str = "active_provider";
-/// Default active provider when unset/blank. Decision D3: il default è locale
-/// (Unsloth), non il cloud.
-pub const DEFAULT_PROVIDER_ID: &str = "unsloth";
+/// Default active provider when unset/blank. Decision D5: su installazione pulita
+/// il default è il provider llama.cpp diretto (`llamaserver`), non il cloud né
+/// Unsloth Studio — la traduzione locale funziona out-of-the-box con lo spawn
+/// on-demand di llama-server (ticket 04/05). Chi ha già una scelta persistita la
+/// mantiene (D3: `unsloth` resta selezionabile di prima classe).
+pub const DEFAULT_PROVIDER_ID: &str = "llamaserver";
 
 /// Default `max_tokens` per il provider cloud (OpenRouter). Valore generoso:
 /// i modelli cloud hanno finestre ampie, quindi la traduzione di pagine lunghe
@@ -328,8 +331,9 @@ pub fn provider_model_path_key(id: &str) -> String {
     format!("provider.{id}.model_path")
 }
 
-/// Read the active provider id, falling back to [`DEFAULT_PROVIDER_ID`] (D3:
-/// unsloth) when unset or stored blank.
+/// Read the active provider id, falling back to [`DEFAULT_PROVIDER_ID`] (D5:
+/// `llamaserver`, llama.cpp diretto) when unset or stored blank. Un valore già
+/// persistito (utenti esistenti) vince sempre sul default.
 pub fn get_active_provider(conn: &Connection) -> rusqlite::Result<String> {
     let stored = get_setting(conn, ACTIVE_PROVIDER_KEY)?;
     Ok(match stored {
@@ -636,20 +640,26 @@ mod tests {
     // --- Provider presets + active provider (ticket 07) ---------------------
 
     #[test]
-    fn active_provider_defaults_to_unsloth_when_unset() {
-        // Decision D3: il provider attivo di default è locale (Unsloth).
+    fn active_provider_defaults_to_llamaserver_on_first_run() {
+        // Decision D5: su prima esecuzione (nessuna scelta persistita) il provider
+        // attivo di default è llama.cpp diretto (`llamaserver`), non il cloud né
+        // Unsloth Studio.
         let c = conn();
-        assert_eq!(get_active_provider(&c).unwrap(), "unsloth");
+        assert_eq!(get_active_provider(&c).unwrap(), "llamaserver");
         assert_eq!(get_active_provider(&c).unwrap(), DEFAULT_PROVIDER_ID);
     }
 
     #[test]
-    fn active_provider_roundtrips_when_set() {
+    fn active_provider_persisted_choice_wins_over_default() {
+        // D3/D5: un utente esistente con una scelta persistita (es. `unsloth`,
+        // che resta selezionabile di prima classe) la mantiene sul default.
         let c = conn();
         set_active_provider(&c, "openrouter").unwrap();
         assert_eq!(get_active_provider(&c).unwrap(), "openrouter");
         set_active_provider(&c, "lmstudio").unwrap();
         assert_eq!(get_active_provider(&c).unwrap(), "lmstudio");
+        set_active_provider(&c, "unsloth").unwrap();
+        assert_eq!(get_active_provider(&c).unwrap(), "unsloth");
     }
 
     #[test]

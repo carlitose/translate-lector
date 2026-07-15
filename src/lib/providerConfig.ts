@@ -81,8 +81,9 @@ export interface ProviderPreset {
 /**
  * Built-in provider presets, mirroring the core's `provider_presets()` in
  * `src-tauri/src/settings.rs` (design §2). The active provider defaults to
- * `unsloth` (decision D3) in the core; the UI reads the real value via
- * `get_active_provider`. Base-URLs are starting defaults the user can override.
+ * `llamaserver` (decision D5, llama.cpp diretto) in the core; the UI reads the
+ * real value via `get_active_provider`. Base-URLs are starting defaults the user
+ * can override.
  */
 export const PROVIDERS: ProviderPreset[] = [
   {
