@@ -683,14 +683,17 @@ fn storage<E: std::fmt::Display>(e: E) -> LlmError {
 ///    updated summary (EC05 compression) and the new glossary terms, with a
 ///    COMPACT selected glossary and NO re-translation of the page (budget-safe).
 ///
-/// Afterwards the recomposed translation is cached (page-level, as before;
-/// per-unit cache is STC-09). On real navigation `sessions.rolling_summary` is
-/// updated once and the new glossary terms are inserted deduped (locked terms
-/// untouched) — but ONLY when the perceptor-update succeeded: a failed
-/// perceptor-update is swallowed (soft log), the page translation is still cached
-/// and returned, and the context simply does not advance (STC-10 resilience). On
-/// prefetch (`update_context == false`) the percettore step is skipped entirely
-/// (ticket 12): the page translation is cached and nothing else.
+/// Afterwards, on REAL navigation (`update_context`) the recomposed translation
+/// is cached page-level, `sessions.rolling_summary` is updated once and the new
+/// glossary terms are inserted deduped (locked terms untouched) — but the context
+/// advances ONLY when the perceptor-update succeeded: a failed perceptor-update is
+/// swallowed (soft log), the page translation is still cached and returned, and
+/// the context simply does not advance (STC-10 resilience). On prefetch
+/// (`update_context == false`) the percettore step is skipped AND the page-level
+/// cache is NOT written (ticket 01, option B): a prefetch warms only the per-unit
+/// cache (STC-09). This keeps the real navigation a page miss so the percettore
+/// runs and the glossary grows, while the warmed per-unit cache still serves the
+/// units with no re-translation (latency unchanged).
 pub fn translate_page(
     conn: &Connection,
     client: &dyn ChatClient,
@@ -983,13 +986,18 @@ pub fn translate_page(
         }
     }
 
-    // Persist. The page cache is written either way (page-level, as before) —
-    // ANCHE quando il perceptor-update è fallito: la traduzione riuscita non va
-    // mai persa (STC-10). Il contesto percettore (summary + glossario) avanza SOLO
-    // su navigazione reale E solo se il perceptor-update è riuscito; un prefetch
-    // non deve mutare il contesto fuori ordine (ticket 12).
-    cache_insert(conn, p, &translated_text)?;
+    // Persist (ticket 01, opzione B). La cache di PAGINA si scrive SOLO su
+    // navigazione reale (`update_context`), non sul prefetch: un prefetch scalda
+    // esclusivamente la cache per-unità (STC-09). Così alla navigazione reale la
+    // pagina è un MISS di pagina, la pipeline prosegue fino al percettore (il
+    // glossario cresce) e le unità sono servite dalla cache per-unità (nessuna
+    // ri-traduzione, latenza invariata). Sulla navigazione reale la riga di
+    // pagina viene scritta ANCHE quando il perceptor-update è fallito: la
+    // traduzione riuscita non va mai persa (STC-10). Il contesto percettore
+    // (summary + glossario) avanza SOLO se il perceptor-update è riuscito; un
+    // prefetch non deve mutare il contesto fuori ordine (ticket 12).
     if p.update_context {
+        cache_insert(conn, p, &translated_text)?;
         if summary_advanced {
             documents::set_rolling_summary(conn, p.document_id, &rolling_summary).map_err(storage)?;
             glossary::insert_terms_deduped(conn, p.document_id, &new_terms, p.page_number)
@@ -2166,9 +2174,11 @@ lines, so it stays a single translation unit even though it is not short.";
 
     // --- Prefetch: cache-only, no context mutation (ticket 12) --------------
 
-    /// A prefetch (`update_context: false`) of a later page must cache the
-    /// translation but leave `sessions.rolling_summary` and the glossary
-    /// untouched — advancing the percettore out of order would corrupt context.
+    /// A prefetch (`update_context: false`) of a later page warms ONLY the
+    /// per-unit cache (STC-09), NOT the page-level cache (ticket 01, option B),
+    /// and leaves `sessions.rolling_summary` and the glossary untouched —
+    /// advancing the percettore or writing the page row out of order would keep
+    /// the later real navigation from advancing the context.
     #[test]
     fn prefetch_caches_translation_without_touching_summary_or_glossary() {
         let c = conn();
@@ -2176,11 +2186,9 @@ lines, so it stays a single translation unit even though it is not short.";
         crate::documents::set_rolling_summary(&c, 1, "Riassunto originale.").unwrap();
         let before_glossary = crate::glossary::list_glossary(&c, 1).unwrap().len();
 
-        // Model would advance the summary and add a term — both must be ignored.
-        let client = MockClient::new(vec![Ok(resp(
-            &content_with("Tradotto in anticipo", "Riassunto AVANZATO (da ignorare)", &[("new", "nuovo")]),
-            300,
-        ))]);
+        // The percettore is skipped on prefetch, so a single translate-only
+        // response is all that is consumed (the whole page is one unit here).
+        let client = MockClient::new(vec![Ok(resp("Tradotto in anticipo", 300))]);
         let prefetch = TranslateParams {
             document_id: 1,
             page_number: 4, // the NEXT page (N+1)
@@ -2195,19 +2203,14 @@ lines, so it stays a single translation unit even though it is not short.";
 
         let out = translate_page(&c, &client, &prefetch).unwrap();
         assert!(!out.from_cache);
+        assert_eq!(out.translated_text, "Tradotto in anticipo");
         assert_eq!(out.updated_summary, None, "prefetch does not report/persist a summary");
         assert_eq!(client.calls(), 1);
 
-        // The translation IS cached for page 4.
-        let cached: String = c
-            .query_row(
-                "SELECT translated_text FROM translations_cache
-                  WHERE document_id=1 AND page_number=4 AND target_language='it'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(cached, "Tradotto in anticipo");
+        // NUOVO CONTRATTO (opzione B): il prefetch NON scrive la cache di pagina
+        // per page 4 — solo la cache per-unità viene scaldata.
+        assert_eq!(page_rows(&c), 0, "il prefetch non scrive la cache di pagina");
+        assert_eq!(unit_rows(&c), 1, "il prefetch scalda la cache per-unità (STC-09)");
 
         // The context is UNCHANGED: summary unchanged, no glossary rows added.
         assert_eq!(
@@ -2257,6 +2260,80 @@ lines, so it stays a single translation unit even though it is not short.";
             crate::documents::get_rolling_summary(&c, 1).unwrap(),
             "Riassunto originale."
         );
+    }
+
+    /// REGRESSIONE (ticket 01, opzione B): un prefetch di P (`update_context:
+    /// false`) NON deve scrivere la cache di PAGINA — scalda solo la cache
+    /// per-unità (STC-09). Alla navigazione reale su P (`update_context: true`,
+    /// stesso testo) la pagina è quindi un MISS di pagina: la pipeline prosegue,
+    /// le unità sono servite dalla cache per-unità (nessuna ri-traduzione), il
+    /// percettore gira UNA volta e il glossario cresce.
+    ///
+    /// Prima del fix questo test FALLISCE: il prefetch scrive la cache di pagina,
+    /// la navigazione reale è un cache-hit che ritorna prima del percettore →
+    /// zero chiamate, glossario resta a 0.
+    #[test]
+    fn prefetch_warmed_page_advances_context_on_real_navigation_without_retranslating() {
+        let c = conn();
+        seed_session(&c);
+        assert_eq!(
+            crate::glossary::list_glossary(&c, 1).unwrap().len(),
+            0,
+            "precondizione: glossario vuoto"
+        );
+
+        // --- Prefetch di P (N+1) con update_context=false -------------------
+        // Una sola risposta: la traduzione dell'unica unità. Il percettore è
+        // saltato sul prefetch, quindi nessuna risposta percettore serve qui.
+        let client_prefetch = MockClient::new(vec![Ok(resp("Ciao mondo", 100))]);
+        let prefetch = TranslateParams {
+            document_id: 1,
+            page_number: 4,
+            target_language: "it",
+            page_text: "Hello world.",
+            model: "openai/gpt-4o",
+            max_tokens: 4096,
+            n_ctx: 128_000,
+            update_context: false,
+            is_current: None,
+        };
+        let out_pf = translate_page(&c, &client_prefetch, &prefetch).unwrap();
+        assert!(!out_pf.from_cache);
+        assert_eq!(client_prefetch.calls(), 1, "prefetch: solo la traduzione dell'unità");
+
+        // Il prefetch NON scrive la cache di pagina, ma SCALDA la cache per-unità.
+        assert_eq!(page_rows(&c), 0, "il prefetch non scrive la cache di pagina (opzione B)");
+        assert_eq!(unit_rows(&c), 1, "il prefetch scalda la cache per-unità (STC-09)");
+
+        // --- Navigazione reale su P con update_context=true -----------------
+        // Coda con la SOLA risposta del percettore: se le unità venissero
+        // ri-tradotte, la prima pop verrebbe consumata dalla traduzione e il
+        // percettore andrebbe in panic sulla coda vuota. Quindi client.calls()==1
+        // dimostra che l'unità è servita dalla cache per-unità (nessuna
+        // ri-traduzione) e che il percettore gira esattamente una volta.
+        let client_nav = MockClient::new(vec![Ok(resp(
+            &content_with("ignorato", "Riassunto avanzato", &[("hello", "ciao")]),
+            200,
+        ))]);
+        let nav = TranslateParams { update_context: true, ..prefetch };
+        let out_nav = translate_page(&c, &client_nav, &nav).unwrap();
+
+        assert!(!out_nav.from_cache, "navigazione reale: miss di pagina, non un cache-hit");
+        assert_eq!(out_nav.translated_text, "Ciao mondo", "traduzione servita dalle unità cachate");
+        assert_eq!(
+            client_nav.calls(),
+            1,
+            "esattamente 1 chiamata: solo il percettore (nessuna ri-traduzione delle unità)"
+        );
+
+        // Il glossario è cresciuto da 0 al termine proposto dal percettore.
+        let glossary = crate::glossary::list_glossary(&c, 1).unwrap();
+        assert_eq!(glossary.len(), 1, "il glossario cresce col termine proposto");
+        assert_eq!(glossary[0].source_term, "hello");
+        assert_eq!(glossary[0].translation, "ciao");
+
+        // Ora la pagina è cachata come "completa": un accesso successivo è un HIT.
+        assert_eq!(page_rows(&c), 1, "la navigazione reale scrive la cache di pagina");
     }
 
     // --- Stale-job cancellation (ticket 06, L3/L4) ---------------------------

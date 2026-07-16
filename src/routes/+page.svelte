@@ -442,10 +442,13 @@
   }
 
   /**
-   * Prefetch the NEXT page in the background (ticket 12, D5). Warms the per-page
-   * cache with `updateContext: false` so it never advances the summary/glossary
-   * out of order, and never touches the current view or status. Best-effort:
-   * any error (offline, rate limit) is swallowed — it just means no warm cache.
+   * Prefetch the NEXT page in the background (ticket 12, D5). Warms only the
+   * per-unit cache (STC-09) with `updateContext: false`; under option B (ticket
+   * 01) the per-page cache row is written on real navigation, so the percettore
+   * still runs and the glossary grows on arrival. Never advances the
+   * summary/glossary out of order, and never touches the current view or status.
+   * Best-effort: any error (offline, rate limit) is swallowed — it just means no
+   * warm cache.
    */
   async function prefetchNextPage(): Promise<void> {
     if (!prefetchEnabled || !session || !pdfDoc) return;
