@@ -243,8 +243,8 @@ impl ChatResponse {
 /// The transport-level variants are split so the retry layer can tell
 /// **transient** failures (worth retrying with backoff: [`Timeout`],
 /// [`ServerError`], [`RateLimited`], [`Offline`]) apart from **permanent** ones
-/// (no point retrying: [`MissingApiKey`], generic [`Http`], [`ParseFailed`],
-/// [`Storage`]). See [`LlmError::is_transient`].
+/// (no point retrying: [`MissingApiKey`], generic [`Http`], [`Storage`]). See
+/// [`LlmError::is_transient`].
 ///
 /// [`Timeout`]: LlmError::Timeout
 /// [`ServerError`]: LlmError::ServerError
@@ -252,7 +252,6 @@ impl ChatResponse {
 /// [`Offline`]: LlmError::Offline
 /// [`MissingApiKey`]: LlmError::MissingApiKey
 /// [`Http`]: LlmError::Http
-/// [`ParseFailed`]: LlmError::ParseFailed
 /// [`Storage`]: LlmError::Storage
 #[derive(Debug, Clone, PartialEq)]
 pub enum LlmError {
@@ -329,8 +328,6 @@ pub enum LlmError {
     ///
     /// [`OutputBudgetExhausted`]: LlmError::OutputBudgetExhausted
     OutputTruncated(String),
-    /// The response could not be parsed even after the correction retry.
-    ParseFailed(String),
     /// A local storage error while reading/writing the cache.
     Storage(String),
     /// The job was interrupted at a unit boundary because it is no longer
@@ -434,9 +431,6 @@ impl LlmError {
                  metà risposta). Riduci il testo, usa un modello meno verboso, o \
                  aumenta il context (n_ctx) del server."
                     .into()
-            }
-            LlmError::ParseFailed(m) => {
-                format!("Risposta del modello non valida (JSON non conforme): {m}")
             }
             LlmError::Storage(m) => format!("Errore della cache locale: {m}"),
             LlmError::Cancelled => {
@@ -1610,6 +1604,116 @@ pub fn parse_perceptor_update(content: &str) -> Result<PerceptorUpdateOutput, St
     ))
 }
 
+/// Estrazione **tollerante** dei soli `new_glossary_terms` da un contenuto
+/// perceptor-update che [`parse_perceptor_update`] ha rifiutato (STC-10,
+/// resilienza ticket 02). Sul provider locale la risposta stretta può fallire di
+/// routine (JSON troncato con `updated_summary` a metà, chiave `updated_summary`
+/// assente, prosa/reasoning prima del JSON): in quei casi i termini di glossario
+/// proposti andrebbero persi silenziosamente. Questa funzione recupera SOLTANTO
+/// l'array `new_glossary_terms` — così i termini possono essere inseriti (deduped,
+/// locked intatti) ANCHE quando il summary non è recuperabile.
+///
+/// Strategia (best-effort, mai un panic): localizza la chiave
+/// `new_glossary_terms`, estrae il primo array `[...]` bilanciato che la segue e
+/// prova a deserializzarlo come `Vec<GlossaryTerm>`; se l'array intero non
+/// deserializza (es. un elemento troncato in coda), ripiega su un parsing
+/// elemento-per-elemento che scarta i termini malformati e tiene quelli validi.
+/// Ritorna un vettore vuoto quando non c'è nulla di recuperabile (nessun segnale
+/// d'errore: l'assenza di termini è essa stessa il risultato).
+pub fn extract_glossary_terms_tolerant(content: &str) -> Vec<GlossaryTerm> {
+    let Some(key_pos) = find_glossary_key(content) else {
+        return Vec::new();
+    };
+    let after = &content[key_pos..];
+
+    // Fast path: un array `[...]` bilanciato dopo la chiave (risposta non troncata).
+    if let Some(array) = extract_first_json_array(after) {
+        // (a) l'intero array deserializza pulito.
+        if let Ok(terms) = serde_json::from_str::<Vec<GlossaryTerm>>(array) {
+            return terms;
+        }
+        // (b) fallback elemento-per-elemento: tieni i termini validi, scarta i rotti.
+        if let Ok(values) = serde_json::from_str::<Vec<serde_json::Value>>(array) {
+            return values
+                .into_iter()
+                .filter_map(|v| serde_json::from_value::<GlossaryTerm>(v).ok())
+                .collect();
+        }
+        return Vec::new();
+    }
+
+    // (c) recupero della TRONCATURA reale (ticket 02, caso bersaglio): sul provider
+    // locale `finish_reason:length` taglia la risposta a metà elemento, lasciando
+    // l'array `new_glossary_terms` SBILANCIATO (nessun `]` di chiusura). Il fast
+    // path bilanciato qui ritorna `None` e i termini andrebbero persi tutti — anche
+    // quelli iniziali già completi. Recuperiamo gli elementi `{...}` iniziali ben
+    // formati fino al punto di taglio, scartando quello troncato in coda.
+    salvage_leading_glossary_terms(after)
+}
+
+/// Trova la posizione della **chiave** JSON `new_glossary_terms` in `content`,
+/// cioè un'occorrenza del literal seguita (saltata l'eventuale `"` di chiusura e
+/// gli spazi) da `:`. Così una menzione in prosa/`updated_summary` della stessa
+/// frase (es. "produrrò new_glossary_terms e updated_summary") non fa da ombra
+/// all'array vero (F4). Best-effort: se nessuna occorrenza è seguita da `:`,
+/// ripiega sulla prima occorrenza literal. Mai un panic.
+fn find_glossary_key(content: &str) -> Option<usize> {
+    const KEY: &str = "new_glossary_terms";
+    let mut search_from = 0usize;
+    let mut first_literal: Option<usize> = None;
+    while let Some(rel) = content[search_from..].find(KEY) {
+        let pos = search_from + rel;
+        first_literal.get_or_insert(pos);
+        // Dopo la chiave: salta un eventuale `"` di chiusura e gli spazi; se il
+        // prossimo carattere significativo è `:`, è la chiave JSON reale.
+        let rest = content[pos + KEY.len()..].trim_start();
+        let rest = rest.strip_prefix('"').unwrap_or(rest).trim_start();
+        if rest.starts_with(':') {
+            return Some(pos);
+        }
+        search_from = pos + KEY.len();
+    }
+    first_literal
+}
+
+/// Recupera gli elementi iniziali ben formati di un array `new_glossary_terms`
+/// **troncato/sbilanciato**. Scansiona da `after` (che parte dalla chiave) il
+/// primo `[`, poi estrae uno dopo l'altro i blocchi `{...}` bilanciati,
+/// deserializzandoli come [`GlossaryTerm`]: tiene quelli validi e si ferma al
+/// primo elemento incompleto/troncato in coda (o all'esaurirsi del contenuto).
+/// Best-effort, mai un panic.
+fn salvage_leading_glossary_terms(after: &str) -> Vec<GlossaryTerm> {
+    let mut terms = Vec::new();
+    // Posizionati subito dopo il `[` di apertura dell'array.
+    let Some(open) = after.find('[') else {
+        return terms;
+    };
+    let mut rest = &after[open + 1..];
+    loop {
+        let Some(block) = extract_first_json_block(rest) else {
+            break;
+        };
+        match serde_json::from_str::<GlossaryTerm>(block) {
+            Ok(term) => terms.push(term),
+            // Elemento incompleto (troncatura) o malformato in coda: stop.
+            Err(_) => break,
+        }
+        // Avanza oltre il blocco appena consumato. `block` è un sottoslice di
+        // `rest`, quindi l'offset di fine è calcolabile dai puntatori.
+        let end = (block.as_ptr() as usize - rest.as_ptr() as usize) + block.len();
+        rest = &rest[end..];
+    }
+    terms
+}
+
+/// Estrae il primo array JSON `[...]` bilanciato da `s`, rispettando le stringhe
+/// (le parentesi quadre dentro una stringa non contano) e l'escaping. Gemello di
+/// [`extract_first_json_block`] per gli array; usato dall'estrazione tollerante
+/// dei termini di glossario. Ritorna `None` se non c'è un array bilanciato.
+fn extract_first_json_array(s: &str) -> Option<&str> {
+    extract_first_balanced(s, b'[', b']')
+}
+
 // --- Layered parsing (§4.4) --------------------------------------------------
 
 /// Parse the model `content` into [`PerceptoreOutput`] using layers (a) direct
@@ -1638,9 +1742,22 @@ pub fn parse_content(content: &str) -> Result<PerceptoreOutput, String> {
 
 /// Return the first balanced `{...}` slice of `s`, honouring braces that appear
 /// inside JSON string literals (and their escapes). `None` if unbalanced/absent.
+///
+/// **Contratto solo-bilanciato**: a differenza del recupero tollerante degli array
+/// (ticket 02), questo scanner NON tollera la troncatura — se le graffe non si
+/// bilanciano ritorna `None`. È voluto: `parse_perceptor_update`/`parse_content`
+/// si affidano a questo contratto.
 pub fn extract_first_json_block(s: &str) -> Option<&str> {
+    extract_first_balanced(s, b'{', b'}')
+}
+
+/// Scanner condiviso: ritorna il primo slice `open…close` bilanciato di `s`,
+/// rispettando le stringhe JSON (`open`/`close` dentro una stringa non contano) e
+/// l'escaping. Base comune di [`extract_first_json_block`] (`{`/`}`) e
+/// `extract_first_json_array` (`[`/`]`). `None` se non c'è un blocco bilanciato.
+fn extract_first_balanced(s: &str, open: u8, close: u8) -> Option<&str> {
     let bytes = s.as_bytes();
-    let start = bytes.iter().position(|&b| b == b'{')?;
+    let start = bytes.iter().position(|&b| b == open)?;
 
     let mut depth = 0usize;
     let mut in_string = false;
@@ -1658,16 +1775,15 @@ pub fn extract_first_json_block(s: &str) -> Option<&str> {
             }
             continue;
         }
-        match c {
-            b'"' => in_string = true,
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&s[start..=i]);
-                }
+        if c == b'"' {
+            in_string = true;
+        } else if c == open {
+            depth += 1;
+        } else if c == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(&s[start..=i]);
             }
-            _ => {}
         }
     }
     None
@@ -2106,6 +2222,115 @@ E così, senza fretta, l'argomentazione si chiude.";
         assert!(parse_perceptor_update(r#"{"updated_summary":"s"}"#).is_err());
     }
 
+    // --- Tolerant glossary-terms extraction (ticket 02, resilience) ---------
+
+    #[test]
+    fn extract_glossary_terms_tolerant_recovers_terms_when_strict_parse_fails() {
+        // Emula il modello locale: prosa/reasoning + JSON con `updated_summary`
+        // TRONCATO a metà (finish_reason:length). Lo schema stretto richiede
+        // ENTRAMBI i campi ⇒ `parse_perceptor_update` fallisce e oggi i termini
+        // andrebbero persi. L'array `new_glossary_terms` è però completo.
+        let partial = "Ecco la mia analisi della pagina.\n\
+            {\"new_glossary_terms\": [\
+              {\"source_term\":\"hobbit\",\"translation\":\"hobbit\",\"type\":\"nome proprio\",\"note\":\"\"},\
+              {\"source_term\":\"Shire\",\"translation\":\"Contea\",\"type\":\"nome proprio\",\"note\":\"\"}\
+            ], \"updated_summary\": \"Bilbo parte per un'avvent";
+
+        // Precondizione RED: il parse stretto NON recupera nulla oggi.
+        assert!(
+            parse_perceptor_update(partial).is_err(),
+            "precondition: strict parse rejects the truncated response"
+        );
+
+        // Il fix: l'estrazione tollerante recupera i due termini.
+        let terms = extract_glossary_terms_tolerant(partial);
+        assert_eq!(terms.len(), 2, "both well-formed terms recovered");
+        assert_eq!(terms[0].source_term, "hobbit");
+        assert_eq!(terms[1].source_term, "Shire");
+        assert_eq!(terms[1].translation, "Contea");
+    }
+
+    #[test]
+    fn extract_glossary_terms_tolerant_skips_an_element_missing_required_fields() {
+        // Array BILANCIATO (chiuso da `]`) il cui ULTIMO elemento è valido JSON ma
+        // NON conforme allo schema (mancano `type`/`note`): non è una troncatura.
+        // Il fallback elemento-per-elemento sul fast path tiene i validi e scarta
+        // quello incompleto. (La vera troncatura — array SBILANCIATO — è coperta da
+        // `..._recovers_leading_terms_from_a_truncated_array`.)
+        let content = "{\"new_glossary_terms\": [\
+            {\"source_term\":\"orc\",\"translation\":\"orco\",\"type\":\"comune\",\"note\":\"\"},\
+            {\"source_term\":\"elf\",\"translation\":\"elfo\"}\
+        ]}";
+        let terms = extract_glossary_terms_tolerant(content);
+        assert_eq!(terms.len(), 1, "only the schema-valid term survives");
+        assert_eq!(terms[0].source_term, "orc");
+    }
+
+    #[test]
+    fn extract_glossary_terms_tolerant_recovers_leading_terms_from_a_truncated_array() {
+        // Il caso di fallimento REALE del modello locale (ticket 02): la risposta è
+        // tagliata da `finish_reason:length` a metà di un elemento, quindi l'array
+        // `new_glossary_terms` è SBILANCIATO (nessun `]`). Due elementi iniziali sono
+        // completi, il terzo è troncato. Il fast path bilanciato fallirebbe e oggi
+        // perderebbe TUTTO: il recupero deve tenere i due completi e scartare il
+        // troncato in coda.
+        let truncated = "{\"new_glossary_terms\": [\
+            {\"source_term\":\"hobbit\",\"translation\":\"hobbit\",\"type\":\"nome proprio\",\"note\":\"\"},\
+            {\"source_term\":\"Shire\",\"translation\":\"Contea\",\"type\":\"nome proprio\",\"note\":\"\"},\
+            {\"source_term\":\"Gand";
+
+        // Precondizione: l'array è sbilanciato, quindi il fast path non estrae nulla.
+        assert!(
+            extract_first_json_array(&truncated[truncated.find('[').unwrap()..]).is_none(),
+            "precondition: the truncated array is unbalanced (no closing ])"
+        );
+
+        let terms = extract_glossary_terms_tolerant(truncated);
+        assert_eq!(terms.len(), 2, "the two complete leading terms are recovered");
+        assert_eq!(terms[0].source_term, "hobbit");
+        assert_eq!(terms[1].source_term, "Shire");
+        assert_eq!(terms[1].translation, "Contea");
+    }
+
+    #[test]
+    fn extract_glossary_terms_tolerant_recovers_from_real_prompt_field_order() {
+        // Ordine REALE del prompt (llm.rs build_perceptor_update_user_prompt):
+        // `updated_summary` PRIMA, `new_glossary_terms` DOPO. Una troncatura da
+        // `finish_reason:length` taglia esattamente l'array del glossario (in coda),
+        // mentre `updated_summary` può a sua volta essere completo o troncato. Il
+        // recupero deve estrarre i termini iniziali completi.
+        let truncated = "{\"updated_summary\": \"Bilbo lascia la Contea per un lungo viaggio verso est.\", \
+            \"new_glossary_terms\": [\
+              {\"source_term\":\"Bilbo\",\"translation\":\"Bilbo\",\"type\":\"nome proprio\",\"note\":\"\"},\
+              {\"source_term\":\"Rivendell\",\"translation\":\"Gran Burrone\",\"type\":\"nome proprio\",\"no";
+
+        let terms = extract_glossary_terms_tolerant(truncated);
+        assert_eq!(terms.len(), 1, "the single complete leading term is recovered");
+        assert_eq!(terms[0].source_term, "Bilbo");
+    }
+
+    #[test]
+    fn extract_glossary_terms_tolerant_ignores_prose_false_match_of_the_key() {
+        // Il testo menziona `new_glossary_terms` in prosa (NON come chiave JSON,
+        // niente `:` a seguire) prima dell'oggetto reale. L'ancoraggio sul `:` deve
+        // saltare la falsa corrispondenza e trovare l'array vero.
+        let content = "Ora aggiorno new_glossary_terms con i nuovi nomi propri.\n\
+            {\"updated_summary\":\"s\",\"new_glossary_terms\": [\
+              {\"source_term\":\"Frodo\",\"translation\":\"Frodo\",\"type\":\"nome proprio\",\"note\":\"\"}\
+            ]}";
+        let terms = extract_glossary_terms_tolerant(content);
+        assert_eq!(terms.len(), 1, "the real array is found past the prose mention");
+        assert_eq!(terms[0].source_term, "Frodo");
+    }
+
+    #[test]
+    fn extract_glossary_terms_tolerant_returns_empty_when_nothing_recoverable() {
+        assert!(extract_glossary_terms_tolerant("not json at all").is_empty());
+        assert!(extract_glossary_terms_tolerant("").is_empty());
+        // Reasoning-only content with no glossary array at all.
+        assert!(extract_glossary_terms_tolerant("Sto pensando alla traduzione…").is_empty());
+    }
+
     // --- Bug #1: default body must not force provider routing --------------
 
     #[test]
@@ -2366,7 +2591,6 @@ E così, senza fretta, l'argomentazione si chiude.";
 
         assert!(!LlmError::MissingApiKey.is_transient(), "EC03 is permanent");
         assert!(!LlmError::Http("400".into()).is_transient());
-        assert!(!LlmError::ParseFailed("x".into()).is_transient());
         assert!(!LlmError::Storage("x".into()).is_transient());
         // Degradable, but not transient: no backoff retry, a param-relaxation
         // retry instead.

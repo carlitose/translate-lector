@@ -14,7 +14,9 @@ import {
   requestKey,
   isCurrentRequest,
   shouldTranslate,
-  isLatestNav
+  isLatestNav,
+  contextNote,
+  CONTEXT_NOT_ADVANCED_HINT
 } from './translation';
 
 describe('isMissingKeyError', () => {
@@ -123,6 +125,21 @@ describe('shouldTranslate', () => {
   it('does NOT translate when there is no extractable text', () => {
     expect(shouldTranslate(10, 10, '')).toBe(false);
     expect(shouldTranslate(10, 10, '   ')).toBe(false);
+  });
+});
+
+describe('contextNote', () => {
+  it('shows the non-intrusive note when the perceptor update failed', () => {
+    expect(contextNote({ perceptor_update_failed: true })).toBe(CONTEXT_NOT_ADVANCED_HINT);
+  });
+
+  it('is empty on a full success', () => {
+    expect(contextNote({ perceptor_update_failed: false })).toBe('');
+  });
+
+  it('is empty when the flag is absent (cache hit / older core)', () => {
+    expect(contextNote({})).toBe('');
+    expect(contextNote({ from_cache: true })).toBe('');
   });
 });
 

@@ -216,6 +216,16 @@ pub struct TranslationResult {
     /// The rolling summary after this page (percettore); `None` on a cache hit
     /// (the percettore is not re-run for cached pages).
     pub updated_summary: Option<String>,
+    /// True when the per-page perceptor-update failed to advance the context
+    /// (STC-10 observability, ticket 02): the strict JSON could not be parsed
+    /// (even after the correction retry) or the call errored at transport level,
+    /// so the rolling summary was NOT advanced for this page — while the page
+    /// translation is still returned and cached (STC-10 invariant, never lost).
+    /// Recovered glossary terms may still have been inserted (tolerant
+    /// extraction). Always `false` on a cache hit and on prefetch (the percettore
+    /// is not run) and on a full success. The frontend surfaces it as a
+    /// non-intrusive "context not advanced for this page" note.
+    pub perceptor_update_failed: bool,
 }
 
 // --- Split a unità (STC-02, cablato nel flusso da STC-08) --------------------
@@ -577,18 +587,47 @@ fn unit_cache_prune(
     Ok(())
 }
 
+/// Outcome of the per-page perceptor-update call at the [`translate_page`]
+/// boundary (STC-10, resilience/observability, ticket 02).
+enum PerceptorUpdateResult {
+    /// Strict JSON parsed: both the updated summary and the new glossary terms
+    /// are available, so the context advances FULLY (summary + glossary).
+    Full {
+        output: crate::llm::PerceptorUpdateOutput,
+        usage: Option<Usage>,
+    },
+    /// Strict JSON could NOT be parsed (even after the correction retry), but the
+    /// `new_glossary_terms` array was tolerantly recovered. The summary CANNOT be
+    /// advanced, yet the glossary can still grow: the terms are inserted anyway,
+    /// decoupled from the summary (ticket 02, criterion b). `terms` may be empty
+    /// (nothing recoverable) — either way this is a perceptor FAILURE for the UI
+    /// signal, because the summary did not advance.
+    Recovered {
+        terms: Vec<GlossaryTerm>,
+        usage: Option<Usage>,
+    },
+}
+
 /// Call the client for the **lean perceptor-update** (STC-10, D5) and parse the
 /// response with the layered fallback, including the single correction retry
 /// (layer c). The lean contract asks ONLY for `{updated_summary,
 /// new_glossary_terms}` (no `translated_text`): the model does not re-translate
 /// the page, so the output stays small and budget-safe (no EC08 from a maxi
-/// re-translation). Returns the parsed output, the provider `usage` when reported
-/// (cost telemetry + ratio calibration), and the **working request body** that
-/// actually succeeded (possibly degraded by the param-relaxation fallback).
+/// re-translation).
+///
+/// Resilience (ticket 02): when the strict parse fails on BOTH the first answer
+/// and the correction retry, instead of returning an error that discards
+/// everything, it attempts a **tolerant extraction** of just the glossary terms
+/// (`new_glossary_terms`) from either answer and returns
+/// [`PerceptorUpdateResult::Recovered`] — so a small local model that can't emit
+/// a conformant `updated_summary` still contributes glossary terms. A
+/// **transport** failure (network / EC08 empty+length / no content) has nothing
+/// to extract from and is surfaced as `Err`; the caller treats both the `Err` and
+/// the `Recovered` outcomes as "context not advanced" and signals the UI.
 fn complete_and_parse_perceptor_update(
     client: &dyn ChatClient,
     req: ChatRequest,
-) -> Result<(crate::llm::PerceptorUpdateOutput, Option<Usage>, ChatRequest), LlmError> {
+) -> Result<PerceptorUpdateResult, LlmError> {
     // `complete_with_fallback` adds the model-agnostic param-relaxation retry
     // (research §2, bug #1) around the transport: a 404 "No endpoints found" or
     // a 400 unsupported-parameter downgrades the body (drop provider →
@@ -598,25 +637,45 @@ fn complete_and_parse_perceptor_update(
     let content = resp.content()?.to_string();
     let usage = resp.usage.clone();
 
-    match crate::llm::parse_perceptor_update(&content) {
-        Ok(out) => Ok((out, usage, working)),
-        Err(_) => {
-            // (c) one correction retry: echo the bad answer, demand pure JSON.
-            // Build it on the *working* (possibly degraded) body so the retry
-            // does not re-send the param the model already rejected.
-            let mut retry_req = working;
-            retry_req.messages.push(ChatMessage::assistant(content));
-            retry_req.messages.push(ChatMessage::user(CORRECTION_PROMPT));
+    if let Ok(out) = crate::llm::parse_perceptor_update(&content) {
+        return Ok(PerceptorUpdateResult::Full { output: out, usage });
+    }
 
-            let (resp2, working2) = complete_with_fallback(client, &retry_req)?;
-            let content2 = resp2.content()?.to_string();
-            let usage2 = resp2.usage.clone();
+    // (c) one correction retry: echo the bad answer, demand pure JSON. Build it
+    // on the *working* (possibly degraded) body so the retry does not re-send the
+    // param the model already rejected.
+    let mut retry_req = working;
+    retry_req.messages.push(ChatMessage::assistant(content.clone()));
+    retry_req.messages.push(ChatMessage::user(CORRECTION_PROMPT));
 
-            // (d) final error if the retry still isn't conformant.
-            let out = crate::llm::parse_perceptor_update(&content2).map_err(LlmError::ParseFailed)?;
-            Ok((out, usage2.or(usage), working2))
+    // A transport failure on the retry itself must not drop terms already
+    // recoverable from the first answer: fall back to tolerant extraction on
+    // `content` rather than propagating the error (resilience over strictness).
+    let (content2, usage2) = match complete_with_fallback(client, &retry_req) {
+        Ok((resp2, _working2)) => match resp2.content() {
+            Ok(c) => (Some(c.to_string()), resp2.usage.clone().or(usage.clone())),
+            Err(_) => (None, usage.clone()),
+        },
+        Err(_) => (None, usage.clone()),
+    };
+
+    // Strict parse of the corrected answer → full success.
+    if let Some(c2) = &content2 {
+        if let Ok(out) = crate::llm::parse_perceptor_update(c2) {
+            return Ok(PerceptorUpdateResult::Full { output: out, usage: usage2 });
         }
     }
+
+    // (d) tolerant recovery: extract the glossary terms from the corrected answer
+    // first (freshest), then the original. Empty when nothing is recoverable.
+    let mut terms = content2
+        .as_deref()
+        .map(crate::llm::extract_glossary_terms_tolerant)
+        .unwrap_or_default();
+    if terms.is_empty() {
+        terms = crate::llm::extract_glossary_terms_tolerant(&content);
+    }
+    Ok(PerceptorUpdateResult::Recovered { terms, usage: usage2 })
 }
 
 /// Call the client for a **translate-only** unit (STC-08, D5) and extract the
@@ -713,6 +772,9 @@ pub fn translate_page(
                 from_cache: true,
                 total_tokens: None,
                 updated_summary: None,
+                // A cache hit does not re-run the percettore, so there is no
+                // update to fail (STC-10): never a false alarm.
+                perceptor_update_failed: false,
             });
         }
     }
@@ -937,6 +999,10 @@ pub fn translate_page(
     // restituita (coerente con la cache per-unità di STC-09).
     let mut new_terms: Vec<GlossaryTerm> = Vec::new();
     let mut summary_advanced = false;
+    // STC-10 observability (ticket 02): true when the context could NOT be
+    // advanced for this page (strict parse failed or the call errored), even if
+    // glossary terms were tolerantly recovered. Surfaced to the UI.
+    let mut perceptor_update_failed = false;
     if p.update_context {
         // Compact glossary for the perceptor prompt: only the terms relevant to
         // the page (locked-first, STC-03), never the whole glossary.
@@ -959,8 +1025,8 @@ pub fn translate_page(
 
         let req = build_perceptor_update_request(p.model, messages, p.max_tokens);
         match complete_and_parse_perceptor_update(client, req) {
-            Ok((output, usage, _working)) => {
-                // Only advance the context when the perceptor actually succeeded.
+            Ok(PerceptorUpdateResult::Full { output, usage }) => {
+                // Only advance the summary when the perceptor actually succeeded.
                 rolling_summary = output.updated_summary;
                 new_terms = output.new_glossary_terms;
                 summary_advanced = true;
@@ -971,10 +1037,33 @@ pub fn translate_page(
                     prompt_tokens_sum += u.prompt_tokens;
                 }
             }
+            Ok(PerceptorUpdateResult::Recovered { terms, usage }) => {
+                // Partial: strict JSON unparseable, so the summary does NOT
+                // advance — but glossary terms were tolerantly recovered and are
+                // inserted anyway (decoupled from `summary_advanced`, ticket 02).
+                // Still a failure for the UI signal (context not fully advanced).
+                new_terms = terms;
+                perceptor_update_failed = true;
+                if let Some(u) = usage {
+                    saw_usage = true;
+                    total_tokens_sum += u.total_tokens;
+                    prompt_tokens_sum += u.prompt_tokens;
+                }
+                eprintln!(
+                    "[perceptor] update parziale document_id={} page={} lang={}: summary NON avanzato, {} termini recuperati",
+                    p.document_id,
+                    p.page_number,
+                    p.target_language,
+                    new_terms.len()
+                );
+            }
             Err(e) => {
                 // Fallimento soft: la traduzione della pagina resta valida e viene
                 // cachata sotto; il contesto (summary + glossario) semplicemente
-                // non avanza per questa pagina.
+                // non avanza per questa pagina. Il fallimento è ora osservabile
+                // dall'utente via `perceptor_update_failed` (ticket 02), non solo
+                // questo log.
+                perceptor_update_failed = true;
                 eprintln!(
                     "[perceptor] update fallito document_id={} page={} lang={}: {}",
                     p.document_id,
@@ -998,8 +1087,17 @@ pub fn translate_page(
     // prefetch non deve mutare il contesto fuori ordine (ticket 12).
     if p.update_context {
         cache_insert(conn, p, &translated_text)?;
+        // The summary advances ONLY on a full perceptor success.
         if summary_advanced {
             documents::set_rolling_summary(conn, p.document_id, &rolling_summary).map_err(storage)?;
+        }
+        // Glossary insertion is DECOUPLED from the summary (ticket 02, criterion
+        // b): terms come from a full success OR from tolerant recovery on a
+        // partial failure, so the glossary can grow even when the summary could
+        // not advance. `insert_terms_deduped` leaves locked terms untouched and
+        // dedups against existing rows, so this is safe either way. A no-op when
+        // `new_terms` is empty.
+        if !new_terms.is_empty() {
             glossary::insert_terms_deduped(conn, p.document_id, &new_terms, p.page_number)
                 .map_err(storage)?;
         }
@@ -1039,6 +1137,10 @@ pub fn translate_page(
         } else {
             None
         },
+        // Only meaningful on real navigation (the percettore runs); a prefetch or
+        // cache hit never sets it. True when the summary could not be advanced
+        // (STC-10 observability, ticket 02).
+        perceptor_update_failed,
     })
 }
 
@@ -1508,6 +1610,123 @@ mod tests {
             before_glossary,
             "no glossary terms inserted on perceptor failure"
         );
+    }
+
+    /// STC-10 resilience (ticket 02, criterion b): when the strict perceptor JSON
+    /// fails to parse (here: a response with the `new_glossary_terms` array but a
+    /// TRUNCATED `updated_summary`, as the small local model produces routinely),
+    /// the glossary terms are TOLERANTLY recovered and inserted EVEN THOUGH the
+    /// summary cannot be advanced — glossary insertion is decoupled from
+    /// `summary_advanced`. The page is still cached and the failure is signalled.
+    #[test]
+    fn perceptor_partial_json_recovers_and_inserts_glossary_terms_summary_not_advanced() {
+        let c = conn();
+        seed_session(&c);
+        crate::documents::set_rolling_summary(&c, 1, "Riassunto originale.").unwrap();
+        let before = crate::glossary::list_glossary(&c, 1).unwrap().len();
+
+        // Perceptor answers with recoverable terms but a summary cut off mid-word:
+        // strict parse (needs BOTH fields) fails on both the first answer and the
+        // correction retry, so today the terms would be lost silently.
+        let partial = "Ecco l'aggiornamento del contesto.\n\
+            {\"new_glossary_terms\": [\
+              {\"source_term\":\"hobbit\",\"translation\":\"hobbit\",\"type\":\"nome proprio\",\"note\":\"\"}\
+            ], \"updated_summary\": \"Bilbo lascia la Contea per un'avvent";
+
+        let client = MockClient::new(vec![
+            Ok(resp("Ciao mondo", 10)), // translate-only unit (succeeds)
+            Ok(resp(partial, 10)),      // perceptor: strict parse fails
+            Ok(resp(partial, 20)),      // perceptor correction: still strict-fails
+        ]);
+
+        let out = translate_page(&c, &client, &params("Hello")).unwrap();
+
+        // Translation is preserved and cached (STC-10 invariant).
+        assert_eq!(out.translated_text, "Ciao mondo");
+        // Summary NOT advanced (couldn't be parsed) — reported as None.
+        assert_eq!(out.updated_summary, None, "summary not advanced on partial perceptor");
+        // The failure is SIGNALLED to the UI (non-silent).
+        assert!(out.perceptor_update_failed, "partial perceptor failure is surfaced");
+        assert_eq!(client.calls(), 3, "unit + perceptor + one correction retry");
+
+        // The recovered glossary term WAS inserted, decoupled from the summary.
+        let terms = crate::glossary::list_glossary(&c, 1).unwrap();
+        assert_eq!(terms.len(), before + 1, "recovered term inserted despite summary not advancing");
+        assert!(
+            terms.iter().any(|t| t.source_term == "hobbit"),
+            "the tolerant-extracted term is present"
+        );
+
+        // Summary genuinely unchanged.
+        assert_eq!(
+            crate::documents::get_rolling_summary(&c, 1).unwrap(),
+            "Riassunto originale.",
+            "rolling summary not advanced"
+        );
+
+        // Page cached despite the perceptor failure.
+        let stored: String = c
+            .query_row(
+                "SELECT translated_text FROM translations_cache
+                  WHERE document_id=1 AND page_number=3 AND target_language='it'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "Ciao mondo");
+    }
+
+    /// STC-10 observability (ticket 02, criterion a): a perceptor-update that
+    /// fails at the TRANSPORT level (no content to recover terms from) still
+    /// returns the translation, caches it, and SIGNALS the failure via
+    /// `perceptor_update_failed` — never a silent `eprintln!`-only swallow.
+    #[test]
+    fn perceptor_transport_failure_surfaces_signal_and_keeps_translation() {
+        let c = conn();
+        seed_session(&c);
+        let before = crate::glossary::list_glossary(&c, 1).unwrap().len();
+
+        let client = MockClient::new(vec![
+            Ok(resp("Ciao mondo", 10)),                    // unit succeeds
+            Err(LlmError::Http("500 boom".into())),        // perceptor transport error
+        ]);
+
+        let out = translate_page(&c, &client, &params("Hello")).unwrap();
+        assert_eq!(out.translated_text, "Ciao mondo", "translation preserved");
+        assert!(out.perceptor_update_failed, "transport failure surfaced to the UI");
+        assert_eq!(out.updated_summary, None, "summary not advanced");
+        assert_eq!(client.calls(), 2, "unit + perceptor (no correction retry on transport error)");
+        assert_eq!(
+            crate::glossary::list_glossary(&c, 1).unwrap().len(),
+            before,
+            "no terms recoverable from a transport error"
+        );
+
+        // Page still cached.
+        let stored: String = c
+            .query_row(
+                "SELECT translated_text FROM translations_cache
+                  WHERE document_id=1 AND page_number=3 AND target_language='it'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "Ciao mondo");
+    }
+
+    /// A fully successful perceptor-update reports `perceptor_update_failed ==
+    /// false` (no false alarm) and advances the summary as before.
+    #[test]
+    fn perceptor_success_does_not_signal_failure() {
+        let c = conn();
+        seed_session(&c);
+        let client = MockClient::new(vec![
+            Ok(resp("Ciao mondo", 100)),     // unit
+            Ok(resp(&valid_content(), 100)), // perceptor OK
+        ]);
+        let out = translate_page(&c, &client, &params("Hello")).unwrap();
+        assert!(!out.perceptor_update_failed, "success is not a failure");
+        assert_eq!(out.updated_summary.as_deref(), Some("riassunto"));
     }
 
     // --- Bug #1: model-agnostic 404 fallback through the service ------------

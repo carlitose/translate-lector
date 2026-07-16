@@ -13,6 +13,16 @@ export interface TranslationResult {
    * will surface glossary changes; the summary is exposed here for state.
    */
   updated_summary?: string | null;
+  /**
+   * True when the per-page perceptor-update failed to advance the document
+   * context (STC-10 observability, ticket 02): the strict JSON could not be
+   * parsed even after the correction retry, or the call errored — so the rolling
+   * summary was NOT advanced for this page. The translation itself is always
+   * produced and cached regardless (STC-10 invariant); glossary terms may still
+   * have been recovered. `false`/absent on a cache hit, on prefetch, and on a
+   * full success. Surfaced as a non-intrusive status note (never a modal).
+   */
+  perceptor_update_failed?: boolean;
 }
 
 function errorText(err: unknown): string {
@@ -106,6 +116,25 @@ export function pageStatusLabel(status: PageStatus): string {
 /** The status of a completed translation, distinguishing a cache hit. */
 export function resultStatus(fromCache: boolean): PageStatus {
   return fromCache ? 'cached' : 'translated';
+}
+
+/**
+ * Non-intrusive note shown when the per-page perceptor-update failed to advance
+ * the document context (ticket 02). The page IS translated and readable; only
+ * the rolling summary/glossary context did not advance for this page. Kept short
+ * and informational — no modal, no error styling (the translation succeeded).
+ */
+export const CONTEXT_NOT_ADVANCED_HINT =
+  'ⓘ Contesto non aggiornato per questa pagina (glossario/riassunto): la traduzione è comunque completa.';
+
+/**
+ * The context note to show for a completed translation result. Returns the
+ * non-intrusive hint when the core reported a perceptor-update failure, or an
+ * empty string otherwise (full success, cache hit, prefetch, or an older core
+ * that does not send the flag).
+ */
+export function contextNote(result: Partial<TranslationResult>): string {
+  return result.perceptor_update_failed ? CONTEXT_NOT_ADVANCED_HINT : '';
 }
 
 // --- Obsolete-request handling (ticket 12) ----------------------------------

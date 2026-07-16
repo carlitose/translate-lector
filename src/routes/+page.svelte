@@ -16,6 +16,7 @@
     isCurrentRequest,
     shouldTranslate,
     isLatestNav,
+    contextNote,
     type TranslationResult,
     type PageStatus,
     type RequestKey
@@ -79,6 +80,10 @@
   let translationError = $state('');
   // Per-page status for the bottom bar (§3.1): idle/loading/cached/translated/error.
   let pageStatus = $state<PageStatus>('idle');
+  // Non-intrusive note when the perceptor-update failed to advance the context
+  // for this page (ticket 02): the translation is still shown; only the
+  // summary/glossary context did not advance. Empty = no note.
+  let contextNoteText = $state('');
   // Monotonic token so a slow response for a stale page/language is ignored.
   let translationSeq = 0;
   // Monotonic navigation token (finding 2): captured at the start of each
@@ -411,6 +416,7 @@
     translating = true;
     pageStatus = 'loading';
     translationError = '';
+    contextNoteText = '';
     try {
       const result = await invoke<TranslationResult>('translate_page', {
         documentId: requested.documentId,
@@ -429,6 +435,9 @@
       if (seq !== translationSeq || !now || !isCurrentRequest(requested, now)) return;
       translatedText = result.translated_text;
       pageStatus = resultStatus(result.from_cache);
+      // Non-intrusive note if the perceptor-update did not advance the context
+      // for this page (ticket 02); empty on success / cache hit.
+      contextNoteText = contextNote(result);
       void prefetchNextPage(); // warm N+1 in the background (D5)
     } catch (e) {
       const now = currentKey();
@@ -622,6 +631,12 @@
       <span class="status-indicator" class:status-error={pageStatus === 'error'}>
         {pageStatusLabel(pageStatus)}
       </span>
+    {/if}
+    {#if session && contextNoteText}
+      <!-- Non-intrusive note (ticket 02): the perceptor-update did not advance
+           the summary/glossary context for this page. The translation itself is
+           shown and cached; this is informational, not an error. -->
+      <span class="context-note" role="status">{contextNoteText}</span>
     {/if}
     {#if session && pageStatus === 'error'}
       <!-- Retry the current page after a failed translation (ticket 12). Reuses
@@ -881,6 +896,15 @@
   .status-indicator.status-error {
     color: #b3261e;
     opacity: 1;
+  }
+
+  .context-note {
+    font-size: 0.82rem;
+    opacity: 0.7;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 42ch;
   }
 
   @media (prefers-color-scheme: dark) {
