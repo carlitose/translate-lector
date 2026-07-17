@@ -1,6 +1,25 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
-  import { isValidTranslation, toUpdateArgs, typeLabel, type GlossaryTermRecord } from './glossary';
+  import { tick } from 'svelte';
+  import {
+    isValidTranslation,
+    isValidNewTerm,
+    toUpdateArgs,
+    toAddArgs,
+    typeLabel,
+    pageLabel,
+    type GlossaryTermRecord,
+    type AddTermFormValues,
+    type AddTermResult
+  } from './glossary';
+
+  // Free-text `type` with a small set of suggestions (product decision #4).
+  const TYPE_SUGGESTIONS = ['comune', 'tecnico', 'nome proprio'];
+
+  /** Blank form values; `locked` defaults to true (product decision #1). */
+  function emptyForm(): AddTermFormValues {
+    return { sourceTerm: '', translation: '', termType: '', note: '', locked: true };
+  }
 
   // Controlled open state (bindable so the bottom-bar [Glossario] toggles it)
   // plus the current document whose terms are shown.
@@ -15,6 +34,11 @@
   let info = $state('');
   // id of the row currently being saved (for a per-row busy state).
   let savingId = $state<number | null>(null);
+  // "Aggiungi termine" form state + its busy flag.
+  let form = $state<AddTermFormValues>(emptyForm());
+  let adding = $state(false);
+  // Row transiently highlighted after a duplicate is opened in edit.
+  let highlightId = $state<number | null>(null);
 
   /** Reload the document's terms whenever the panel opens. */
   $effect(() => {
@@ -56,6 +80,64 @@
     }
   }
 
+  /**
+   * Add a brand-new term. On `inserted` the list reloads, a confirmation shows
+   * and the form resets. On `duplicate` (product decision #2) no row is added —
+   * the existing row is scrolled to, highlighted and focused for inline edit.
+   * Validation failures come back as `Err(String)` and are shown non-intrusively.
+   */
+  async function addTerm(): Promise<void> {
+    if (documentId == null) return;
+    if (!isValidNewTerm(form.sourceTerm, form.translation)) return;
+    const label = form.sourceTerm.trim();
+    error = '';
+    info = '';
+    adding = true;
+    try {
+      const result = await invoke<AddTermResult>('add_glossary_term', {
+        ...toAddArgs(documentId, form)
+      });
+      // `load` clears info/error, so reload first, then set the message.
+      await load(documentId);
+      if (result.status === 'duplicate') {
+        info = `«${label}» esiste già — aperto in modifica.`;
+        await focusExistingRow(result.id);
+      } else {
+        info = `«${label}» aggiunto.`;
+        form = emptyForm();
+      }
+    } catch (e) {
+      error = `Errore nell'aggiunta: ${e}`;
+    } finally {
+      adding = false;
+    }
+  }
+
+  /** Scroll to, highlight and focus the existing row's translation input. */
+  async function focusExistingRow(id: number): Promise<void> {
+    // Restart the flash even when the same duplicate is re-submitted: drop the
+    // class, let Svelte flush, then re-add it so the keyframes replay.
+    highlightId = null;
+    await tick();
+    highlightId = id;
+    await tick();
+    const row = document.getElementById(`gloss-row-${id}`);
+    if (!row) return;
+    row.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    // Clear the highlight once the flash finishes so the class doesn't linger.
+    row.addEventListener(
+      'animationend',
+      () => {
+        if (highlightId === id) highlightId = null;
+      },
+      { once: true }
+    );
+    const input = row.querySelector<HTMLInputElement>('[data-role="translation"]');
+    // preventScroll so the default focus jump doesn't fight the smooth scroll.
+    input?.focus({ preventScroll: true });
+    input?.select();
+  }
+
   function close(): void {
     open = false;
   }
@@ -89,6 +171,59 @@
         <p class="msg info">{info}</p>
       {/if}
 
+      {#if documentId != null}
+        <form
+          class="add-form"
+          aria-label="Aggiungi termine"
+          onsubmit={(e) => {
+            e.preventDefault();
+            void addTerm();
+          }}
+        >
+          <input
+            class="edit"
+            aria-label="Termine"
+            placeholder="Termine"
+            bind:value={form.sourceTerm}
+          />
+          <input
+            class="edit"
+            aria-label="Traduzione"
+            placeholder="Traduzione"
+            bind:value={form.translation}
+          />
+          <input
+            class="edit"
+            list="glossary-type-suggestions"
+            aria-label="Tipo"
+            placeholder="Tipo"
+            bind:value={form.termType}
+          />
+          <datalist id="glossary-type-suggestions">
+            {#each TYPE_SUGGESTIONS as suggestion}
+              <option value={suggestion}></option>
+            {/each}
+          </datalist>
+          <input
+            class="edit"
+            aria-label="Nota"
+            placeholder="Nota"
+            bind:value={form.note}
+          />
+          <label class="lock-toggle" title="Vincolo assoluto">
+            <input type="checkbox" aria-label="Blocca" bind:checked={form.locked} />
+            Bloccato
+          </label>
+          <button
+            type="submit"
+            class="add"
+            disabled={adding || !isValidNewTerm(form.sourceTerm, form.translation)}
+          >
+            {adding ? '…' : 'Aggiungi'}
+          </button>
+        </form>
+      {/if}
+
       {#if loading}
         <p class="empty">Caricamento…</p>
       {:else if documentId == null}
@@ -111,11 +246,16 @@
             </thead>
             <tbody>
               {#each terms as term (term.id)}
-                <tr class:locked={term.locked}>
+                <tr
+                  id={`gloss-row-${term.id}`}
+                  class:locked={term.locked}
+                  class:highlight={highlightId === term.id}
+                >
                   <td class="source">{term.source_term}</td>
                   <td>
                     <input
                       class="edit"
+                      data-role="translation"
                       aria-label={`Traduzione di ${term.source_term}`}
                       bind:value={term.translation}
                     />
@@ -136,7 +276,7 @@
                       bind:value={term.note}
                     />
                   </td>
-                  <td class="col-page">{term.first_seen_page}</td>
+                  <td class="col-page">{pageLabel(term.first_seen_page)}</td>
                   <td>
                     <button
                       class="save"
@@ -243,6 +383,43 @@
     background: rgba(57, 108, 216, 0.08);
   }
 
+  tr.highlight {
+    animation: row-flash 1.6s ease-out;
+  }
+
+  @keyframes row-flash {
+    0% {
+      background: rgba(255, 196, 0, 0.55);
+    }
+    100% {
+      background: transparent;
+    }
+  }
+
+  .add-form {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.6rem;
+    border: 1px solid #ececec;
+    border-radius: 8px;
+    background: rgba(57, 108, 216, 0.04);
+  }
+
+  .add-form .edit {
+    flex: 1 1 8rem;
+    width: auto;
+  }
+
+  .lock-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    font-size: 0.85rem;
+    white-space: nowrap;
+  }
+
   .edit {
     width: 100%;
     box-sizing: border-box;
@@ -308,6 +485,10 @@
     }
     tr.locked {
       background: rgba(57, 108, 216, 0.18);
+    }
+    .add-form {
+      border-color: #3a3a3a;
+      background: rgba(57, 108, 216, 0.1);
     }
     .msg.info {
       color: #4ac26b;
