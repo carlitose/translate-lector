@@ -1,9 +1,14 @@
 import { describe, it, expect } from 'vitest';
 import {
   isValidTranslation,
+  isValidNewTerm,
   toUpdateArgs,
+  toAddArgs,
   typeLabel,
-  type GlossaryTermRecord
+  pageLabel,
+  type GlossaryTermRecord,
+  type AddTermFormValues,
+  type AddTermResult
 } from './glossary';
 
 const base: GlossaryTermRecord = {
@@ -60,5 +65,78 @@ describe('typeLabel', () => {
 
   it('passes through a real type', () => {
     expect(typeLabel('tecnico')).toBe('tecnico');
+  });
+});
+
+describe('isValidNewTerm', () => {
+  it('requires both source term and translation (trimmed) to be non-empty', () => {
+    expect(isValidNewTerm('', 'consiglio')).toBe(false);
+    expect(isValidNewTerm('   ', 'consiglio')).toBe(false);
+    expect(isValidNewTerm('board', '')).toBe(false);
+    expect(isValidNewTerm('board', '   ')).toBe(false);
+    expect(isValidNewTerm('', '')).toBe(false);
+    expect(isValidNewTerm(null, undefined)).toBe(false);
+  });
+
+  it('accepts when both are non-empty once trimmed', () => {
+    expect(isValidNewTerm('board', 'consiglio')).toBe(true);
+    expect(isValidNewTerm('  board  ', '  consiglio  ')).toBe(true);
+  });
+});
+
+describe('toAddArgs', () => {
+  const form: AddTermFormValues = {
+    sourceTerm: '  board  ',
+    translation: '  consiglio di amministrazione  ',
+    termType: '  tecnico  ',
+    note: '  vincolante  ',
+    locked: true
+  };
+
+  it('maps form fields to the add_glossary_term invoke args, trimming text', () => {
+    expect(toAddArgs(42, form)).toEqual({
+      documentId: 42,
+      sourceTerm: 'board',
+      translation: 'consiglio di amministrazione',
+      termType: 'tecnico',
+      note: 'vincolante',
+      locked: true
+    });
+  });
+
+  it('carries exactly the fields the command expects', () => {
+    expect(Object.keys(toAddArgs(42, form)).sort()).toEqual([
+      'documentId',
+      'locked',
+      'note',
+      'sourceTerm',
+      'termType',
+      'translation'
+    ]);
+  });
+
+  it('preserves the locked flag when false', () => {
+    expect(toAddArgs(1, { ...form, locked: false }).locked).toBe(false);
+  });
+});
+
+describe('AddTermResult', () => {
+  it('accepts the two documented shapes returned by add_glossary_term', () => {
+    const inserted: AddTermResult = { status: 'inserted', id: 42 };
+    const duplicate: AddTermResult = { status: 'duplicate', id: 7 };
+    expect(inserted.status).toBe('inserted');
+    expect(duplicate.status).toBe('duplicate');
+    expect([inserted, duplicate].map((r) => r.id)).toEqual([42, 7]);
+  });
+});
+
+describe('pageLabel', () => {
+  it('shows "manuale" for the sentinel page 0 (manually added term)', () => {
+    expect(pageLabel(0)).toBe('manuale');
+  });
+
+  it('shows the page number for perceptor-collected terms', () => {
+    expect(pageLabel(3)).toBe('3');
+    expect(pageLabel(12)).toBe('12');
   });
 });

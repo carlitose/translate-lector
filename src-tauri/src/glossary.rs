@@ -11,7 +11,7 @@
 //! consumed by the prompt builder (`llm::build_user_prompt`).
 
 use crate::llm::GlossaryTerm;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 use serde::Serialize;
 
 /// A stored glossary row (§4.3) as needed to build the prompt context and to
@@ -231,26 +231,21 @@ pub fn insert_terms_deduped(
     terms: &[GlossaryTerm],
     page: i64,
 ) -> rusqlite::Result<usize> {
-    // Existing source_terms for this document, lowercased.
-    let mut existing: std::collections::HashSet<String> = {
-        let mut stmt =
-            conn.prepare("SELECT source_term FROM glossary WHERE document_id = ?1")?;
-        let rows = stmt.query_map(params![document_id], |r| r.get::<_, String>(0))?;
-        rows.filter_map(Result::ok)
-            .map(|s| s.trim().to_lowercase())
-            .collect()
-    };
-
     let mut inserted = 0usize;
     for term in terms {
-        let key = term.source_term.trim().to_lowercase();
-        if key.is_empty() || existing.contains(&key) {
-            continue; // dedup against DB and within the batch
+        // Skip blank source terms (they carry no dedup key). Dedup against the DB
+        // and within the batch is enforced atomically by the `ux_glossary_dedup`
+        // UNIQUE index (ticket 04): `ON CONFLICT DO NOTHING` inserts only when no
+        // row with the same `(document_id, lower(trim(source_term)))` exists,
+        // never clobbering an existing (locked included) row.
+        if term.source_term.trim().is_empty() {
+            continue;
         }
-        conn.execute(
+        let changed = conn.execute(
             "INSERT INTO glossary
                  (document_id, source_term, translation, type, locked, note, first_seen_page)
-             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)
+             ON CONFLICT DO NOTHING",
             params![
                 document_id,
                 term.source_term,
@@ -260,8 +255,7 @@ pub fn insert_terms_deduped(
                 page
             ],
         )?;
-        existing.insert(key);
-        inserted += 1;
+        inserted += changed;
     }
     Ok(inserted)
 }
@@ -317,10 +311,15 @@ impl From<rusqlite::Error> for AddTermError {
 /// chooses `locked`. `first_seen_page` is stored as `0`, the "manual" marker
 /// (decision 01 #3).
 ///
-/// Dedup is case-insensitive against existing `source_term`s in the document,
-/// reusing the existence logic of [`insert_terms_deduped`] (`trim().to_lowercase()`).
-/// On a duplicate the existing row is returned **untouched** (never clobbered,
-/// locked rows included) via [`AddOutcome::Duplicate`] — no insert, no update.
+/// Dedup is enforced at the storage layer by the `ux_glossary_dedup` UNIQUE
+/// index on `(document_id, lower(trim(source_term)))` via
+/// `INSERT … ON CONFLICT DO NOTHING`: `Inserted` vs `Duplicate` is derived from
+/// the conflict result, not a prior SELECT. On a conflict the existing row is
+/// fetched (using the same `lower(trim(...))` key) and returned **untouched**
+/// (never clobbered, locked rows included) via [`AddOutcome::Duplicate`] — no
+/// insert, no update. Note the key uses SQLite's `lower()` (ASCII casefold), a
+/// deliberate narrowing of the old Rust full-Unicode `to_lowercase()` so that
+/// index, conflict, probe and reconcile share one identical normalisation.
 ///
 /// Core-side validation: `source_term` and `translation` must be non-empty
 /// after trim, otherwise [`AddTermError::Validation`] is returned through the
@@ -343,28 +342,16 @@ pub fn add_manual_term(
         return Err(AddTermError::Validation("translation non può essere vuota"));
     }
 
-    // Existence check, case-insensitive, mirroring `insert_terms_deduped`. A
-    // single targeted query returns just the existing id (if any); the bound key
-    // is already trimmed+lowercased and the stored side is normalised in SQL.
-    let key = source.to_lowercase();
-    let existing_id: Option<i64> = conn
-        .query_row(
-            "SELECT id FROM glossary
-             WHERE document_id = ?1 AND lower(trim(source_term)) = ?2
-             LIMIT 1",
-            params![document_id, key],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if let Some(id) = existing_id {
-        // Never clobber an existing row (locked included): just point the UI at it.
-        return Ok(AddOutcome::Duplicate(id));
-    }
-
-    conn.execute(
+    // Atomic dedup (ticket 04): attempt the insert with `ON CONFLICT DO NOTHING`
+    // against the `ux_glossary_dedup` UNIQUE index on
+    // `(document_id, lower(trim(source_term)))`. `Inserted` vs `Duplicate` is
+    // derived from the conflict result, not a prior SELECT, so two concurrent
+    // writers can never both pass an existence check and create a duplicate row.
+    let changed = conn.execute(
         "INSERT INTO glossary
              (document_id, source_term, translation, type, locked, note, first_seen_page)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)
+         ON CONFLICT DO NOTHING",
         params![
             document_id,
             source,
@@ -374,7 +361,25 @@ pub fn add_manual_term(
             note.trim()
         ],
     )?;
-    Ok(AddOutcome::Inserted(conn.last_insert_rowid()))
+    if changed == 1 {
+        return Ok(AddOutcome::Inserted(conn.last_insert_rowid()));
+    }
+
+    // Conflict: a row with the same normalised key already exists. Never clobber
+    // it (locked included) — fetch and return its id so the UI can open it. Both
+    // sides of the comparison MUST use the IDENTICAL `lower(trim(...))` — SQLite's
+    // ASCII casefold — that the `ux_glossary_dedup` index and `ON CONFLICT` use;
+    // binding a Rust `to_lowercase()` here instead disagreed on non-ASCII
+    // uppercase (e.g. 'SOCIETÀ') and turned a real duplicate into a spurious
+    // QueryReturnedNoRows error. Bind the raw source_term and let SQLite lower it.
+    let existing_id: i64 = conn.query_row(
+        "SELECT id FROM glossary
+         WHERE document_id = ?1 AND lower(trim(source_term)) = lower(trim(?2))
+         LIMIT 1",
+        params![document_id, source],
+        |r| r.get(0),
+    )?;
+    Ok(AddOutcome::Duplicate(existing_id))
 }
 
 #[cfg(test)]
@@ -505,6 +510,80 @@ mod tests {
             vec!["board".to_string()],
             "manual term is picked by select_glossary when it occurs in the unit"
         );
+    }
+
+    /// Ticket 04: the manual and perceptor writers share one storage-level dedup
+    /// guarantee. Whatever the writer or the case, a single key yields a single
+    /// row — the UNIQUE index prevents the concurrent-duplicate race — and the
+    /// existing (locked) row is never clobbered.
+    #[test]
+    fn manual_and_perceptor_paths_dedup_across_case_via_unique_index() {
+        let c = conn();
+        // Manual add, mixed case, locked.
+        let out = add_manual_term(&c, 1, "Board", "consiglio", "tecnico", "", true).unwrap();
+        assert!(matches!(out, AddOutcome::Inserted(_)));
+
+        // Perceptor proposes the same term in a different case -> deduped, no insert.
+        let n = insert_terms_deduped(&c, 1, &[term("board", "altro")], 4).unwrap();
+        assert_eq!(n, 0, "perceptor batch dedups against the manual row across case");
+
+        // A second manual add in yet another case -> Duplicate, no new row.
+        let out2 = add_manual_term(&c, 1, "BOARD", "x", "comune", "", false).unwrap();
+        assert!(matches!(out2, AddOutcome::Duplicate(_)), "second add is a duplicate");
+
+        let entries = list_glossary(&c, 1).unwrap();
+        assert_eq!(entries.len(), 1, "exactly one row for the key regardless of writer/case");
+        assert!(entries[0].locked, "the original locked manual row is preserved");
+        assert_eq!(entries[0].translation, "consiglio", "existing translation not clobbered");
+    }
+
+    /// Ticket 04: `add_manual_term` derives `Duplicate(existing_id)` from the
+    /// conflict result and returns the existing row's id (so the UI can open it).
+    #[test]
+    fn add_manual_duplicate_returns_existing_id_from_conflict() {
+        let c = conn();
+        let inserted_id = match add_manual_term(&c, 1, "board", "consiglio", "tecnico", "", false).unwrap() {
+            AddOutcome::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+        let dup = add_manual_term(&c, 1, "BOARD", "altro", "comune", "", true).unwrap();
+        assert_eq!(dup, AddOutcome::Duplicate(inserted_id), "conflict yields the existing id");
+    }
+
+    /// Ticket 04 follow-up (bug): an all-caps accented term (e.g. Italian
+    /// 'SOCIETÀ') must dedup to `Duplicate(existing_id)`, never error. The
+    /// conflict fires on the ASCII-casefold `ux_glossary_dedup` index, but the
+    /// old fetch probe bound Rust's full-Unicode `to_lowercase()` ('società')
+    /// and compared it to SQLite's ASCII `lower()` ('societÀ'); they disagreed
+    /// on 'À', the probe found no row and the function returned `Err(Db)`. Both
+    /// sides now use `lower(trim(...))`, so they agree.
+    ///
+    /// Note: dedup is ASCII casefold, so the accent's own case is significant —
+    /// 'SOCIETÀ' and 'società' are *distinct* keys. These variants keep the
+    /// accent uppercase so they genuinely collide on the index.
+    #[test]
+    fn add_manual_duplicate_all_caps_accented_returns_duplicate_not_error() {
+        let c = conn();
+        let inserted_id =
+            match add_manual_term(&c, 1, "SOCIETÀ", "company", "comune", "", false).unwrap() {
+                AddOutcome::Inserted(id) => id,
+                other => panic!("expected Inserted, got {other:?}"),
+            };
+        // Same all-caps accented term again -> conflict on the ASCII index. Old
+        // code would return Err(Db) here (unwrap would panic).
+        let out = add_manual_term(&c, 1, "SOCIETÀ", "azienda", "comune", "", true).unwrap();
+        assert_eq!(
+            out,
+            AddOutcome::Duplicate(inserted_id),
+            "accented duplicate returns the existing id, not an error"
+        );
+        // ASCII-case variant that keeps the accent uppercase also collides.
+        let out2 = add_manual_term(&c, 1, "SocietÀ", "ditta", "comune", "", false).unwrap();
+        assert_eq!(out2, AddOutcome::Duplicate(inserted_id));
+
+        let entries = list_glossary(&c, 1).unwrap();
+        assert_eq!(entries.len(), 1, "no second row for the accented key");
+        assert_eq!(entries[0].translation, "company", "existing row left untouched");
     }
 
     #[test]
