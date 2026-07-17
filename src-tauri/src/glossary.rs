@@ -11,7 +11,7 @@
 //! consumed by the prompt builder (`llm::build_user_prompt`).
 
 use crate::llm::GlossaryTerm;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
 /// A stored glossary row (§4.3) as needed to build the prompt context and to
@@ -266,6 +266,117 @@ pub fn insert_terms_deduped(
     Ok(inserted)
 }
 
+// --- Aggiunta manuale di un termine (ticket 02) ------------------------------
+
+/// Outcome of a *successful* manual add attempt (ticket 02, decision 01 #2).
+/// Validation failures are not outcomes — they travel through the `Result`
+/// error channel as [`AddTermError::Validation`], mirroring how the rest of the
+/// codebase surfaces validation errors (see [`crate::llm::LlmError`]).
+///
+/// - `Inserted(id)` — a brand-new row was created; `id` is the new row's id.
+/// - `Duplicate(id)` — a row with the same `source_term` (case-insensitive)
+///   already exists in the document; `id` is the **existing** row's id, so the
+///   UI can open it in edit instead of inserting again. Nothing is written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddOutcome {
+    Inserted(i64),
+    Duplicate(i64),
+}
+
+/// Error from [`add_manual_term`]: either a validation failure (empty/whitespace
+/// `source_term`/`translation`) or an underlying database error. The Tauri
+/// command maps both to `Err(String)` via `Display`, so the frontend keeps
+/// seeing the same Italian validation messages.
+#[derive(Debug)]
+pub enum AddTermError {
+    /// `source_term` or `translation` was empty/whitespace after trimming.
+    Validation(&'static str),
+    /// Underlying SQLite failure.
+    Db(rusqlite::Error),
+}
+
+impl std::fmt::Display for AddTermError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AddTermError::Validation(reason) => f.write_str(reason),
+            AddTermError::Db(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for AddTermError {}
+
+impl From<rusqlite::Error> for AddTermError {
+    fn from(e: rusqlite::Error) -> Self {
+        AddTermError::Db(e)
+    }
+}
+
+/// Manually add a glossary term for a document (ticket 02). Unlike
+/// [`insert_terms_deduped`] (percettore-only, always `locked = 0`), the caller
+/// chooses `locked`. `first_seen_page` is stored as `0`, the "manual" marker
+/// (decision 01 #3).
+///
+/// Dedup is case-insensitive against existing `source_term`s in the document,
+/// reusing the existence logic of [`insert_terms_deduped`] (`trim().to_lowercase()`).
+/// On a duplicate the existing row is returned **untouched** (never clobbered,
+/// locked rows included) via [`AddOutcome::Duplicate`] — no insert, no update.
+///
+/// Core-side validation: `source_term` and `translation` must be non-empty
+/// after trim, otherwise [`AddTermError::Validation`] is returned through the
+/// error channel with no DB write. Stored text values are all trimmed.
+pub fn add_manual_term(
+    conn: &Connection,
+    document_id: i64,
+    source_term: &str,
+    translation: &str,
+    term_type: &str,
+    note: &str,
+    locked: bool,
+) -> Result<AddOutcome, AddTermError> {
+    let source = source_term.trim();
+    let trans = translation.trim();
+    if source.is_empty() {
+        return Err(AddTermError::Validation("source_term non può essere vuoto"));
+    }
+    if trans.is_empty() {
+        return Err(AddTermError::Validation("translation non può essere vuota"));
+    }
+
+    // Existence check, case-insensitive, mirroring `insert_terms_deduped`. A
+    // single targeted query returns just the existing id (if any); the bound key
+    // is already trimmed+lowercased and the stored side is normalised in SQL.
+    let key = source.to_lowercase();
+    let existing_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM glossary
+             WHERE document_id = ?1 AND lower(trim(source_term)) = ?2
+             LIMIT 1",
+            params![document_id, key],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(id) = existing_id {
+        // Never clobber an existing row (locked included): just point the UI at it.
+        return Ok(AddOutcome::Duplicate(id));
+    }
+
+    conn.execute(
+        "INSERT INTO glossary
+             (document_id, source_term, translation, type, locked, note, first_seen_page)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+        params![
+            document_id,
+            source,
+            trans,
+            term_type.trim(),
+            locked as i64,
+            note.trim()
+        ],
+    )?;
+    Ok(AddOutcome::Inserted(conn.last_insert_rowid()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,6 +400,111 @@ mod tests {
             term_type: "comune".into(),
             note: String::new(),
         }
+    }
+
+    // --- add_manual_term (ticket 02, aggiunta manuale) -----------------------
+
+    #[test]
+    fn add_manual_inserts_new_unlocked_term_with_page_zero() {
+        let c = conn();
+        let out = add_manual_term(&c, 1, "board", "consiglio", "tecnico", "nota", false).unwrap();
+        let id = match out {
+            AddOutcome::Inserted(id) => id,
+            other => panic!("expected Inserted, got {other:?}"),
+        };
+        assert!(id > 0, "Inserted carries the new row id");
+
+        let e = &list_glossary(&c, 1).unwrap()[0];
+        assert_eq!(e.id, id);
+        assert_eq!(e.source_term, "board");
+        assert_eq!(e.translation, "consiglio");
+        assert_eq!(e.term_type, "tecnico");
+        assert_eq!(e.note, "nota");
+        assert!(!e.locked, "unlocked when caller passes locked = false");
+        assert_eq!(e.first_seen_page, 0, "manual terms are marked with page 0");
+    }
+
+    #[test]
+    fn add_manual_inserts_new_locked_term() {
+        let c = conn();
+        let out = add_manual_term(&c, 1, "board", "consiglio", "tecnico", "", true).unwrap();
+        assert!(matches!(out, AddOutcome::Inserted(_)));
+
+        let e = &list_glossary(&c, 1).unwrap()[0];
+        assert!(e.locked, "locked when caller passes locked = true");
+    }
+
+    #[test]
+    fn add_manual_duplicate_case_insensitive_returns_existing_id_untouched() {
+        let c = conn();
+        // Pre-existing locked row with its own translation/note/page.
+        c.execute(
+            "INSERT INTO glossary
+                 (document_id, source_term, translation, type, locked, note, first_seen_page)
+             VALUES (1, 'Board', 'CONSIGLIO-ESISTENTE', 'tecnico', 1, 'nota-orig', 7)",
+            [],
+        )
+        .unwrap();
+        let existing_id = list_glossary(&c, 1).unwrap()[0].id;
+
+        // Different case, different translation/locked -> must NOT clobber.
+        let out = add_manual_term(&c, 1, "board", "altra-traduzione", "comune", "altra-nota", false)
+            .unwrap();
+        assert_eq!(out, AddOutcome::Duplicate(existing_id));
+
+        let entries = list_glossary(&c, 1).unwrap();
+        assert_eq!(entries.len(), 1, "no new row inserted on duplicate");
+        let e = &entries[0];
+        assert_eq!(e.translation, "CONSIGLIO-ESISTENTE", "translation preserved");
+        assert!(e.locked, "locked flag preserved");
+        assert_eq!(e.note, "nota-orig", "note preserved");
+        assert_eq!(e.first_seen_page, 7, "first_seen_page preserved");
+    }
+
+    #[test]
+    fn add_manual_rejects_empty_source_term_without_inserting() {
+        let c = conn();
+        let err = add_manual_term(&c, 1, "   ", "consiglio", "tecnico", "", true).unwrap_err();
+        assert!(
+            matches!(err, AddTermError::Validation(_)),
+            "empty source rejected through the error channel"
+        );
+        let count: i64 = c
+            .query_row("SELECT COUNT(*) FROM glossary", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "nothing inserted on invalid source");
+    }
+
+    #[test]
+    fn add_manual_rejects_empty_translation_without_inserting() {
+        let c = conn();
+        let err = add_manual_term(&c, 1, "board", "   ", "tecnico", "", true).unwrap_err();
+        assert!(
+            matches!(err, AddTermError::Validation(_)),
+            "empty translation rejected through the error channel"
+        );
+        let count: i64 = c
+            .query_row("SELECT COUNT(*) FROM glossary", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "nothing inserted on invalid translation");
+    }
+
+    #[test]
+    fn add_manual_term_is_listed_and_selected_when_present_in_text() {
+        let c = conn();
+        add_manual_term(&c, 1, "board", "consiglio", "tecnico", "", false).unwrap();
+
+        let entries = list_glossary(&c, 1).unwrap();
+        assert!(
+            entries.iter().any(|e| e.source_term == "board"),
+            "manual term appears in list_glossary"
+        );
+        let selected = select_glossary("the board met today", &entries, None);
+        assert_eq!(
+            sources(&selected),
+            vec!["board".to_string()],
+            "manual term is picked by select_glossary when it occurs in the unit"
+        );
     }
 
     #[test]

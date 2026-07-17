@@ -715,6 +715,55 @@ fn update_glossary_term(
         .map_err(|e| e.to_string())
 }
 
+/// Result of [`add_glossary_term`] for the frontend (ticket 02). `status` is
+/// `"inserted"` (a brand-new row was created; `id` is the new row) or
+/// `"duplicate"` (the term already exists; `id` is the **existing** row, so the
+/// UI opens it in edit instead of adding a second one). Validation failures come
+/// back as `Err(String)`, not a status.
+#[derive(serde::Serialize)]
+struct AddGlossaryTermResult {
+    status: String,
+    id: i64,
+}
+
+/// Manually add a glossary term to the current document (ticket 02, UC:
+/// aggiunta manuale). `locked` is chosen by the caller (UI default: `true`);
+/// `first_seen_page` is stored as `0` ("manuale"). Dedup is case-insensitive and
+/// never clobbers an existing row — on a duplicate it returns the existing row's
+/// id so the frontend can open it in edit.
+#[tauri::command]
+fn add_glossary_term(
+    app: tauri::AppHandle,
+    document_id: i64,
+    source_term: String,
+    translation: String,
+    term_type: String,
+    note: String,
+    locked: bool,
+) -> Result<AddGlossaryTermResult, String> {
+    let conn = open_db(&app)?;
+    match glossary::add_manual_term(
+        &conn,
+        document_id,
+        &source_term,
+        &translation,
+        &term_type,
+        &note,
+        locked,
+    )
+    .map_err(|e| e.to_string())?
+    {
+        glossary::AddOutcome::Inserted(id) => Ok(AddGlossaryTermResult {
+            status: "inserted".into(),
+            id,
+        }),
+        glossary::AddOutcome::Duplicate(id) => Ok(AddGlossaryTermResult {
+            status: "duplicate".into(),
+            id,
+        }),
+    }
+}
+
 /// Resolve the `.db` path. Uses the user-chosen data folder recorded in the
 /// bootstrap pointer (§3.5, ticket 13) when present, otherwise the OS app-data
 /// default. Creates the chosen directory. The pointer is read here — before the
@@ -813,7 +862,8 @@ pub fn run() {
             check_provider_reachable,
             get_prefetch_enabled,
             list_glossary,
-            update_glossary_term
+            update_glossary_term,
+            add_glossary_term
         ])
         // Ticket 04 (D1): migrate from `.run(context)` to `.build(context)?.run(cb)`
         // so we get the `RunEvent` callback for deterministic kill-on-exit.
