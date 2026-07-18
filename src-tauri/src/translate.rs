@@ -242,6 +242,19 @@ pub struct AdvanceContextParams<'a> {
     /// Upper bound on generated tokens for the perceptor call (as `max_tokens` in
     /// [`TranslateParams`]).
     pub max_tokens: u32,
+    /// Whether the perceptor-update may pay a second, full-page **correction
+    /// retry** when the first answer does not parse as strict JSON (ticket 02).
+    /// `true` for **cloud** providers (behaviour unchanged: one retry, as today).
+    /// `false` for the **local** provider, where strict-JSON failure is routine
+    /// and the extra full-page call just doubles the cost while holding the single
+    /// `LocalProviderSlot` and delaying the N+1 prefetch — with a `Recovered`
+    /// outcome (summary not advanced) this doubling would repeat on every page.
+    /// Skipping the retry maps the non-conformant first answer to `Recovered`
+    /// (tolerantly extracted terms, summary NOT advanced), leaving the
+    /// `context_advanced` marker unset so the re-visit retries (ticket 01).
+    /// Derived by the caller from the active provider's `base_url`
+    /// (`llm::is_local_url`).
+    pub allow_correction_retry: bool,
 }
 
 /// Result of [`advance_context`] (ticket 01, two-phase arrival), exposed to the
@@ -717,6 +730,7 @@ enum PerceptorUpdateResult {
 fn complete_and_parse_perceptor_update(
     client: &dyn ChatClient,
     req: ChatRequest,
+    allow_correction_retry: bool,
 ) -> Result<PerceptorUpdateResult, LlmError> {
     // `complete_with_fallback` adds the model-agnostic param-relaxation retry
     // (research §2, bug #1) around the transport: a 404 "No endpoints found" or
@@ -729,6 +743,20 @@ fn complete_and_parse_perceptor_update(
 
     if let Ok(out) = crate::llm::parse_perceptor_update(&content) {
         return Ok(PerceptorUpdateResult::Full { output: out, usage });
+    }
+
+    // Mitigation cap (ticket 02): on the LOCAL provider the correction retry is
+    // disabled — strict-JSON failure is routine there, so a second full-page call
+    // just doubles the cost (holding the single `LocalProviderSlot`, delaying the
+    // N+1 prefetch) while a `Recovered` summary rarely advances. Stop after the
+    // first answer and tolerantly recover the glossary terms from it: the summary
+    // cannot advance → `Recovered` (a perceptor FAILURE for the UI signal; the
+    // caller leaves the `context_advanced` marker unset so the re-visit retries,
+    // ticket 01). Cloud keeps `allow_correction_retry == true` and the retry below
+    // (behaviour unchanged).
+    if !allow_correction_retry {
+        let terms = crate::llm::extract_glossary_terms_tolerant(&content);
+        return Ok(PerceptorUpdateResult::Recovered { terms, usage });
     }
 
     // (c) one correction retry: echo the bad answer, demand pure JSON. Build it
@@ -1200,7 +1228,7 @@ pub fn advance_context(
     let mut total_tokens_sum: i64 = 0;
     let mut saw_usage = false;
 
-    match complete_and_parse_perceptor_update(client, req) {
+    match complete_and_parse_perceptor_update(client, req, p.allow_correction_retry) {
         Ok(PerceptorUpdateResult::Full { output, usage }) => {
             advanced_summary = Some(output.updated_summary);
             new_terms = output.new_glossary_terms;
@@ -1411,6 +1439,17 @@ mod tests {
     /// Derive phase-2 params from a real-navigation [`TranslateParams`], so a test
     /// can run `advance_context` on the same page the view path translated.
     fn adv_from<'a>(p: &TranslateParams<'a>) -> AdvanceContextParams<'a> {
+        adv_from_with(p, true)
+    }
+
+    /// Like [`adv_from`] but lets a test pick the `allow_correction_retry` flag
+    /// (ticket 02): `true` = cloud (correction retry, as today), `false` = local
+    /// (retry capped, at most one perceptor call). `adv_from` defaults to `true`
+    /// because the shared cloud `params()` helper models a cloud provider.
+    fn adv_from_with<'a>(
+        p: &TranslateParams<'a>,
+        allow_correction_retry: bool,
+    ) -> AdvanceContextParams<'a> {
         AdvanceContextParams {
             document_id: p.document_id,
             page_number: p.page_number,
@@ -1418,6 +1457,7 @@ mod tests {
             page_text: p.page_text,
             model: p.model,
             max_tokens: p.max_tokens,
+            allow_correction_retry,
         }
     }
 
@@ -3678,5 +3718,121 @@ fixed({fixed}) windows: a={} b={} stable={fixed_stable}",
         let adv3 = advance_context(&c, &client_noop, &adv_from(&p)).unwrap();
         assert!(!adv3.advanced, "advanced page no longer retries");
         assert_eq!(client_noop.calls(), 0);
+    }
+
+    // --- Ticket 02: cap the perceptor correction-retry on the local provider ----
+
+    /// Ticket 02 (criteria a + c): on the LOCAL provider
+    /// (`allow_correction_retry == false`) a perceptor-update whose first answer is
+    /// not strict JSON costs AT MOST ONE model call — no correction retry. The
+    /// outcome stays observable (`perceptor_update_failed`), the `context_advanced`
+    /// marker is left unset (so a later re-visit retries, ticket 01), and any
+    /// tolerantly-recovered glossary term is still inserted (decoupled from the
+    /// summary). This is the doubling that ticket 02 removes on the hot local path.
+    #[test]
+    fn local_perceptor_first_nonjson_costs_one_call_and_stays_observable() {
+        let c = conn();
+        seed_session(&c);
+        let before = crate::glossary::list_glossary(&c, 1).unwrap().len();
+
+        // The small local model routinely emits recoverable terms but a summary
+        // cut off mid-word, so strict parse fails on the first (and only) answer.
+        let partial = "Ecco l'aggiornamento del contesto.\n\
+            {\"new_glossary_terms\": [\
+              {\"source_term\":\"hobbit\",\"translation\":\"hobbit\",\"type\":\"nome proprio\",\"note\":\"\"}\
+            ], \"updated_summary\": \"Bilbo lascia la Contea per un'avvent";
+        let client = MockClient::new(vec![Ok(resp(partial, 10))]);
+
+        let p = params_small("Hello");
+        let adv = advance_context(&c, &client, &adv_from_with(&p, false)).unwrap();
+
+        assert_eq!(
+            client.calls(),
+            1,
+            "local caps the perceptor at ONE call: no correction retry"
+        );
+        assert!(!adv.advanced, "summary not advanced (strict parse failed, no retry)");
+        assert!(adv.perceptor_update_failed, "the failure stays observable to the UI");
+
+        // Marker left unset → a re-visit retries the advancement (ticket 01).
+        assert!(
+            !context_already_advanced(&c, p.document_id, p.page_number, p.target_language)
+                .unwrap(),
+            "context_advanced marker unset on a capped local failure → a re-visit retries"
+        );
+        // Glossary still grows: the recovered term is inserted despite no retry.
+        assert_eq!(
+            crate::glossary::list_glossary(&c, 1).unwrap().len(),
+            before + 1,
+            "the single local call still recovers and inserts the glossary term"
+        );
+    }
+
+    /// Ticket 02 (criterion b): the CLOUD provider
+    /// (`allow_correction_retry == true`) keeps today's behaviour — a first
+    /// non-strict-JSON perceptor answer triggers the single correction retry, so a
+    /// perceptor-update that fails twice costs exactly TWO model calls. This is the
+    /// contrast partner of the local one-call test above.
+    #[test]
+    fn cloud_perceptor_first_nonjson_pays_the_retry_two_calls() {
+        let c = conn();
+        seed_session(&c);
+        let client = MockClient::new(vec![
+            Ok(resp("not json", 10)),       // perceptor: strict parse fails
+            Ok(resp("still not json", 10)), // correction retry (cloud): still fails
+        ]);
+
+        let p = params("Hello");
+        let adv = advance_context(&c, &client, &adv_from_with(&p, true)).unwrap();
+
+        assert_eq!(
+            client.calls(),
+            2,
+            "cloud pays the correction retry (unchanged): two perceptor calls"
+        );
+        assert!(!adv.advanced, "summary not advanced after both answers fail");
+        assert!(adv.perceptor_update_failed, "the failure stays observable to the UI");
+    }
+
+    /// Ticket 02 edge case: capping the retry must NOT suppress a valid first
+    /// answer. On the LOCAL provider (`allow_correction_retry == false`), a
+    /// perceptor-update whose first (and only) answer already parses `Full`
+    /// advances the summary and sets the `context_advanced` marker in a single
+    /// call — the flag only removes the *retry*, never blocks a good answer.
+    /// Guards against a future reorder that moved the flag check above the
+    /// `Full`-parse branch.
+    #[test]
+    fn local_perceptor_valid_first_answer_advances_in_one_call() {
+        let c = conn();
+        seed_session(&c);
+        let before = crate::glossary::list_glossary(&c, 1).unwrap().len();
+        let p = params_small("Hello");
+
+        // View path first: writes the page-cache row with context_advanced=0 so
+        // the later advance can flip the marker on it (as a real arrival would).
+        let client_view = MockClient::new(vec![Ok(resp("Ciao mondo", 10))]);
+        translate_page(&c, &client_view, &p).unwrap();
+
+        // Context path on the LOCAL provider (retry capped) — first answer is valid.
+        let client = MockClient::new(vec![Ok(resp(
+            &content_with("ignored", "Riassunto pagina", &[("board", "consiglio")]),
+            10,
+        ))]);
+        let adv = advance_context(&c, &client, &adv_from_with(&p, false)).unwrap();
+
+        assert_eq!(client.calls(), 1, "a valid first answer never triggers a retry");
+        assert!(adv.advanced, "a valid first answer advances even with the retry capped");
+        assert_eq!(adv.updated_summary.as_deref(), Some("Riassunto pagina"));
+        assert!(!adv.perceptor_update_failed, "valid answer is not a failure");
+        assert!(
+            context_already_advanced(&c, p.document_id, p.page_number, p.target_language)
+                .unwrap(),
+            "the marker is set on a full success so a re-visit is a no-op (ticket 01)"
+        );
+        assert_eq!(
+            crate::glossary::list_glossary(&c, 1).unwrap().len(),
+            before + 1,
+            "the proposed term is inserted"
+        );
     }
 }

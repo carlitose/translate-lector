@@ -715,6 +715,13 @@ async fn advance_context(
             page_text: &page_text,
             model: &cfg.model,
             max_tokens: cfg.max_tokens,
+            // Ticket 02: cap the perceptor correction-retry to the LOCAL provider.
+            // Local (`is_local_url`) => no retry (max 1 LLM call per page): strict
+            // JSON fails routinely there and a second full-page call just doubles
+            // the cost, holding `LocalProviderSlot` and delaying the N+1 prefetch.
+            // Cloud keeps the retry (behaviour unchanged). Same local predicate the
+            // slot/`is_current` wiring already uses (`should_check_is_current`).
+            allow_correction_retry: !llm::is_local_url(&cfg.base_url),
         };
 
         // Serialize the local provider (L3/L4): the context-advance perceptor call
