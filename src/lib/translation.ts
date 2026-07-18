@@ -25,6 +25,29 @@ export interface TranslationResult {
   perceptor_update_failed?: boolean;
 }
 
+/**
+ * Shape returned by the `advance_context` core command (two-phase arrival,
+ * ticket 01). Phase 2 runs the once-per-page perceptor-update OFF the response
+ * path: `translate_page` delivers the text instantly, then the frontend calls
+ * `advance_context` to grow the summary/glossary. A re-visit of an already
+ * advanced page is a no-op (`advanced: false`, no failure).
+ */
+export interface AdvanceContextResult {
+  /** True when the rolling summary was advanced this call (full perceptor success). */
+  advanced: boolean;
+  /** Rolling summary after this page; `null` on a no-op/recovery/failure. */
+  updated_summary?: string | null;
+  /**
+   * True when the perceptor could not advance the context (unparseable JSON even
+   * after the correction retry, or a transport error). The translation is always
+   * delivered regardless; surfaced as the non-intrusive context note. Never true
+   * on a no-op (re-visit of a healthy page).
+   */
+  perceptor_update_failed?: boolean;
+  /** Sum of the perceptor call(s) tokens; `null` on a no-op or no usage. */
+  total_tokens?: number | null;
+}
+
 function errorText(err: unknown): string {
   return typeof err === 'string' ? err : String(err);
 }
@@ -133,7 +156,9 @@ export const CONTEXT_NOT_ADVANCED_HINT =
  * empty string otherwise (full success, cache hit, prefetch, or an older core
  * that does not send the flag).
  */
-export function contextNote(result: Partial<TranslationResult>): string {
+export function contextNote(
+  result: Partial<TranslationResult> | Partial<AdvanceContextResult>
+): string {
   return result.perceptor_update_failed ? CONTEXT_NOT_ADVANCED_HINT : '';
 }
 

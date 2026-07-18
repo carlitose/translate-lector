@@ -1,0 +1,125 @@
+diff --git a/src-tauri/src/translate.rs b/src-tauri/src/translate.rs
+index bf2128c..42e2bd4 100644
+--- a/src-tauri/src/translate.rs
++++ b/src-tauri/src/translate.rs
+@@ -3336,4 +3336,120 @@ fixed({fixed}) windows: a={} b={} stable={fixed_stable}",
+         assert!(out.from_cache, "served from the page-level cache");
+         assert_eq!(client2.calls(), 0, "page hit short-circuits before the unit loop");
+     }
++
++    // --- REPRO 2026-07-18: "la pagina N+1 non è più pronta all'arrivo" ------
++
++    /// A `ChatClient` that delegates to a MockClient but sleeps `delay` on every
++    /// call, so a test can measure how much model-call latency sits on the
++    /// blocking path of `translate_page` (what the user waits for on arrival).
++    struct SlowClient {
++        inner: MockClient,
++        delay: std::time::Duration,
++    }
++
++    impl ChatClient for SlowClient {
++        fn complete(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
++            std::thread::sleep(self.delay);
++            self.inner.complete(req)
++        }
++    }
++
++    /// SINTOMO UTENTE (2026-07-18): arrivando su una pagina già interamente
++    /// prefetchata, la traduzione deve essere PRONTA — nessuna chiamata al
++    /// modello sul percorso bloccante prima che `translate_page` ritorni il
++    /// testo. Con l'opzione B (2e81d42) questo test FALLISCE: la navigazione
++    /// reale è un MISS di pagina e il perceptor-update gira in modo SINCRONO
++    /// prima del return, quindi l'utente aspetta una chiamata full-page al
++    /// modello locale anche se ogni unità era già in cache.
++    #[test]
++    fn arrival_on_fully_prefetched_page_returns_without_blocking_model_calls() {
++        let c = conn();
++        seed_session(&c);
++
++        // Prefetch of page 4 (update_context=false): warms the unit cache.
++        let client_pf = MockClient::new(vec![Ok(resp("Ciao mondo", 100))]);
++        let prefetch = TranslateParams {
++            document_id: 1,
++            page_number: 4,
++            target_language: "it",
++            page_text: "Hello world.",
++            model: "local-model",
++            max_tokens: 2048,
++            n_ctx: 4096,
++            update_context: false,
++            is_current: None,
++        };
++        translate_page(&c, &client_pf, &prefetch).unwrap();
++        assert_eq!(unit_rows(&c), 1, "prefetch warmed the unit cache");
++        assert_eq!(page_rows(&c), 0, "option B: no page row from prefetch");
++
++        // Real navigation to page 4: the translation is fully cached per-unit.
++        // The user's requirement: it must be READY -> zero blocking model calls.
++        let client_nav = MockClient::new(vec![Ok(resp(
++            &content_with("ignorato", "Riassunto avanzato", &[("hello", "ciao")]),
++            200,
++        ))]);
++        let nav = TranslateParams { update_context: true, ..prefetch };
++        let out = translate_page(&c, &client_nav, &nav).unwrap();
++        assert_eq!(out.translated_text, "Ciao mondo");
++        assert_eq!(
++            client_nav.calls(),
++            0,
++            "REPRO: arrival on a prefetched page must not block on any model call \
++             before returning the translation (found {} blocking call/s: the \
++             perceptor-update sits on the navigation critical path)",
++            client_nav.calls()
++        );
++    }
++
++    /// Quantifica la latenza percepita: con un modello che impiega `delay` per
++    /// chiamata, l'arrivo su una pagina interamente prefetchata impiega >= 1x
++    /// `delay` (percettore) e, quando il modello locale NON emette JSON
++    /// conforme (caso documentato come routine su STC-10), >= 2x `delay`
++    /// (percettore + retry di correzione): equivalente a ri-tradurre la pagina.
++    #[test]
++    fn arrival_latency_on_prefetched_page_equals_one_or_two_full_model_calls() {
++        let c = conn();
++        seed_session(&c);
++
++        let client_pf = MockClient::new(vec![Ok(resp("Ciao mondo", 100))]);
++        let prefetch = TranslateParams {
++            document_id: 1,
++            page_number: 4,
++            target_language: "it",
++            page_text: "Hello world.",
++            model: "local-model",
++            max_tokens: 2048,
++            n_ctx: 4096,
++            update_context: false,
++            is_current: None,
++        };
++        translate_page(&c, &client_pf, &prefetch).unwrap();
++
++        // Local model answers with NON-conformant JSON twice (perceptor + the
++        // correction retry), the routine failure mode documented in ticket 02.
++        let delay = std::time::Duration::from_millis(150);
++        let slow = SlowClient {
++            inner: MockClient::new(vec![
++                Ok(resp("chiacchiere senza JSON", 10)),
++                Ok(resp("ancora niente JSON", 10)),
++            ]),
++            delay,
++        };
++        let nav = TranslateParams { update_context: true, ..prefetch };
++        let t0 = std::time::Instant::now();
++        let out = translate_page(&c, &slow, &nav).unwrap();
++        let elapsed = t0.elapsed();
++
++        assert_eq!(out.translated_text, "Ciao mondo", "text was fully cached");
++        assert_eq!(slow.inner.calls(), 2, "perceptor + correction retry, both blocking");
++        assert!(
++            elapsed < delay,
++            "REPRO latenza: la navigazione su pagina prefetchata è durata {:?} \
++             (>= 2x la latenza di una chiamata modello, {:?}) pur avendo TUTTE le \
++             unità in cache: il prefetch non rende più 'pronta' la pagina N+1",
++            elapsed,
++            delay
++        );
++    }
+ }

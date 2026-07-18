@@ -228,6 +228,43 @@ pub struct TranslationResult {
     pub perceptor_update_failed: bool,
 }
 
+/// Inputs for the context-advance phase (ticket 01, two-phase arrival). A small
+/// mirror of [`TranslateParams`] carrying only what the once-per-page
+/// perceptor-update needs: no `n_ctx` / `update_context` / `is_current` — the
+/// perceptor is always a single real call, serialized by the caller and gated by
+/// the `context_advanced` marker, never a prefetch and never mid-loop cancellable.
+pub struct AdvanceContextParams<'a> {
+    pub document_id: i64,
+    pub page_number: i64,
+    pub target_language: &'a str,
+    pub page_text: &'a str,
+    pub model: &'a str,
+    /// Upper bound on generated tokens for the perceptor call (as `max_tokens` in
+    /// [`TranslateParams`]).
+    pub max_tokens: u32,
+}
+
+/// Result of [`advance_context`] (ticket 01, two-phase arrival), exposed to the
+/// frontend so it can surface the context-advanced summary and the
+/// perceptor-failure note after the translation has already been rendered.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct AdvanceContextResult {
+    /// True when the rolling summary was advanced this call (a FULL perceptor
+    /// success). False on a no-op (context already advanced), a tolerant recovery
+    /// (terms only), or a failure.
+    pub advanced: bool,
+    /// The rolling summary after this page; `Some` only when `advanced`.
+    pub updated_summary: Option<String>,
+    /// True when the perceptor-update could NOT advance the context (strict parse
+    /// failed even after the correction retry, or the call errored) — STC-10
+    /// observability, surfaced to the UI. Never true on a no-op (already
+    /// advanced): re-visits of a healthy page report no failure.
+    pub perceptor_update_failed: bool,
+    /// Sum of `usage.total_tokens` for the perceptor call(s); `None` on a no-op or
+    /// when the provider reported no usage.
+    pub total_tokens: Option<i64>,
+}
+
 // --- Split a unità (STC-02, cablato nel flusso da STC-08) --------------------
 //
 // Divide una pagina in unità di traduzione a livello di paragrafo entro un budget
@@ -462,6 +499,12 @@ fn cache_lookup(
 /// key so a corrected translation OVERWRITES a previously poisoned row (ticket
 /// 16 self-heal): a stale write that captured the wrong source_text is replaced
 /// as soon as the page is re-translated from its real text.
+///
+/// Two-phase arrival (ticket 01): this is the VIEW-path write, so the row is
+/// always written with `context_advanced = 0` — the context has not been advanced
+/// yet (the perceptor now runs later, in [`advance_context`]). The UPSERT resets
+/// the marker to 0 too, so a re-translation from new/corrected text (ticket 16
+/// heal) makes [`advance_context`] run again for the new text.
 fn cache_insert(
     conn: &Connection,
     p: &TranslateParams,
@@ -469,12 +512,13 @@ fn cache_insert(
 ) -> Result<(), LlmError> {
     conn.execute(
         "INSERT INTO translations_cache
-             (document_id, page_number, target_language, source_text, translated_text, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+             (document_id, page_number, target_language, source_text, translated_text, created_at, context_advanced)
+         VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%SZ','now'), 0)
          ON CONFLICT(document_id, page_number, target_language) DO UPDATE SET
-             source_text     = excluded.source_text,
-             translated_text = excluded.translated_text,
-             created_at      = excluded.created_at",
+             source_text      = excluded.source_text,
+             translated_text  = excluded.translated_text,
+             created_at       = excluded.created_at,
+             context_advanced = 0",
         params![
             p.document_id,
             p.page_number,
@@ -482,6 +526,52 @@ fn cache_insert(
             p.page_text,
             translated_text
         ],
+    )
+    .map_err(|e| LlmError::Storage(e.to_string()))?;
+    Ok(())
+}
+
+/// Whether the document context (rolling summary + glossary) has already been
+/// advanced for this page — the exactly-once guard of the two-phase arrival
+/// (ticket 01). Reads the `context_advanced` marker on the page-cache row: `true`
+/// only when the row exists AND the marker is 1 (a full perceptor success flipped
+/// it). A missing row (no page cached yet) or a 0 marker (view-path write, or a
+/// prior perceptor failure/recovery) both mean "not advanced" → the perceptor
+/// should run.
+fn context_already_advanced(
+    conn: &Connection,
+    document_id: i64,
+    page_number: i64,
+    target_language: &str,
+) -> Result<bool, LlmError> {
+    let flag: Option<i64> = conn
+        .query_row(
+            "SELECT context_advanced FROM translations_cache
+              WHERE document_id = ?1 AND page_number = ?2 AND target_language = ?3",
+            params![document_id, page_number, target_language],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| LlmError::Storage(e.to_string()))?;
+    Ok(matches!(flag, Some(1)))
+}
+
+/// Flip the `context_advanced` marker to 1 for a page — called by
+/// [`advance_context`] ONLY on a FULL perceptor success, so the perceptor runs
+/// exactly once per page and a re-visit is a no-op. A failure/recovery leaves the
+/// marker at 0 so a later re-visit retries. No-op UPDATE (0 rows) when the page
+/// row is absent, which cannot happen on the normal flow (the view-path write
+/// precedes advance).
+fn mark_context_advanced(
+    conn: &Connection,
+    document_id: i64,
+    page_number: i64,
+    target_language: &str,
+) -> Result<(), LlmError> {
+    conn.execute(
+        "UPDATE translations_cache SET context_advanced = 1
+          WHERE document_id = ?1 AND page_number = ?2 AND target_language = ?3",
+        params![document_id, page_number, target_language],
     )
     .map_err(|e| LlmError::Storage(e.to_string()))?;
     Ok(())
@@ -780,9 +870,11 @@ pub fn translate_page(
     }
 
     // Load the percettore context ONCE for the whole page (D6: the same summary
-    // version is passed read-only to every unit; it is advanced afterwards, once).
-    let summary_limit = settings::get_summary_token_limit(conn).map_err(storage)?;
-    let mut rolling_summary = documents::get_rolling_summary(conn, p.document_id).map_err(storage)?;
+    // version is passed read-only to every unit). Two-phase arrival (ticket 01):
+    // the summary is NO LONGER advanced here — the perceptor-update runs later in
+    // [`advance_context`], off the response path — so this snapshot is purely
+    // read-only input for the unit prompts.
+    let rolling_summary = documents::get_rolling_summary(conn, p.document_id).map_err(storage)?;
     let entries = glossary::list_glossary(conn, p.document_id).map_err(storage)?;
     // The full locked block is estimated below only to SIZE the unit budget; no
     // call ever ships the whole glossary. Both the per-unit translate calls
@@ -984,127 +1076,27 @@ pub fn translate_page(
     // unit, so `concat` reproduces the page structure).
     let translated_text = translated_units.concat();
 
-    // --- Perceptor-update: ONCE per page, real navigation only (D5/D6/D10) ----
-    // Lean contract (STC-10): ask ONLY for the updated summary + new glossary
-    // terms — the model does NOT re-translate the page (that already came from the
-    // units), so the output stays small and budget-safe (this was the last big
-    // call that blew past a small window → EC08). Input is compact too: only the
-    // glossary SELECTED for the whole page (union of per-unit relevance), never
-    // the entire glossary. Skipped entirely on prefetch (ticket 12), as before.
+    // --- Fase 1 (view path), two-phase arrival (ticket 01) -------------------
+    // Il perceptor-update NON gira più qui: è stato spostato in [`advance_context`]
+    // (fase 2), FUORI dal percorso di risposta. Così l'arrivo su una pagina
+    // interamente prefetchata ritorna il testo assemblato dalla cache per-unità
+    // (0 chiamate LLM sincrone) senza attendere il percettore.
     //
-    // Resilienza (STC-10, fix chiave lato utente): un fallimento del
-    // perceptor-update NON deve scartare la traduzione già prodotta. La chiamata è
-    // avvolta in un `match` (niente `?` che aborta): su errore si logga in modo
-    // soft, il summary/glossario NON avanza, ma la pagina viene comunque cachata e
-    // restituita (coerente con la cache per-unità di STC-09).
-    let mut new_terms: Vec<GlossaryTerm> = Vec::new();
-    let mut summary_advanced = false;
-    // STC-10 observability (ticket 02): true when the context could NOT be
-    // advanced for this page (strict parse failed or the call errored), even if
-    // glossary terms were tolerantly recovered. Surfaced to the UI.
-    let mut perceptor_update_failed = false;
-    if p.update_context {
-        // Compact glossary for the perceptor prompt: only the terms relevant to
-        // the page (locked-first, STC-03), never the whole glossary.
-        let page_selected =
-            glossary::select_glossary(p.page_text, &entries, Some(UNLOCKED_GLOSSARY_CAP));
-        let (locked_sel, unlocked_sel) = glossary::render_locked_unlocked(&page_selected);
-
-        let compress = needs_compression(&rolling_summary, summary_limit);
-        let messages = build_perceptor_update_messages(
-            p.target_language,
-            p.page_text,
-            &rolling_summary,
-            &locked_sel,
-            &unlocked_sel,
-            compress,
-            summary_limit,
-        );
-        let perceptor_prompt_chars: usize =
-            messages.iter().map(|m| m.content.chars().count()).sum();
-
-        let req = build_perceptor_update_request(p.model, messages, p.max_tokens);
-        match complete_and_parse_perceptor_update(client, req) {
-            Ok(PerceptorUpdateResult::Full { output, usage }) => {
-                // Only advance the summary when the perceptor actually succeeded.
-                rolling_summary = output.updated_summary;
-                new_terms = output.new_glossary_terms;
-                summary_advanced = true;
-                prompt_chars_sum += perceptor_prompt_chars;
-                if let Some(u) = usage {
-                    saw_usage = true;
-                    total_tokens_sum += u.total_tokens;
-                    prompt_tokens_sum += u.prompt_tokens;
-                }
-            }
-            Ok(PerceptorUpdateResult::Recovered { terms, usage }) => {
-                // Partial: strict JSON unparseable, so the summary does NOT
-                // advance — but glossary terms were tolerantly recovered and are
-                // inserted anyway (decoupled from `summary_advanced`, ticket 02).
-                // Still a failure for the UI signal (context not fully advanced).
-                new_terms = terms;
-                perceptor_update_failed = true;
-                if let Some(u) = usage {
-                    saw_usage = true;
-                    total_tokens_sum += u.total_tokens;
-                    prompt_tokens_sum += u.prompt_tokens;
-                }
-                eprintln!(
-                    "[perceptor] update parziale document_id={} page={} lang={}: summary NON avanzato, {} termini recuperati",
-                    p.document_id,
-                    p.page_number,
-                    p.target_language,
-                    new_terms.len()
-                );
-            }
-            Err(e) => {
-                // Fallimento soft: la traduzione della pagina resta valida e viene
-                // cachata sotto; il contesto (summary + glossario) semplicemente
-                // non avanza per questa pagina. Il fallimento è ora osservabile
-                // dall'utente via `perceptor_update_failed` (ticket 02), non solo
-                // questo log.
-                perceptor_update_failed = true;
-                eprintln!(
-                    "[perceptor] update fallito document_id={} page={} lang={}: {}",
-                    p.document_id,
-                    p.page_number,
-                    p.target_language,
-                    e.user_message()
-                );
-            }
-        }
-    }
-
-    // Persist (ticket 01, opzione B). La cache di PAGINA si scrive SOLO su
-    // navigazione reale (`update_context`), non sul prefetch: un prefetch scalda
-    // esclusivamente la cache per-unità (STC-09). Così alla navigazione reale la
-    // pagina è un MISS di pagina, la pipeline prosegue fino al percettore (il
-    // glossario cresce) e le unità sono servite dalla cache per-unità (nessuna
-    // ri-traduzione, latenza invariata). Sulla navigazione reale la riga di
-    // pagina viene scritta ANCHE quando il perceptor-update è fallito: la
-    // traduzione riuscita non va mai persa (STC-10). Il contesto percettore
-    // (summary + glossario) avanza SOLO se il perceptor-update è riuscito; un
-    // prefetch non deve mutare il contesto fuori ordine (ticket 12).
+    // Persistenza (ticket 01, opzione B + marker): la cache di PAGINA si scrive
+    // SOLO su navigazione reale (`update_context`), mai sul prefetch (che scalda
+    // solo la cache per-unità, STC-09). La riga è scritta con `context_advanced =
+    // 0` (via `cache_insert`): la fase 2 la porterà a 1 SOLO su successo pieno del
+    // percettore, così il percettore gira esattamente una volta per pagina e una
+    // rivisita è un page-hit istantaneo (mentre un fallimento lascia 0 e la
+    // rivisita ritenta). La traduzione riuscita non va mai persa (STC-10): la riga
+    // di pagina è scritta anche se la fase 2 fallirà più tardi.
     if p.update_context {
         cache_insert(conn, p, &translated_text)?;
-        // The summary advances ONLY on a full perceptor success.
-        if summary_advanced {
-            documents::set_rolling_summary(conn, p.document_id, &rolling_summary).map_err(storage)?;
-        }
-        // Glossary insertion is DECOUPLED from the summary (ticket 02, criterion
-        // b): terms come from a full success OR from tolerant recovery on a
-        // partial failure, so the glossary can grow even when the summary could
-        // not advance. `insert_terms_deduped` leaves locked terms untouched and
-        // dedups against existing rows, so this is safe either way. A no-op when
-        // `new_terms` is empty.
-        if !new_terms.is_empty() {
-            glossary::insert_terms_deduped(conn, p.document_id, &new_terms, p.page_number)
-                .map_err(storage)?;
-        }
 
         // Calibrate the chars/token ratio from real usage (research §3) — stored
         // for cost telemetry; the budget/`needs_compression` keep the stable
-        // default ratio.
+        // default ratio. Derived from the unit calls only now (the perceptor call
+        // moved to `advance_context`).
         if let Some(ratio) = calibrate_chars_per_token(prompt_chars_sum, prompt_tokens_sum) {
             let _ =
                 settings::set_setting(conn, settings::CHARS_PER_TOKEN_KEY, &format!("{ratio:.4}"));
@@ -1129,18 +1121,145 @@ pub fn translate_page(
         translated_text,
         from_cache: false,
         total_tokens,
-        // Only report the advanced summary when it was actually persisted; a
-        // prefetch reports `None` because it did not touch the context, and a
-        // failed perceptor-update reports `None` too (context not advanced, STC-10).
-        updated_summary: if p.update_context && summary_advanced {
-            Some(rolling_summary)
-        } else {
-            None
-        },
-        // Only meaningful on real navigation (the percettore runs); a prefetch or
-        // cache hit never sets it. True when the summary could not be advanced
-        // (STC-10 observability, ticket 02).
+        // Two-phase arrival (ticket 01): the perceptor-update runs in
+        // [`advance_context`], so the view path never advances the summary nor
+        // reports a perceptor failure. Both are surfaced by `advance_context`.
+        updated_summary: None,
+        perceptor_update_failed: false,
+    })
+}
+
+/// Phase 2 of two-phase arrival (ticket 01): advance the document context
+/// (rolling summary + glossary) for a page whose translation was already
+/// delivered by [`translate_page`]. Runs the once-per-page **lean
+/// perceptor-update** (STC-10, D5/D6) OUTSIDE the response path, so a warm arrival
+/// on a prefetched page is instant while the glossary still grows page by page.
+///
+/// Idempotency & exactly-once are driven by the `context_advanced` marker on the
+/// page-cache row (written 0 by the view-path page write): the perceptor runs
+/// EXACTLY ONCE per page (first real navigation) and this is a no-op on a re-visit
+/// of an already-advanced page. On a **Full** success it advances the summary,
+/// inserts the deduped glossary terms and flips the marker to 1. On a **Recovered**
+/// (tolerant terms, summary unparseable) it inserts the recovered terms but LEAVES
+/// the marker at 0 — the summary did not advance, so a later re-visit retries. A
+/// transport **Err** changes nothing and leaves the marker at 0. Both failure
+/// modes set `perceptor_update_failed` for the UI (STC-10 observability), and
+/// neither ever loses the already-delivered translation.
+///
+/// The caller must serialize this behind the local-provider slot (like
+/// `translate_page`) so context advances in cursor order; the summary/glossary
+/// snapshot is re-loaded here (not carried from phase 1) so a page superseded by a
+/// faster reader still advances correctly in order.
+pub fn advance_context(
+    conn: &Connection,
+    client: &dyn ChatClient,
+    p: &AdvanceContextParams,
+) -> Result<AdvanceContextResult, LlmError> {
+    // Exactly-once guard: skip if the context is already advanced for this page
+    // (marker == 1). A missing row or a 0 marker means "needs advance".
+    if context_already_advanced(conn, p.document_id, p.page_number, p.target_language)? {
+        return Ok(AdvanceContextResult {
+            advanced: false,
+            updated_summary: None,
+            perceptor_update_failed: false,
+            total_tokens: None,
+        });
+    }
+
+    // Load the perceptor context fresh (read-only snapshot): the same summary +
+    // glossary the pipeline uses, so a serialized advance sees prior pages' effects.
+    let summary_limit = settings::get_summary_token_limit(conn).map_err(storage)?;
+    let rolling_summary = documents::get_rolling_summary(conn, p.document_id).map_err(storage)?;
+    let entries = glossary::list_glossary(conn, p.document_id).map_err(storage)?;
+
+    // Lean contract (STC-10): ask ONLY for the updated summary + new glossary
+    // terms — no re-translation (that came from the units), so the output stays
+    // small and budget-safe. Input is compact too: only the glossary SELECTED for
+    // the whole page (locked-first, STC-03), never the entire glossary.
+    let page_selected =
+        glossary::select_glossary(p.page_text, &entries, Some(UNLOCKED_GLOSSARY_CAP));
+    let (locked_sel, unlocked_sel) = glossary::render_locked_unlocked(&page_selected);
+
+    let compress = needs_compression(&rolling_summary, summary_limit);
+    let messages = build_perceptor_update_messages(
+        p.target_language,
+        p.page_text,
+        &rolling_summary,
+        &locked_sel,
+        &unlocked_sel,
+        compress,
+        summary_limit,
+    );
+    let req = build_perceptor_update_request(p.model, messages, p.max_tokens);
+
+    // Resilienza (STC-10): un fallimento NON deve propagare un errore (la
+    // traduzione è già stata consegnata). Il `match` isola gli esiti.
+    let mut new_terms: Vec<GlossaryTerm> = Vec::new();
+    let mut advanced_summary: Option<String> = None;
+    let mut perceptor_update_failed = false;
+    let mut total_tokens_sum: i64 = 0;
+    let mut saw_usage = false;
+
+    match complete_and_parse_perceptor_update(client, req) {
+        Ok(PerceptorUpdateResult::Full { output, usage }) => {
+            advanced_summary = Some(output.updated_summary);
+            new_terms = output.new_glossary_terms;
+            if let Some(u) = usage {
+                saw_usage = true;
+                total_tokens_sum += u.total_tokens;
+            }
+        }
+        Ok(PerceptorUpdateResult::Recovered { terms, usage }) => {
+            // Partial: summary unparseable → NOT advanced (marker stays 0, a
+            // re-visit retries), but recovered terms are inserted (decoupled from
+            // the summary, ticket 02). Still a failure for the UI signal.
+            new_terms = terms;
+            perceptor_update_failed = true;
+            if let Some(u) = usage {
+                saw_usage = true;
+                total_tokens_sum += u.total_tokens;
+            }
+            eprintln!(
+                "[perceptor] update parziale document_id={} page={} lang={}: summary NON avanzato, {} termini recuperati",
+                p.document_id,
+                p.page_number,
+                p.target_language,
+                new_terms.len()
+            );
+        }
+        Err(e) => {
+            perceptor_update_failed = true;
+            eprintln!(
+                "[perceptor] update fallito document_id={} page={} lang={}: {}",
+                p.document_id,
+                p.page_number,
+                p.target_language,
+                e.user_message()
+            );
+        }
+    }
+
+    // Persist: advance the summary ONLY on a full success; insert recovered terms
+    // regardless (deduped, locked untouched — a no-op when empty). Flip the marker
+    // to 1 ONLY on a full success, so a failure/recovery leaves it 0 and a later
+    // re-visit retries the advancement.
+    if let Some(summary) = &advanced_summary {
+        documents::set_rolling_summary(conn, p.document_id, summary).map_err(storage)?;
+    }
+    if !new_terms.is_empty() {
+        glossary::insert_terms_deduped(conn, p.document_id, &new_terms, p.page_number)
+            .map_err(storage)?;
+    }
+    if advanced_summary.is_some() {
+        mark_context_advanced(conn, p.document_id, p.page_number, p.target_language)?;
+    }
+
+    let total_tokens = if saw_usage { Some(total_tokens_sum) } else { None };
+    Ok(AdvanceContextResult {
+        advanced: advanced_summary.is_some(),
+        updated_summary: advanced_summary,
         perceptor_update_failed,
+        total_tokens,
     })
 }
 
@@ -1289,6 +1408,51 @@ mod tests {
         }
     }
 
+    /// Derive phase-2 params from a real-navigation [`TranslateParams`], so a test
+    /// can run `advance_context` on the same page the view path translated.
+    fn adv_from<'a>(p: &TranslateParams<'a>) -> AdvanceContextParams<'a> {
+        AdvanceContextParams {
+            document_id: p.document_id,
+            page_number: p.page_number,
+            target_language: p.target_language,
+            page_text: p.page_text,
+            model: p.model,
+            max_tokens: p.max_tokens,
+        }
+    }
+
+    /// Two-phase real navigation for tests (ticket 01): run the view path
+    /// (`translate_page`) then, on real navigation, the context path
+    /// (`advance_context`) with the SAME client — so a canned queue `[units...,
+    /// perceptor...]` is consumed in order across both phases. Folds the two
+    /// results into a single `TranslationResult`-shaped view (text/from_cache from
+    /// phase 1; updated_summary/perceptor_update_failed from phase 2; total_tokens
+    /// summed), so pre-two-phase behavioural tests read essentially unchanged. A
+    /// prefetch (`update_context == false`) never advances and returns phase 1
+    /// verbatim. Mirrors what the frontend does: render, then advance the context.
+    fn navigate(
+        c: &Connection,
+        client: &dyn ChatClient,
+        p: &TranslateParams,
+    ) -> Result<TranslationResult, LlmError> {
+        let view = translate_page(c, client, p)?;
+        if !p.update_context {
+            return Ok(view);
+        }
+        let adv = advance_context(c, client, &adv_from(p))?;
+        let total_tokens = match (view.total_tokens, adv.total_tokens) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+        };
+        Ok(TranslationResult {
+            translated_text: view.translated_text,
+            from_cache: view.from_cache,
+            total_tokens,
+            updated_summary: adv.updated_summary,
+            perceptor_update_failed: adv.perceptor_update_failed,
+        })
+    }
+
     /// Un paragrafo "grande" (~340 token) con una frase-guida in testa. Col
     /// packing cablato (ticket 04) due paragrafi piccoli collasserebbero in UNA
     /// finestra da [`PACK_TARGET_TOKENS`]: due paragrafi così superano insieme
@@ -1371,7 +1535,7 @@ mod tests {
             update_context: true,
             is_current: None,
         };
-        translate_page(&c, &client, &p).unwrap();
+        navigate(&c, &client, &p).unwrap();
         let sent = client.requests.borrow();
         // Single unit (degrade) keeps the page max_tokens; the perceptor call
         // always uses the page max_tokens.
@@ -1421,7 +1585,7 @@ mod tests {
             Ok(resp(&valid_content(), 400)),   // perceptor-update
         ]);
         // Request page 3 with its REAL text — source_text differs from the row.
-        let out = translate_page(&c, &client, &params("Hello")).unwrap();
+        let out = navigate(&c, &client, &params("Hello")).unwrap();
 
         assert!(!out.from_cache, "mismatched source_text must be a miss");
         assert_eq!(out.translated_text, "Ciao mondo", "re-translated, not the poisoned value");
@@ -1482,7 +1646,7 @@ mod tests {
             is_current: None,
         };
 
-        let out = translate_page(&c, &client, &p).unwrap();
+        let out = navigate(&c, &client, &p).unwrap();
 
         assert_ne!(out.translated_text, "Ignoranza", "must NOT serve the page-9 translation");
         assert_eq!(out.translated_text, "Traduzione pagina 10");
@@ -1490,7 +1654,7 @@ mod tests {
         assert_eq!(client.calls(), 2, "the page is re-translated (unit + perceptor)");
 
         // A subsequent visit with the SAME correct text is now a legitimate hit.
-        let out2 = translate_page(&c, &client, &p).unwrap();
+        let out2 = navigate(&c, &client, &p).unwrap();
         assert!(out2.from_cache, "healed row is served on the next matching visit");
         assert_eq!(out2.translated_text, "Traduzione pagina 10");
         assert_eq!(client.calls(), 2, "no extra model call once healed");
@@ -1506,7 +1670,7 @@ mod tests {
             Ok(resp(&valid_content(), 801)), // perceptor-update
         ]);
 
-        let out = translate_page(&c, &client, &params("Hello")).unwrap();
+        let out = navigate(&c, &client, &params("Hello")).unwrap();
 
         assert_eq!(out.translated_text, "Ciao mondo");
         assert!(!out.from_cache);
@@ -1534,10 +1698,10 @@ mod tests {
             Ok(resp(&valid_content(), 250)), // perceptor-update
         ]);
 
-        let first = translate_page(&c, &client, &params("Hello")).unwrap();
+        let first = navigate(&c, &client, &params("Hello")).unwrap();
         assert!(!first.from_cache);
 
-        let second = translate_page(&c, &client, &params("Hello")).unwrap();
+        let second = navigate(&c, &client, &params("Hello")).unwrap();
         assert!(second.from_cache);
         assert_eq!(second.translated_text, "Ciao mondo");
         assert_eq!(client.calls(), 2, "no extra model calls for a cached page");
@@ -1558,7 +1722,7 @@ mod tests {
             Ok(resp(&format!("```json\n{}\n```", valid_content()), 120)), // perceptor correction
         ]);
 
-        let out = translate_page(&c, &client, &params("Hello")).unwrap();
+        let out = navigate(&c, &client, &params("Hello")).unwrap();
         assert_eq!(out.translated_text, "Ciao mondo", "translation from the unit call");
         assert_eq!(out.updated_summary.as_deref(), Some("riassunto"), "summary from the corrected perceptor");
         assert_eq!(client.calls(), 3, "unit + perceptor malformed + one correction retry");
@@ -1582,7 +1746,7 @@ mod tests {
             Ok(resp("still not json", 10)), // perceptor correction still malformed
         ]);
 
-        let out = translate_page(&c, &client, &params("Hello")).unwrap();
+        let out = navigate(&c, &client, &params("Hello")).unwrap();
         assert_eq!(out.translated_text, "Ciao mondo", "translation from the unit is returned");
         assert_eq!(out.updated_summary, None, "summary not advanced on perceptor failure");
         assert_eq!(client.calls(), 3, "unit + perceptor + one correction retry");
@@ -1639,7 +1803,7 @@ mod tests {
             Ok(resp(partial, 20)),      // perceptor correction: still strict-fails
         ]);
 
-        let out = translate_page(&c, &client, &params("Hello")).unwrap();
+        let out = navigate(&c, &client, &params("Hello")).unwrap();
 
         // Translation is preserved and cached (STC-10 invariant).
         assert_eq!(out.translated_text, "Ciao mondo");
@@ -1691,7 +1855,7 @@ mod tests {
             Err(LlmError::Http("500 boom".into())),        // perceptor transport error
         ]);
 
-        let out = translate_page(&c, &client, &params("Hello")).unwrap();
+        let out = navigate(&c, &client, &params("Hello")).unwrap();
         assert_eq!(out.translated_text, "Ciao mondo", "translation preserved");
         assert!(out.perceptor_update_failed, "transport failure surfaced to the UI");
         assert_eq!(out.updated_summary, None, "summary not advanced");
@@ -1724,7 +1888,7 @@ mod tests {
             Ok(resp("Ciao mondo", 100)),     // unit
             Ok(resp(&valid_content(), 100)), // perceptor OK
         ]);
-        let out = translate_page(&c, &client, &params("Hello")).unwrap();
+        let out = navigate(&c, &client, &params("Hello")).unwrap();
         assert!(!out.perceptor_update_failed, "success is not a failure");
         assert_eq!(out.updated_summary.as_deref(), Some("riassunto"));
     }
@@ -1748,7 +1912,7 @@ mod tests {
             Ok(resp(&valid_content(), 321)), // perceptor downgraded retry succeeds
         ]);
 
-        let out = translate_page(&c, &client, &params("Hello")).unwrap();
+        let out = navigate(&c, &client, &params("Hello")).unwrap();
         assert_eq!(out.translated_text, "Ciao mondo", "translation from the unit call");
         assert_eq!(out.updated_summary.as_deref(), Some("riassunto"));
         assert_eq!(client.calls(), 3, "unit + perceptor 404 + downgraded perceptor retry");
@@ -1800,7 +1964,7 @@ mod tests {
             Ok(resp(&content_with("ignored", "s", &[]), 10)),
         ]);
 
-        let out = translate_page(&c, &client, &params_small(&page)).unwrap();
+        let out = navigate(&c, &client, &params_small(&page)).unwrap();
 
         assert_eq!(client.calls(), 4, "unit1: 2 calls; unit2: 1 call; perceptor: 1 call");
         assert!(out.translated_text.contains("PART0") && out.translated_text.contains("PART1"));
@@ -1831,7 +1995,7 @@ mod tests {
             Ok(resp(&valid_content(), 55)),                         // degraded correction valid
         ]);
 
-        let out = translate_page(&c, &client, &params("Hello")).unwrap();
+        let out = navigate(&c, &client, &params("Hello")).unwrap();
 
         assert_eq!(out.translated_text, "Ciao mondo");
         assert_eq!(out.updated_summary.as_deref(), Some("riassunto"));
@@ -1886,7 +2050,7 @@ mod tests {
             Ok(resp("Il consiglio si e riunito.", 100)), // translate-only unit
             Ok(resp(&valid_content(), 100)),             // perceptor-update
         ]);
-        translate_page(&c, &client, &params("The board met.")).unwrap();
+        navigate(&c, &client, &params("The board met.")).unwrap();
 
         // The unit's translate-only prompt carries the read-only summary and the
         // locked term SELECTED for the unit (STC-03), rendered as an absolute
@@ -1908,7 +2072,7 @@ mod tests {
             Ok(resp(&content_with("ignored", "Nuovo riassunto pag. 3.", &[]), 200)), // perceptor
         ]);
 
-        let out = translate_page(&c, &client, &params("Hello")).unwrap();
+        let out = navigate(&c, &client, &params("Hello")).unwrap();
         assert_eq!(out.updated_summary.as_deref(), Some("Nuovo riassunto pag. 3."));
 
         // Reloads from the DB (persist + reload).
@@ -1940,7 +2104,7 @@ mod tests {
                 100,
             )), // perceptor proposes terms
         ]);
-        translate_page(&c, &client, &params("x")).unwrap();
+        navigate(&c, &client, &params("x")).unwrap();
 
         let entries = crate::glossary::list_glossary(&c, 1).unwrap();
         assert_eq!(entries.len(), 2, "board deduped, CEO added");
@@ -1973,7 +2137,7 @@ mod tests {
             Ok(resp(&content_with("ignored", short, &[]), 500)), // perceptor recompresses
         ]);
 
-        let out = translate_page(&c, &client, &params("Hello")).unwrap();
+        let out = navigate(&c, &client, &params("Hello")).unwrap();
 
         // Recompression is requested on the PERCEPTOR prompt (the summary is
         // owned by the once-per-page perceptor call, D6), not the unit prompt.
@@ -1997,7 +2161,7 @@ mod tests {
             Ok(resp("Tradotto", 100)),       // translate-only unit
             Ok(resp(&valid_content(), 100)), // perceptor-update
         ]);
-        translate_page(&c, &client, &params("Hello")).unwrap();
+        navigate(&c, &client, &params("Hello")).unwrap();
 
         assert!(
             !client.user_prompt(1).contains(crate::llm::COMPRESSION_INSTRUCTION),
@@ -2045,7 +2209,7 @@ mod tests {
         responses.push(Ok(resp(&content_with("ignored", "riassunto finale", &[]), 7)));
         let client = MockClient::new(responses);
 
-        let out = translate_page(&c, &client, &params_small(&page)).unwrap();
+        let out = navigate(&c, &client, &params_small(&page)).unwrap();
 
         assert_eq!(client.calls(), n + 1, "one call per packed window + one perceptor call");
         for i in 0..n {
@@ -2088,7 +2252,7 @@ mod tests {
             Ok(resp(&content_with("ignored", "s", &[]), 5)), // perceptor
         ]);
         let page = two_paragraphs();
-        translate_page(&c, &client, &params_small(&page)).unwrap();
+        navigate(&c, &client, &params_small(&page)).unwrap();
 
         assert_eq!(client.calls(), 3, "two windows + one perceptor");
         let reqs = client.requests.borrow();
@@ -2148,7 +2312,7 @@ mod tests {
             Ok(resp("Il consiglio si e riunito.", 10)), // translate-only unit
             Ok(resp(&content_with("ignored", "s", &[]), 10)), // lean perceptor-update
         ]);
-        translate_page(&c, &client, &params("The board met.")).unwrap();
+        navigate(&c, &client, &params("The board met.")).unwrap();
 
         let reqs = client.requests.borrow();
         // The unit call sends NO response_format; the perceptor sends the LEAN one.
@@ -2189,7 +2353,7 @@ lines, so it stays a single translation unit even though it is not short.";
             Ok(resp("Traduzione intera della pagina.", 100)), // the single unit
             Ok(resp(&valid_content(), 200)),                  // perceptor-update
         ]);
-        let out = translate_page(&c, &client, &params(page)).unwrap();
+        let out = navigate(&c, &client, &params(page)).unwrap();
 
         assert_eq!(out.translated_text, "Traduzione intera della pagina.", "whole page from one call");
         let reqs = client.requests.borrow();
@@ -2213,7 +2377,7 @@ lines, so it stays a single translation unit even though it is not short.";
             Ok(resp(&content_with("ignored", "s", &[]), 10)),
         ]);
         let page = two_paragraphs();
-        translate_page(&c, &client, &params_small(&page)).unwrap();
+        navigate(&c, &client, &params_small(&page)).unwrap();
         let perceptor_calls = client
             .requests
             .borrow()
@@ -2263,7 +2427,7 @@ lines, so it stays a single translation unit even though it is not short.";
             Ok(resp(&content_with("ignored", "RIASSUNTO-AVANZATO.", &[]), 10)),
         ]);
         let page = two_paragraphs();
-        translate_page(&c, &client, &params_small(&page)).unwrap();
+        navigate(&c, &client, &params_small(&page)).unwrap();
 
         let p0 = client.user_prompt(0);
         let p1 = client.user_prompt(1);
@@ -2307,7 +2471,7 @@ lines, so it stays a single translation unit even though it is not short.";
             Ok(resp(&valid_content(), 300)),           // perceptor-update
         ]);
 
-        let out = translate_page(&c, &client, &params("Hello")).unwrap();
+        let out = navigate(&c, &client, &params("Hello")).unwrap();
         assert_eq!(out.translated_text, "Testo completo.", "the complete retry wins");
         assert_eq!(client.calls(), 3, "unit truncated + retry + perceptor");
 
@@ -2375,7 +2539,7 @@ lines, so it stays a single translation unit even though it is not short.";
             Ok(resp(&content_with("ignored", "s", &[]), 10)), // perceptor
         ]);
         let page = two_paragraphs();
-        translate_page(&c, &client, &params_small(&page)).unwrap();
+        navigate(&c, &client, &params_small(&page)).unwrap();
 
         let reqs = client.requests.borrow();
         // The retried request (index 1) grew but still fits within n_ctx=4096.
@@ -2481,16 +2645,17 @@ lines, so it stays a single translation unit even though it is not short.";
         );
     }
 
-    /// REGRESSIONE (ticket 01, opzione B): un prefetch di P (`update_context:
-    /// false`) NON deve scrivere la cache di PAGINA — scalda solo la cache
-    /// per-unità (STC-09). Alla navigazione reale su P (`update_context: true`,
-    /// stesso testo) la pagina è quindi un MISS di pagina: la pipeline prosegue,
-    /// le unità sono servite dalla cache per-unità (nessuna ri-traduzione), il
-    /// percettore gira UNA volta e il glossario cresce.
+    /// REGRESSIONE 2e81d42, riadattata alla forma two-phase (ticket 01): un
+    /// prefetch di P (`update_context: false`) NON scrive la cache di PAGINA —
+    /// scalda solo la cache per-unità (STC-09). Alla navigazione reale su P la
+    /// FASE 1 (`translate_page`) assembla il testo dalla cache per-unità e ritorna
+    /// **senza alcuna chiamata al modello** (la vittoria del ticket: arrivo
+    /// istantaneo su pagina prefetchata), scrivendo la riga di pagina con
+    /// `context_advanced = 0`. La FASE 2 (`advance_context`) fa girare il
+    /// percettore UNA volta e il glossario cresce.
     ///
-    /// Prima del fix questo test FALLISCE: il prefetch scrive la cache di pagina,
-    /// la navigazione reale è un cache-hit che ritorna prima del percettore →
-    /// zero chiamate, glossario resta a 0.
+    /// Intento preservato dal test originale (contesto avanzato, unità non
+    /// ritradotte); intento NUOVO: la fase 1 non blocca su chiamate LLM.
     #[test]
     fn prefetch_warmed_page_advances_context_on_real_navigation_without_retranslating() {
         let c = conn();
@@ -2524,26 +2689,41 @@ lines, so it stays a single translation unit even though it is not short.";
         assert_eq!(page_rows(&c), 0, "il prefetch non scrive la cache di pagina (opzione B)");
         assert_eq!(unit_rows(&c), 1, "il prefetch scalda la cache per-unità (STC-09)");
 
-        // --- Navigazione reale su P con update_context=true -----------------
-        // Coda con la SOLA risposta del percettore: se le unità venissero
-        // ri-tradotte, la prima pop verrebbe consumata dalla traduzione e il
-        // percettore andrebbe in panic sulla coda vuota. Quindi client.calls()==1
-        // dimostra che l'unità è servita dalla cache per-unità (nessuna
-        // ri-traduzione) e che il percettore gira esattamente una volta.
-        let client_nav = MockClient::new(vec![Ok(resp(
+        // --- FASE 1: navigazione reale su P (view path) --------------------
+        // Client con coda VUOTA: qualsiasi chiamata al modello farebbe panic. Se
+        // la fase 1 restituisce senza panic e con 0 chiamate, è la prova che
+        // l'arrivo su una pagina interamente prefetchata NON blocca su alcuna
+        // chiamata LLM (il percettore non è più sul percorso di risposta).
+        let client_view = MockClient::new(vec![]);
+        let nav = TranslateParams { update_context: true, ..prefetch };
+        let out_view = translate_page(&c, &client_view, &nav).unwrap();
+
+        assert!(!out_view.from_cache, "navigazione reale: miss di pagina, non un cache-hit");
+        assert_eq!(out_view.translated_text, "Ciao mondo", "traduzione servita dalle unità cachate");
+        assert_eq!(
+            client_view.calls(),
+            0,
+            "REGRESSIONE: 0 chiamate LLM sincrone sul percorso di risposta dell'arrivo"
+        );
+        // La fase 1 scrive la cache di pagina (marker context_advanced=0), così una
+        // rivisita è un HIT istantaneo mentre il contesto è ancora da avanzare.
+        assert_eq!(page_rows(&c), 1, "la fase 1 scrive la cache di pagina");
+        assert_eq!(
+            crate::glossary::list_glossary(&c, 1).unwrap().len(),
+            0,
+            "il contesto NON è ancora avanzato dopo la sola fase 1"
+        );
+
+        // --- FASE 2: advance_context (context path) ------------------------
+        // Qui gira il percettore, esattamente una volta: il glossario cresce.
+        let client_ctx = MockClient::new(vec![Ok(resp(
             &content_with("ignorato", "Riassunto avanzato", &[("hello", "ciao")]),
             200,
         ))]);
-        let nav = TranslateParams { update_context: true, ..prefetch };
-        let out_nav = translate_page(&c, &client_nav, &nav).unwrap();
-
-        assert!(!out_nav.from_cache, "navigazione reale: miss di pagina, non un cache-hit");
-        assert_eq!(out_nav.translated_text, "Ciao mondo", "traduzione servita dalle unità cachate");
-        assert_eq!(
-            client_nav.calls(),
-            1,
-            "esattamente 1 chiamata: solo il percettore (nessuna ri-traduzione delle unità)"
-        );
+        let adv = advance_context(&c, &client_ctx, &adv_from(&nav)).unwrap();
+        assert!(adv.advanced, "la fase 2 avanza il contesto");
+        assert!(!adv.perceptor_update_failed);
+        assert_eq!(client_ctx.calls(), 1, "esattamente 1 chiamata: solo il percettore");
 
         // Il glossario è cresciuto da 0 al termine proposto dal percettore.
         let glossary = crate::glossary::list_glossary(&c, 1).unwrap();
@@ -2551,8 +2731,8 @@ lines, so it stays a single translation unit even though it is not short.";
         assert_eq!(glossary[0].source_term, "hello");
         assert_eq!(glossary[0].translation, "ciao");
 
-        // Ora la pagina è cachata come "completa": un accesso successivo è un HIT.
-        assert_eq!(page_rows(&c), 1, "la navigazione reale scrive la cache di pagina");
+        // La pagina resta cachata come "completa": una rivisita è un page-HIT.
+        assert_eq!(page_rows(&c), 1);
     }
 
     // --- Stale-job cancellation (ticket 06, L3/L4) ---------------------------
@@ -2593,7 +2773,7 @@ lines, so it stays a single translation unit even though it is not short.";
             Ok(resp(&content_with("ignored", "s", &[]), 10)),
         ]);
         let p2 = TranslateParams { is_current: None, ..params_small(&page) };
-        let out2 = translate_page(&c, &client2, &p2).unwrap();
+        let out2 = navigate(&c, &client2, &p2).unwrap();
         assert_eq!(
             client2.calls(),
             2,
@@ -2914,7 +3094,7 @@ fixed({fixed}) windows: a={} b={} stable={fixed_stable}",
         responses.push(Ok(resp(&content_with("ignored", "s", &[]), 7)));
         let client = MockClient::new(responses);
 
-        let out = translate_page(&c, &client, &params_small(&page)).unwrap();
+        let out = navigate(&c, &client, &params_small(&page)).unwrap();
 
         assert_eq!(
             client.calls(),
@@ -2944,7 +3124,7 @@ fixed({fixed}) windows: a={} b={} stable={fixed_stable}",
         responses.push(Ok(resp(&content_with("ignored", "s", &[]), 7)));
         let client = MockClient::new(responses);
 
-        let out = translate_page(&c, &client, &params_small(&page)).unwrap();
+        let out = navigate(&c, &client, &params_small(&page)).unwrap();
 
         assert_eq!(out.translated_text, page, "echo → ricomposizione byte-identica");
         let mut last = 0usize;
@@ -2992,7 +3172,7 @@ fixed({fixed}) windows: a={} b={} stable={fixed_stable}",
         responses.push(Ok(resp(&content_with("ignored", "s", &[]), 7)));
         let client = MockClient::new(responses);
 
-        let out = translate_page(&c, &client, &params_small(&page)).unwrap();
+        let out = navigate(&c, &client, &params_small(&page)).unwrap();
 
         assert_eq!(
             client.calls(),
@@ -3046,7 +3226,7 @@ fixed({fixed}) windows: a={} b={} stable={fixed_stable}",
             update_context: true,
             is_current: None,
         };
-        let out = translate_page(&c, &client, &p).unwrap();
+        let out = navigate(&c, &client, &p).unwrap();
 
         assert_eq!(
             client.calls(),
@@ -3114,7 +3294,7 @@ fixed({fixed}) windows: a={} b={} stable={fixed_stable}",
             Ok(resp("not json", 10)),       // perceptor malformed
             Ok(resp("still not json", 10)), // correction still malformed
         ]);
-        let out1 = translate_page(&c, &client1, &params_small(&page)).unwrap();
+        let out1 = navigate(&c, &client1, &params_small(&page)).unwrap();
         assert!(out1.translated_text.contains("UNO") && out1.translated_text.contains("DUE"));
         assert_eq!(out1.updated_summary, None, "summary not advanced by the failed perceptor");
 
@@ -3157,7 +3337,7 @@ fixed({fixed}) windows: a={} b={} stable={fixed_stable}",
             Ok(resp("DUE", 10)),
             Ok(resp(&content_with("ignored", "s", &[]), 10)),
         ]);
-        let out = translate_page(&c, &client2, &params_small(&page)).unwrap();
+        let out = navigate(&c, &client2, &params_small(&page)).unwrap();
         assert_eq!(client2.calls(), 2, "unit 0 reused; only unit 1 + perceptor called");
         assert!(out.translated_text.contains("UNO") && out.translated_text.contains("DUE"));
         assert!(out.translated_text.find("UNO").unwrap() < out.translated_text.find("DUE").unwrap());
@@ -3182,7 +3362,7 @@ fixed({fixed}) windows: a={} b={} stable={fixed_stable}",
             Ok(resp("T2", 10)),
             Ok(resp(&content_with("ignored", "s1", &[]), 10)),
         ]);
-        translate_page(&c, &client1, &params_small(&page1)).unwrap();
+        navigate(&c, &client1, &params_small(&page1)).unwrap();
         assert_eq!(client1.calls(), 4, "first run: three windows + perceptor");
 
         // Only the middle paragraph changes; boundaries (and thus indices) hold.
@@ -3196,7 +3376,7 @@ fixed({fixed}) windows: a={} b={} stable={fixed_stable}",
             Ok(resp("T1-nuovo", 10)),                          // only the changed unit
             Ok(resp(&content_with("ignored", "s2", &[]), 10)), // perceptor re-runs
         ]);
-        let out = translate_page(&c, &client2, &params_small(&page2)).unwrap();
+        let out = navigate(&c, &client2, &params_small(&page2)).unwrap();
 
         assert_eq!(client2.calls(), 2, "only the changed unit + perceptor; unchanged units reused");
         assert!(out.translated_text.contains("T0"), "unit 0 reused from cache");
@@ -3218,7 +3398,7 @@ fixed({fixed}) windows: a={} b={} stable={fixed_stable}",
             Ok(resp("DUE", 10)),
             Ok(resp(&content_with("ignored", "s", &[]), 10)),
         ]);
-        translate_page(&c, &it, &params_small(&page)).unwrap();
+        navigate(&c, &it, &params_small(&page)).unwrap();
 
         // Same page/indices but a different target language -> all units miss.
         let fr = MockClient::new(vec![
@@ -3230,7 +3410,7 @@ fixed({fixed}) windows: a={} b={} stable={fixed_stable}",
             target_language: "fr",
             ..params_small(&page)
         };
-        let out = translate_page(&c, &fr, &p_fr).unwrap();
+        let out = navigate(&c, &fr, &p_fr).unwrap();
 
         assert_eq!(fr.calls(), 3, "different language: both units + perceptor re-translated");
         assert!(out.translated_text.contains("UN") && out.translated_text.contains("DEUX"));
@@ -3268,7 +3448,7 @@ fixed({fixed}) windows: a={} b={} stable={fixed_stable}",
             Ok(resp("T2", 10)),
             Ok(resp(&content_with("ignored", "s", &[]), 10)),
         ]);
-        let out_a = translate_page(&ca, &a, &params_small(&page)).unwrap();
+        let out_a = navigate(&ca, &a, &params_small(&page)).unwrap();
 
         // A run where a UNIT fails mid-page (earlier units cached, page NOT
         // cached), then a retry that re-translates only the missing unit and
@@ -3285,7 +3465,7 @@ fixed({fixed}) windows: a={} b={} stable={fixed_stable}",
             Ok(resp("T2", 10)),                               // only the missing unit
             Ok(resp(&content_with("ignored", "s", &[]), 10)), // perceptor
         ]);
-        let out_b = translate_page(&cb, &b2, &params_small(&page)).unwrap();
+        let out_b = navigate(&cb, &b2, &params_small(&page)).unwrap();
 
         assert_eq!(
             out_b.translated_text, out_a.translated_text,
@@ -3305,13 +3485,13 @@ fixed({fixed}) windows: a={} b={} stable={fixed_stable}",
             Ok(resp("T2", 10)),
             Ok(resp(&content_with("ignored", "s", &[]), 10)),
         ]);
-        translate_page(&c, &client1, &params_small(&page3)).unwrap();
+        navigate(&c, &client1, &params_small(&page3)).unwrap();
         assert_eq!(unit_rows(&c), 3, "three units cached");
 
         // The page now has only two paragraphs (same first two bodies -> HITs).
         let page2 = format!("{}\n\n{}", big_para("AAA uno."), big_para("BBB due."));
         let client2 = MockClient::new(vec![Ok(resp(&content_with("ignored", "s", &[]), 10))]);
-        translate_page(&c, &client2, &params_small(&page2)).unwrap();
+        navigate(&c, &client2, &params_small(&page2)).unwrap();
         assert_eq!(client2.calls(), 1, "two units reused; only the perceptor called");
         assert_eq!(unit_rows(&c), 2, "the orphan third unit row was pruned");
     }
@@ -3327,7 +3507,7 @@ fixed({fixed}) windows: a={} b={} stable={fixed_stable}",
             Ok(resp("Ciao", 10)),
             Ok(resp(&valid_content(), 10)),
         ]);
-        translate_page(&c, &client1, &params("Hello")).unwrap();
+        navigate(&c, &client1, &params("Hello")).unwrap();
         assert_eq!(unit_rows(&c), 1, "single unit cached too");
 
         // Second visit: page-level hit -> no model call at all, perceptor untouched.
@@ -3335,5 +3515,168 @@ fixed({fixed}) windows: a={} b={} stable={fixed_stable}",
         let out = translate_page(&c, &client2, &params("Hello")).unwrap();
         assert!(out.from_cache, "served from the page-level cache");
         assert_eq!(client2.calls(), 0, "page hit short-circuits before the unit loop");
+    }
+
+    // --- Two-phase arrival (ticket 01, prefetched-page-arrival-latency) ------
+    //
+    // Regression tests from the triangulation repros
+    // (`docs/tickets/prefetched-page-arrival-latency/repro/`): the gap that let
+    // the bug through was that NO test measured the number of blocking LLM calls
+    // on the ARRIVAL of a prefetched page. These pin it down.
+
+    /// AC#1 (repro-first / recent-change): arriving on a page whose units are all
+    /// warmed by the prefetch, the VIEW path (`translate_page`) returns the text
+    /// with **zero blocking model calls** — the perceptor no longer sits on the
+    /// arrival's response path. Client queue is EMPTY: any model call panics.
+    #[test]
+    fn arrival_on_fully_prefetched_page_returns_without_blocking_model_calls() {
+        let c = conn();
+        seed_session(&c);
+
+        // Prefetch of page 4 (update_context=false) warms the unit cache.
+        let client_pf = MockClient::new(vec![Ok(resp("Ciao mondo", 100))]);
+        let prefetch = TranslateParams {
+            document_id: 1,
+            page_number: 4,
+            target_language: "it",
+            page_text: "Hello world.",
+            model: "local-model",
+            max_tokens: 2048,
+            n_ctx: 4096,
+            update_context: false,
+            is_current: None,
+        };
+        translate_page(&c, &client_pf, &prefetch).unwrap();
+        assert_eq!(unit_rows(&c), 1, "prefetch warmed the unit cache");
+        assert_eq!(page_rows(&c), 0, "option B: no page row from prefetch");
+
+        // Real navigation: EMPTY client — a single blocking model call would panic.
+        let client_nav = MockClient::new(vec![]);
+        let nav = TranslateParams { update_context: true, ..prefetch };
+        let out = translate_page(&c, &client_nav, &nav).unwrap();
+        assert_eq!(out.translated_text, "Ciao mondo", "text served from the unit cache");
+        assert_eq!(
+            client_nav.calls(),
+            0,
+            "arrival on a prefetched page blocks on ZERO model calls (perceptor is off the response path)"
+        );
+        assert!(!out.perceptor_update_failed, "view path never reports a perceptor failure");
+        assert_eq!(out.updated_summary, None, "view path never advances the summary");
+    }
+
+    /// AC#2: the context path (`advance_context`) runs the perceptor once for the
+    /// page and the glossary grows — even though the arrival itself was instant.
+    #[test]
+    fn advance_context_runs_perceptor_once_and_grows_the_glossary() {
+        let c = conn();
+        seed_session(&c);
+        let page = two_paragraphs();
+        let p = params_small(&page);
+
+        // View path first (two units), writes the page row with context_advanced=0.
+        let client_view = MockClient::new(vec![Ok(resp("UNO", 10)), Ok(resp("DUE", 10))]);
+        translate_page(&c, &client_view, &p).unwrap();
+        assert_eq!(crate::glossary::list_glossary(&c, 1).unwrap().len(), 0, "no terms yet");
+
+        // Context path: one perceptor call proposing a term.
+        let client_ctx = MockClient::new(vec![Ok(resp(
+            &content_with("ignored", "Riassunto pagina", &[("board", "consiglio")]),
+            10,
+        ))]);
+        let adv = advance_context(&c, &client_ctx, &adv_from(&p)).unwrap();
+        assert!(adv.advanced, "context advanced");
+        assert_eq!(adv.updated_summary.as_deref(), Some("Riassunto pagina"));
+        assert_eq!(client_ctx.calls(), 1, "exactly one perceptor call");
+        let glossary = crate::glossary::list_glossary(&c, 1).unwrap();
+        assert_eq!(glossary.len(), 1, "glossary grew");
+        assert_eq!(glossary[0].source_term, "board");
+        assert_eq!(
+            crate::documents::get_rolling_summary(&c, 1).unwrap(),
+            "Riassunto pagina",
+            "rolling summary advanced"
+        );
+    }
+
+    /// AC#3: re-visiting an already-advanced page does NOT re-run the perceptor —
+    /// the `context_advanced` marker makes the second `advance_context` a no-op
+    /// (zero model calls), so the glossary/summary are not touched again.
+    #[test]
+    fn revisit_of_advanced_page_does_not_rerun_the_perceptor() {
+        let c = conn();
+        seed_session(&c);
+        let p = params("Hello");
+
+        // First navigation: view + advance (full success flips the marker to 1).
+        let client1 = MockClient::new(vec![Ok(resp("Ciao mondo", 10))]);
+        translate_page(&c, &client1, &p).unwrap();
+        let client_ctx = MockClient::new(vec![Ok(resp(&valid_content(), 10))]);
+        let adv1 = advance_context(&c, &client_ctx, &adv_from(&p)).unwrap();
+        assert!(adv1.advanced, "first advance succeeds");
+        let terms_after_first = crate::glossary::list_glossary(&c, 1).unwrap().len();
+
+        // Re-visit: advance_context must be a NO-OP (marker == 1). EMPTY client:
+        // any perceptor call would panic.
+        let client_ctx2 = MockClient::new(vec![]);
+        let adv2 = advance_context(&c, &client_ctx2, &adv_from(&p)).unwrap();
+        assert!(!adv2.advanced, "already-advanced page is a no-op");
+        assert!(!adv2.perceptor_update_failed, "a no-op is not a failure");
+        assert_eq!(client_ctx2.calls(), 0, "the perceptor does not re-run on re-visit");
+        assert_eq!(
+            crate::glossary::list_glossary(&c, 1).unwrap().len(),
+            terms_after_first,
+            "glossary unchanged on re-visit"
+        );
+    }
+
+    /// AC#4: a perceptor FAILURE leaves the `context_advanced` marker unset, so a
+    /// later re-visit RETRIES the advancement (and can then succeed). The marker
+    /// is set only on a full success. `perceptor_update_failed` stays observable.
+    #[test]
+    fn perceptor_failure_leaves_marker_unset_and_a_revisit_retries() {
+        let c = conn();
+        seed_session(&c);
+        let p = params("Hello");
+
+        // View path (one unit), then a context path where the perceptor fails
+        // (malformed twice → its own correction retry gives up).
+        let client_view = MockClient::new(vec![Ok(resp("Ciao mondo", 10))]);
+        translate_page(&c, &client_view, &p).unwrap();
+        let client_fail = MockClient::new(vec![
+            Ok(resp("not json", 10)),       // perceptor malformed
+            Ok(resp("still not json", 10)), // correction still malformed
+        ]);
+        let adv1 = advance_context(&c, &client_fail, &adv_from(&p)).unwrap();
+        assert!(!adv1.advanced, "failed perceptor does not advance");
+        assert!(adv1.perceptor_update_failed, "failure is observable");
+        assert_eq!(
+            crate::documents::get_rolling_summary(&c, 1).unwrap(),
+            "",
+            "summary not advanced by the failed perceptor"
+        );
+
+        // Re-visit RETRIES (marker still 0): this time the perceptor succeeds.
+        let client_ok = MockClient::new(vec![Ok(resp(
+            &content_with("ignored", "Riassunto recuperato", &[("hobbit", "hobbit")]),
+            10,
+        ))]);
+        let adv2 = advance_context(&c, &client_ok, &adv_from(&p)).unwrap();
+        assert!(adv2.advanced, "the re-visit retried and advanced the context");
+        assert_eq!(client_ok.calls(), 1, "the retry ran the perceptor again");
+        assert_eq!(
+            crate::documents::get_rolling_summary(&c, 1).unwrap(),
+            "Riassunto recuperato",
+            "summary advanced on the successful retry"
+        );
+        assert_eq!(
+            crate::glossary::list_glossary(&c, 1).unwrap().len(),
+            1,
+            "the retry grew the glossary"
+        );
+
+        // A further re-visit is now a no-op (marker set on the successful retry).
+        let client_noop = MockClient::new(vec![]);
+        let adv3 = advance_context(&c, &client_noop, &adv_from(&p)).unwrap();
+        assert!(!adv3.advanced, "advanced page no longer retries");
+        assert_eq!(client_noop.calls(), 0);
     }
 }

@@ -38,13 +38,25 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
 
         -- Per-page translations (cache)
         CREATE TABLE IF NOT EXISTS translations_cache (
-            id              INTEGER PRIMARY KEY,
-            document_id     INTEGER REFERENCES documents(id),
-            page_number     INTEGER,
-            target_language TEXT,
-            source_text     TEXT,
-            translated_text TEXT,
-            created_at      TEXT,
+            id               INTEGER PRIMARY KEY,
+            document_id      INTEGER REFERENCES documents(id),
+            page_number      INTEGER,
+            target_language  TEXT,
+            source_text      TEXT,
+            translated_text  TEXT,
+            created_at       TEXT,
+            -- Two-phase arrival (ticket 01, prefetched-page-arrival-latency): the
+            -- perceptor-update no longer runs on the response path of
+            -- `translate_page`; it advances the context in a separate
+            -- `advance_context` phase. This marker records whether the context
+            -- (rolling summary + glossary) has been advanced for this page yet, so
+            -- the perceptor runs EXACTLY ONCE per page on the first real
+            -- navigation and never again on a re-visit (page-hit), while a FAILED
+            -- perceptor leaves it 0 so a later re-visit retries. Set to 0 by the
+            -- view-path page write and flipped to 1 only on a FULL perceptor
+            -- success. DEFAULT 1 so pre-existing rows (all written by complete
+            -- pre-two-phase navigations) are treated as already-advanced.
+            context_advanced INTEGER NOT NULL DEFAULT 1,
             UNIQUE(document_id, page_number, target_language)
         );
 
@@ -86,6 +98,35 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         );
         "#,
     )?;
+
+    // Two-phase arrival (ticket 01): add the `context_advanced` marker column to
+    // pre-existing `translations_cache` tables. Idempotent — gated on the column's
+    // presence via `PRAGMA table_info` so steady-state opens do no write. Existing
+    // rows default to 1 ("already advanced"). This is a deliberate tradeoff, not a
+    // claim that every legacy row actually advanced its context: legacy rows are
+    // already-read pages, and marking them advanced avoids re-running the perceptor
+    // across the whole back-catalogue on upgrade. The rare exception — a page whose
+    // only cache row came from a pre-Option-B prefetch that never got a real
+    // navigation — will not grow the glossary on the next visit; acceptable given it
+    // is a one-off legacy edge and the perceptor resumes normally on new pages.
+    let has_context_advanced: bool = {
+        let mut stmt = conn.prepare("PRAGMA table_info(translations_cache)")?;
+        let cols = stmt.query_map([], |r| r.get::<_, String>(1))?;
+        let mut found = false;
+        for col in cols {
+            if col? == "context_advanced" {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    if !has_context_advanced {
+        conn.execute_batch(
+            "ALTER TABLE translations_cache
+                 ADD COLUMN context_advanced INTEGER NOT NULL DEFAULT 1;",
+        )?;
+    }
 
     // Glossary dedup (ticket 04). The dedup key is `(document_id,
     // lower(trim(source_term)))` — note `lower()` is SQLite's ASCII-only

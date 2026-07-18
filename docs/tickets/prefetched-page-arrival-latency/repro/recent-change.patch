@@ -1,0 +1,64 @@
+diff --git a/src-tauri/src/translate.rs b/src-tauri/src/translate.rs
+index bf2128c..69e1f13 100644
+--- a/src-tauri/src/translate.rs
++++ b/src-tauri/src/translate.rs
+@@ -2481,6 +2481,59 @@ lines, so it stays a single translation unit even though it is not short.";
+         );
+     }
+ 
++    /// FEEDBACK LOOP (diagnosi 2026-07-18, lente recent-change): requisito
++    /// utente = arrivando su una pagina COMPLETAMENTE prefetchata la traduzione
++    /// deve essere disponibile SUBITO, senza chiamate LLM bloccanti tra la
++    /// navigazione e la consegna del testo. Scenario realistico del provider
++    /// locale llamaserver (default): n_ctx 4096, e il perceptor-update fallisce
++    /// spesso lo strict parse (premessa documentata di 6f37c30) → prosa non
++    /// parsabile + retry di correzione non parsabile = DUE chiamate LLM complete.
++    ///
++    /// Oggi FALLISCE (per costruzione, dopo 2e81d42/opzione B): translate_page
++    /// esegue il perceptor-update in modo SINCRONO prima di restituire la
++    /// traduzione già calda, quindi `client_nav.calls()` è 2, non 0.
++    #[test]
++    fn arrival_on_fully_prefetched_page_delivers_translation_without_blocking_llm_calls() {
++        let c = conn();
++        seed_session(&c);
++
++        // Prefetch di P=4 col provider locale (n_ctx piccolo): scalda le unità.
++        let client_prefetch = MockClient::new(vec![Ok(resp("Ciao mondo", 100))]);
++        let prefetch = TranslateParams {
++            document_id: 1,
++            page_number: 4,
++            target_language: "it",
++            page_text: "Hello world.",
++            model: "local/gguf",
++            max_tokens: 2048,
++            n_ctx: 4096, // default del provider locale llamaserver
++            update_context: false,
++            is_current: None,
++        };
++        translate_page(&c, &client_prefetch, &prefetch).unwrap();
++        assert_eq!(unit_rows(&c), 1, "precondizione: il prefetch ha scaldato le unità");
++
++        // Navigazione reale su P=4: il modello locale risponde prosa non-JSON
++        // sia alla prima chiamata percettore sia al retry di correzione.
++        let client_nav = MockClient::new(vec![
++            Ok(resp("Ecco un riassunto della pagina in prosa, senza JSON.", 500)),
++            Ok(resp("Ancora prosa non conforme, niente JSON.", 500)),
++        ]);
++        let nav = TranslateParams { update_context: true, ..prefetch };
++        let out = translate_page(&c, &client_nav, &nav).unwrap();
++
++        assert_eq!(out.translated_text, "Ciao mondo", "unità servite dalla cache per-unità");
++        // REQUISITO UTENTE (il "sistema che mi traduce la pagina N+1"): nessuna
++        // chiamata LLM bloccante tra la navigazione e la traduzione già pronta.
++        assert_eq!(
++            client_nav.calls(),
++            0,
++            "la traduzione prefetchata deve essere consegnata senza attendere il perceptor-update \
++             (oggi: {} chiamate LLM sincrone sul percorso critico dell'arrivo)",
++            client_nav.calls()
++        );
++    }
++
+     /// REGRESSIONE (ticket 01, opzione B): un prefetch di P (`update_context:
+     /// false`) NON deve scrivere la cache di PAGINA — scalda solo la cache
+     /// per-unità (STC-09). Alla navigazione reale su P (`update_context: true`,
