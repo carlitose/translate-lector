@@ -1,0 +1,180 @@
+diff --git a/src-tauri/src/translate.rs b/src-tauri/src/translate.rs
+index bf2128c..0dc0f7f 100644
+--- a/src-tauri/src/translate.rs
++++ b/src-tauri/src/translate.rs
+@@ -3336,4 +3336,175 @@ fixed({fixed}) windows: a={} b={} stable={fixed_stable}",
+         assert!(out.from_cache, "served from the page-level cache");
+         assert_eq!(client2.calls(), 0, "page hit short-circuits before the unit loop");
+     }
++
++    // --- DIAGNOSI (lens data-flow): sequenza reale nav N -> prefetch N+1 -> nav N+1
++
++    /// End-to-end del flusso di lettura reale col provider locale (n_ctx piccolo,
++    /// pagine multi-unità) e col contesto che AVANZA a pagina N (summary + glossario
++    /// crescono, come dopo i fix del glossario): il prefetch di N+1 scalda la cache
++    /// per-unità e la navigazione reale su N+1 NON deve ri-tradurre alcuna unità —
++    /// l'unica chiamata al modello ammessa è il perceptor-update.
++    #[test]
++    fn diag_real_nav_after_prefetch_reuses_all_units_with_growing_context() {
++        let c = conn();
++        seed_session(&c);
++
++        // --- Nav reale pagina 3: 2 unità + percettore Full (contesto avanza) --
++        let page3 = two_paragraphs();
++        let client_nav3 = MockClient::new(vec![
++            Ok(resp("Uno tradotto", 10)),
++            Ok(resp("Due tradotto", 10)),
++            Ok(resp(
++                &content_with(
++                    "ignored",
++                    "Riassunto avanzato della pagina tre, con abbastanza testo da spostare la stima dei token del summary rispetto allo stato iniziale vuoto.",
++                    &[("board", "consiglio"), ("shareholder", "azionista")],
++                ),
++                10,
++            )),
++        ]);
++        let p3 = params_small(&page3);
++        translate_page(&c, &client_nav3, &p3).unwrap();
++        assert_eq!(client_nav3.calls(), 3, "nav pagina 3: 2 unità + percettore");
++        assert_eq!(
++            crate::glossary::list_glossary(&c, 1).unwrap().len(),
++            2,
++            "il glossario cresce a pagina 3 (post-fix)"
++        );
++
++        // --- Prefetch pagina 4 (update_context=false): scalda le unità -------
++        let page4 = three_paragraphs();
++        let pf = TranslateParams {
++            page_number: 4,
++            update_context: false,
++            ..params_small(&page4)
++        };
++        let client_pf = MockClient::new(vec![
++            Ok(resp("AAA-tradotto", 10)),
++            Ok(resp("BBB-tradotto", 10)),
++            Ok(resp("CCC-tradotto", 10)),
++        ]);
++        translate_page(&c, &client_pf, &pf).unwrap();
++        assert_eq!(client_pf.calls(), 3, "prefetch: 3 unità, nessun percettore");
++
++        // --- Nav reale pagina 4: SOLO il percettore può chiamare il modello ---
++        // Se anche una sola unità andasse in MISS, il MockClient consumerebbe la
++        // risposta del percettore per l'unità e il test fallirebbe (coda vuota).
++        let client_nav4 = MockClient::new(vec![Ok(resp(
++            &content_with("ignored", "Riassunto pagina quattro", &[]),
++            10,
++        ))]);
++        let p4 = TranslateParams { update_context: true, ..pf };
++        let out = translate_page(&c, &client_nav4, &p4).unwrap();
++        assert!(!out.from_cache, "nav reale: miss di pagina (opzione B)");
++        assert!(
++            out.translated_text.contains("AAA-tradotto")
++                && out.translated_text.contains("BBB-tradotto")
++                && out.translated_text.contains("CCC-tradotto"),
++            "tutte le unità servite dalla cache per-unità"
++        );
++        assert_eq!(
++            client_nav4.calls(),
++            1,
++            "nav pagina 4: nessuna ri-traduzione delle unità, solo il percettore"
++        );
++    }
++
++    /// DIAGNOSI variante: un termine aggiunto/lockato manualmente (nuova feature
++    /// glossario) TRA il prefetch di N+1 e la navigazione reale su N+1 cambia
++    /// `locked_all` -> `glossary_est` -> `budget_unit_text` -> packing. Se il
++    /// packing cambia, gli indici/hash delle unità cambiano e la cache per-unità
++    /// va in MISS totale: la pagina N+1 viene ri-tradotta da zero all'arrivo.
++    #[test]
++    fn diag_locked_term_added_between_prefetch_and_nav_keeps_unit_hits() {
++        let c = conn();
++        seed_session(&c);
++
++        // Prefetch pagina 4 (contesto iniziale: glossario vuoto).
++        let page4 = three_paragraphs();
++        let pf = TranslateParams {
++            page_number: 4,
++            update_context: false,
++            ..params_small(&page4)
++        };
++        let client_pf = MockClient::new(vec![
++            Ok(resp("AAA-tradotto", 10)),
++            Ok(resp("BBB-tradotto", 10)),
++            Ok(resp("CCC-tradotto", 10)),
++        ]);
++        translate_page(&c, &client_pf, &pf).unwrap();
++        assert_eq!(client_pf.calls(), 3);
++
++        // L'utente aggiunge un termine LOCKED dal form (feature nuova) con una
++        // nota lunga: locked_all cresce.
++        crate::glossary::add_manual_term(
++            &c,
++            1,
++            "wyrm",
++            "verme antico",
++            "nome proprio",
++            "Nota lunga che gonfia il blocco locked del glossario e quindi la stima dei token riservati al glossario nel budget delle unita, ripetuta per sicurezza. Nota lunga che gonfia il blocco locked del glossario e quindi la stima dei token riservati al glossario nel budget delle unita.",
++            true,
++        )
++        .unwrap();
++
++        // Nav reale pagina 4: le unità devono restare HIT nonostante il termine.
++        let client_nav4 = MockClient::new(vec![Ok(resp(
++            &content_with("ignored", "Riassunto pagina quattro", &[]),
++            10,
++        ))]);
++        let p4 = TranslateParams { update_context: true, ..pf };
++        let out = translate_page(&c, &client_nav4, &p4).unwrap();
++        assert_eq!(
++            client_nav4.calls(),
++            1,
++            "un termine locked aggiunto tra prefetch e nav non deve invalidare le unità"
++        );
++        assert!(out.translated_text.contains("AAA-tradotto"));
++    }
++
++    /// DIAGNOSI (misura del sintomo): all'arrivo su N+1 con TUTTE le unità già
++    /// in cache (prefetch riuscito), `translate_page` NON ritorna finché il
++    /// perceptor-update non è concluso. Nel modo di fallimento ROUTINARIO del
++    /// provider locale (JSON stretto non parsabile -> correction retry ->
++    /// Recovered, ticket 02), l'arrivo costa DUE chiamate LLM complete
++    /// (prompt = intera pagina) prima che la traduzione, già assemblata dalla
++    /// cache per-unità, venga restituita alla UI.
++    #[test]
++    fn diag_warm_arrival_on_n_plus_1_still_pays_two_synchronous_perceptor_calls() {
++        let c = conn();
++        seed_session(&c);
++
++        // Prefetch di pagina 4: scalda tutte le unità.
++        let page4 = three_paragraphs();
++        let pf = TranslateParams {
++            page_number: 4,
++            update_context: false,
++            ..params_small(&page4)
++        };
++        let client_pf = MockClient::new(vec![
++            Ok(resp("AAA-tradotto", 10)),
++            Ok(resp("BBB-tradotto", 10)),
++            Ok(resp("CCC-tradotto", 10)),
++        ]);
++        translate_page(&c, &client_pf, &pf).unwrap();
++
++        // Nav reale su pagina 4, percettore che fallisce il parse stretto due
++        // volte (il caso "di routine" documentato per il provider locale).
++        let partial = "Analisi.\n{\"new_glossary_terms\": [], \"updated_summary\": \"tronc";
++        let client_nav4 = MockClient::new(vec![
++            Ok(resp(partial, 10)), // perceptor: strict parse fallisce
++            Ok(resp(partial, 10)), // correction retry: fallisce ancora
++        ]);
++        let p4 = TranslateParams { update_context: true, ..pf };
++        let out = translate_page(&c, &client_nav4, &p4).unwrap();
++
++        assert!(out.translated_text.contains("AAA-tradotto"), "unità dalla cache");
++        assert!(out.perceptor_update_failed);
++        assert_eq!(
++            client_nav4.calls(),
++            2,
++            "arrivo warm su N+1 = 2 chiamate LLM sincrone (percettore + retry) prima del ritorno"
++        );
++    }
+ }

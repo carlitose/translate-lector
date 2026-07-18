@@ -18,6 +18,7 @@
     isLatestNav,
     contextNote,
     type TranslationResult,
+    type AdvanceContextResult,
     type PageStatus,
     type RequestKey
   } from '$lib/translation';
@@ -433,12 +434,42 @@
       // gate above; this check catches navigation that happened AFTER sending.
       const now = currentKey();
       if (seq !== translationSeq || !now || !isCurrentRequest(requested, now)) return;
+      // Two-phase arrival (ticket 01): render the translation IMMEDIATELY — an
+      // arrival on a fully prefetched page returns with zero blocking LLM calls,
+      // so the text is shown at once without waiting for the perceptor. Clearing
+      // `translating` here (before phase 2) is what actually reveals the text in
+      // the template: the `{:else if translating}` branch hides `translatedText`
+      // until this flips. The guarded `finally` below re-clears it harmlessly.
       translatedText = result.translated_text;
       pageStatus = resultStatus(result.from_cache);
-      // Non-intrusive note if the perceptor-update did not advance the context
-      // for this page (ticket 02); empty on success / cache hit.
-      contextNoteText = contextNote(result);
-      void prefetchNextPage(); // warm N+1 in the background (D5)
+      translating = false;
+      // Phase 2 — advance the document context (rolling summary + glossary) OFF
+      // the response path. The user is already reading; this call runs the
+      // once-per-page perceptor-update in the background. It is idempotent (a
+      // re-visit is a cheap no-op via the `context_advanced` marker), so it is
+      // safe to call after every on-demand translation, cache hit included.
+      // Ordering (spec §Decision): await it BEFORE prefetching N+1 so the prefetch
+      // uses the advanced summary and context grows in order.
+      try {
+        const adv = await invoke<AdvanceContextResult>('advance_context', {
+          documentId: requested.documentId,
+          pageNumber: requested.pageNumber,
+          targetLanguage: requested.targetLanguage,
+          pageText
+        });
+        // Drop a stale result if the user navigated away meanwhile (the note is
+        // for the page on screen only).
+        const stillCurrent = currentKey();
+        if (seq === translationSeq && stillCurrent && isCurrentRequest(requested, stillCurrent)) {
+          // Non-intrusive note if the perceptor-update did not advance the
+          // context for this page (ticket 02); empty on success / no-op.
+          contextNoteText = contextNote(adv);
+        }
+      } catch {
+        // Advancing the context is best-effort: a failure never blocks reading
+        // (the translation is already shown). A later re-visit retries it.
+      }
+      void prefetchNextPage(); // warm N+1 in the background (D5), after context advanced
     } catch (e) {
       const now = currentKey();
       if (seq !== translationSeq || !now || !isCurrentRequest(requested, now)) return;

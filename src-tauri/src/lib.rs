@@ -661,6 +661,83 @@ async fn translate_page(
     .map_err(|e| format!("translation task failed: {e}"))?
 }
 
+/// Phase 2 of two-phase arrival (ticket 01, prefetched-page-arrival-latency):
+/// advance the document context (rolling summary + glossary) for a page whose
+/// translation `translate_page` already delivered. The frontend invokes this
+/// AFTER it renders the translation and BEFORE it prefetches N+1, so the
+/// once-per-page perceptor-update never sits on the arrival's response path (a
+/// warm arrival on a prefetched page returns instantly).
+///
+/// Serialized behind `LocalProviderSlot` (like translations) so the local model
+/// is never contended and context advances in cursor order. Idempotent via the
+/// `context_advanced` marker: a re-visit of an already-advanced page is a cheap
+/// no-op (no model call). A perceptor failure leaves the context un-advanced and
+/// reports `perceptor_update_failed` so the UI can surface it; a later re-visit
+/// retries. Never runs on prefetch (the frontend only calls it on real
+/// navigation). Runs on a worker thread so the model call never blocks the UI —
+/// the user is already reading the translation while this completes.
+#[tauri::command]
+async fn advance_context(
+    app: tauri::AppHandle,
+    document_id: i64,
+    page_number: i64,
+    target_language: String,
+    page_text: String,
+) -> Result<translate::AdvanceContextResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db(&app)?;
+
+        // Resolve the active provider + config exactly like `translate_page` (the
+        // perceptor call must go to the same endpoint/model as the translation).
+        let active_id = settings::get_active_provider(&conn).map_err(|e| e.to_string())?;
+        let cfg = settings::get_provider_config(&conn, &active_id).map_err(|e| e.to_string())?;
+        let api_key = secrets::get_api_key(&active_id)
+            .map_err(|e| e.to_string())?
+            .unwrap_or_default();
+        let app_managed = sidecar::is_managed_local_provider(
+            llm::is_local_url(&cfg.base_url),
+            cfg.binary_path.trim().is_empty(),
+        );
+        let base = llm::ChatCompletionsClient::new(
+            cfg.base_url.clone(),
+            api_key,
+            /* send_openrouter_headers = */ active_id == "openrouter",
+            cfg.timeout_secs,
+            app_managed,
+        );
+        let retry_policy = llm::RetryPolicy::for_base_url(&cfg.base_url);
+        let client = llm::RetryingChatClient::new(&base, retry_policy);
+
+        let params = translate::AdvanceContextParams {
+            document_id,
+            page_number,
+            target_language: &target_language,
+            page_text: &page_text,
+            model: &cfg.model,
+            max_tokens: cfg.max_tokens,
+        };
+
+        // Serialize the local provider (L3/L4): the context-advance perceptor call
+        // shares the single local slot with translations so they never fight over
+        // the model, and pages advance in the order they were read. Cloud stays
+        // concurrent (no slot), as for translations.
+        let local_slot = app.state::<LocalProviderSlot>();
+        let _local_guard = if llm::is_local_url(&cfg.base_url) {
+            Some(lock_ignoring_poison(&local_slot.0))
+        } else {
+            None
+        };
+
+        // The perceptor call needs a healthy app-managed server too (no-op for a
+        // cloud or non-managed local provider).
+        sidecar::ensure_local_server_ready(&app, &cfg)?;
+
+        translate::advance_context(&conn, &client, &params).map_err(|e| e.user_message())
+    })
+    .await
+    .map_err(|e| format!("advance-context task failed: {e}"))?
+}
+
 /// Cheap reachability probe for the active/selected provider (ticket 09, D3/D7),
 /// used by the non-blocking onboarding hint. Resolves the provider's effective
 /// `base_url` and does a short-timeout GET to its `/v1/models`. Returns `true`
@@ -859,6 +936,7 @@ pub fn run() {
             relocate_document,
             remove_recent,
             translate_page,
+            advance_context,
             check_provider_reachable,
             get_prefetch_enabled,
             list_glossary,
