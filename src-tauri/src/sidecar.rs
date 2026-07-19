@@ -608,12 +608,19 @@ mod tests {
 
     #[test]
     fn binary_image_name_takes_the_file_name() {
+        let windows_named_binary = Path::new("configured")
+            .join("llama.cpp")
+            .join("llama-server.exe");
         assert_eq!(
-            binary_image_name(r"C:\Users\x\.translate-lector\llama.cpp\llama-server.exe"),
+            binary_image_name(&windows_named_binary.to_string_lossy()),
             Some("llama-server.exe".to_string())
         );
+        let extensionless_binary = Path::new("usr")
+            .join("local")
+            .join("bin")
+            .join("llama-server");
         assert_eq!(
-            binary_image_name("/usr/local/bin/llama-server"),
+            binary_image_name(&extensionless_binary.to_string_lossy()),
             Some("llama-server".to_string())
         );
     }

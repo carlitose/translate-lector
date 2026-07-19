@@ -5,6 +5,7 @@
   import * as pdfjsLib from 'pdfjs-dist';
   import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
   import { reconstruct, type TextItem } from '$lib/pdfExtract';
+  import { collectTextContentItems } from '$lib/pdfTextStream';
   import ProviderConfig from '$lib/ProviderConfig.svelte';
   import GlossaryPanel from '$lib/GlossaryPanel.svelte';
   import { isLocalProvider, shouldShowLocalHint, localUnreachableHint } from '$lib/providerConfig';
@@ -120,9 +121,9 @@
     if (!pdfDoc) return '';
     const page = await pdfDoc.getPage(pageNo);
     const viewport = page.getViewport({ scale: 1 });
-    const content = await page.getTextContent();
-    const items: TextItem[] = (content.items as any[])
-      .filter((i) => typeof i.str === 'string')
+    const contentItems = await collectTextContentItems<TextItem | { type: string }>(page);
+    const items: TextItem[] = contentItems
+      .filter((i): i is TextItem => 'str' in i && typeof i.str === 'string')
       .map((i) => ({
         str: i.str,
         transform: i.transform,
