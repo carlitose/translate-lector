@@ -53,3 +53,17 @@ export function clampPage(page: number, total: number): number {
   if (total < 1) return 1;
   return Math.min(Math.max(page, 1), total);
 }
+
+/**
+ * Turn the page selector's draft into a valid 1-based destination. Keeping
+ * this separate from `currentPage` prevents incomplete input from navigating.
+ */
+export function parsePageDraft(draft: string, totalPages: number): number | null {
+  const normalized = draft.trim();
+  if (!normalized || !Number.isInteger(totalPages) || totalPages < 1) return null;
+  if (!/^[0-9]+$/.test(normalized)) return null;
+
+  const page = Number(normalized);
+  if (!Number.isInteger(page) || page < 1 || page > totalPages) return null;
+  return page;
+}

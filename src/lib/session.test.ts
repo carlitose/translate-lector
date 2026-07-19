@@ -3,6 +3,7 @@ import {
   restoreDecision,
   fileName,
   clampPage,
+  parsePageDraft,
   type LastSession
 } from './session';
 
@@ -53,5 +54,29 @@ describe('clampPage', () => {
 
   it('defaults to page 1 for an empty document', () => {
     expect(clampPage(4, 0)).toBe(1);
+  });
+});
+
+describe('parsePageDraft', () => {
+  it('accepts a valid page, including the first and last page', () => {
+    expect(parsePageDraft('4', 10)).toBe(4);
+    expect(parsePageDraft('1', 10)).toBe(1);
+    expect(parsePageDraft('10', 10)).toBe(10);
+  });
+
+  it('rejects pages outside the document limits', () => {
+    expect(parsePageDraft('0', 10)).toBeNull();
+    expect(parsePageDraft('11', 10)).toBeNull();
+  });
+
+  it('rejects empty, non-decimal-integer syntax, and non-numeric drafts', () => {
+    expect(parsePageDraft('', 10)).toBeNull();
+    expect(parsePageDraft('   ', 10)).toBeNull();
+    expect(parsePageDraft('2.5', 10)).toBeNull();
+    expect(parsePageDraft('2.0', 10)).toBeNull();
+    expect(parsePageDraft('1e1', 10)).toBeNull();
+    expect(parsePageDraft('+2', 10)).toBeNull();
+    expect(parsePageDraft('0x2', 10)).toBeNull();
+    expect(parsePageDraft('pagina 2', 10)).toBeNull();
   });
 });

@@ -1,36 +1,37 @@
 import { describe, expect, it, vi } from 'vitest';
 import { collectTextContentItems, type TextContentPage } from './pdfTextStream';
 
-function pageWithReads(
-  reads: Array<
-    | { done: false; value: { items: string[] } }
-    | { done: true; value?: undefined }
-    | Error
-  >
-): {
-  page: TextContentPage<string>;
+type TextContentRead<T> =
+  | { done: false; value: { items: T[] } }
+  | { done: true; value?: undefined };
+
+function pageWithReads<T>(reads: Array<TextContentRead<T> | Error>): {
+  page: TextContentPage<T>;
   getTextContent: ReturnType<typeof vi.fn>;
   releaseLock: ReturnType<typeof vi.fn>;
+  stream: ReturnType<TextContentPage<T>['streamTextContent']>;
 } {
   const releaseLock = vi.fn();
-  const read = vi.fn(async (): Promise<ReadableStreamReadResult<{ items: string[] }>> => {
+  const read = vi.fn(async (): Promise<ReadableStreamReadResult<{ items: T[] }>> => {
     const next = reads.shift();
     if (next instanceof Error) throw next;
     if (!next) throw new Error('Unexpected read');
     return next;
   });
-  const getTextContent = vi.fn(async () => ({ items: [] }));
+  const getTextContent = vi.fn(async () => ({ items: [] as T[] }));
+  const stream = {
+    getReader: () => ({ read, releaseLock })
+  };
 
   return {
     page: {
       isPureXfa: false,
       getTextContent,
-      streamTextContent: () => ({
-        getReader: () => ({ read, releaseLock })
-      })
+      streamTextContent: () => stream
     },
     getTextContent,
-    releaseLock
+    releaseLock,
+    stream
   };
 }
 
@@ -64,7 +65,7 @@ describe('collectTextContentItems', () => {
   });
 
   it('returns an empty array for an immediately completed stream', async () => {
-    const { page, releaseLock } = pageWithReads([{ done: true }]);
+    const { page, releaseLock } = pageWithReads<string>([{ done: true }]);
 
     await expect(collectTextContentItems(page)).resolves.toEqual([]);
     expect(releaseLock).toHaveBeenCalledOnce();
@@ -72,9 +73,22 @@ describe('collectTextContentItems', () => {
 
   it('releases the reader lock and propagates the original read error', async () => {
     const readError = new Error('stream failed');
-    const { page, releaseLock } = pageWithReads([readError]);
+    const { page, releaseLock } = pageWithReads<string>([readError]);
 
     await expect(collectTextContentItems(page)).rejects.toBe(readError);
+    expect(releaseLock).toHaveBeenCalledOnce();
+  });
+
+  it('works when getReader exists but async iteration is unavailable', async () => {
+    const { page, getTextContent, releaseLock, stream } = pageWithReads([
+      { done: false, value: { items: ['WKWebView text'] } },
+      { done: true }
+    ]);
+
+    expect(stream.getReader).toBeTypeOf('function');
+    expect((stream as unknown as Record<symbol, unknown>)[Symbol.asyncIterator]).toBeUndefined();
+    await expect(collectTextContentItems(page)).resolves.toEqual(['WKWebView text']);
+    expect(getTextContent).not.toHaveBeenCalled();
     expect(releaseLock).toHaveBeenCalledOnce();
   });
 });
