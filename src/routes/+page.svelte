@@ -1,11 +1,16 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { open } from '@tauri-apps/plugin-dialog';
   import * as pdfjsLib from 'pdfjs-dist';
   import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
-  import { reconstruct, type TextItem } from '$lib/pdfExtract';
-  import { collectTextContentItems } from '$lib/pdfTextStream';
+  import {
+    PdfDocumentLoadController,
+    type ActivePdfDocument,
+    type PdfDocumentLoadState
+  } from '$lib/pdfDocumentLoad';
+  import { extractPageText } from '$lib/pdfPageText';
+  import { LatestRenderCoordinator } from '$lib/pdfRender';
   import ProviderConfig from '$lib/ProviderConfig.svelte';
   import GlossaryPanel from '$lib/GlossaryPanel.svelte';
   import { isLocalProvider, shouldShowLocalHint, localUnreachableHint } from '$lib/providerConfig';
@@ -16,7 +21,6 @@
     requestKey,
     isCurrentRequest,
     shouldTranslate,
-    isLatestNav,
     contextNote,
     type TranslationResult,
     type AdvanceContextResult,
@@ -27,6 +31,7 @@
     restoreDecision,
     fileName,
     clampPage,
+    parsePageDraft,
     type LastSession,
     type RecentDocument
   } from '$lib/session';
@@ -52,13 +57,18 @@
     current_page: number;
   }
 
+  type PdfDocument = Awaited<ReturnType<typeof pdfjsLib.getDocument>['promise']>;
+  type ActiveDocument = ActivePdfDocument<PdfDocument, SessionRecord>;
+
   // pdf.js document handle — kept out of reactive state (not a plain object).
-  let pdfDoc: Awaited<ReturnType<typeof pdfjsLib.getDocument>['promise']> | null = null;
+  let pdfDoc: PdfDocument | null = null;
+  let documentGeneration = 0;
   let canvasEl: HTMLCanvasElement | undefined = $state();
 
   let title = $state('');
   let totalPages = $state(0);
   let currentPage = $state(1);
+  let pageDraft = $state('');
   let reconstructedText = $state('');
   // The page number `reconstructedText` was extracted from. Set ATOMICALLY with
   // `reconstructedText` in `showPage` so the translation effect can enforce the
@@ -88,10 +98,10 @@
   let contextNoteText = $state('');
   // Monotonic token so a slow response for a stale page/language is ignored.
   let translationSeq = 0;
-  // Monotonic navigation token (finding 2): captured at the start of each
-  // `showPage` render so a superseded, out-of-order render never commits its
-  // page↔text state over the page now on screen.
-  let navToken = 0;
+  // PDF.js forbids concurrent RenderTasks on one canvas. This coordinator
+  // cancels an obsolete task, waits for its cleanup, and only starts the latest
+  // navigation's replacement.
+  const pageRenderer = new LatestRenderCoordinator();
   // Prefetch the next page in the background (decision D5, read from settings).
   let prefetchEnabled = $state(true);
   // Non-blocking onboarding hint shown when the active provider is local and its
@@ -110,48 +120,62 @@
   }
 
   const isCurated = $derived(LANGUAGES.some((l) => l.code === targetLanguage));
-  const canPrev = $derived(currentPage > 1);
-  const canNext = $derived(currentPage < totalPages);
+  const canPrev = $derived(!loading && currentPage > 1);
+  const canNext = $derived(!loading && currentPage < totalPages);
 
   const RENDER_SCALE = 1.4;
   const EC01_MESSAGE = 'formato non supportato (no OCR)';
 
-  /** Extract + reconstruct the text of a pdf.js page. */
-  async function extractPageText(pageNo: number): Promise<string> {
-    if (!pdfDoc) return '';
-    const page = await pdfDoc.getPage(pageNo);
-    const viewport = page.getViewport({ scale: 1 });
-    const contentItems = await collectTextContentItems<TextItem | { type: string }>(page);
-    const items: TextItem[] = contentItems
-      .filter((i): i is TextItem => 'str' in i && typeof i.str === 'string')
-      .map((i) => ({
-        str: i.str,
-        transform: i.transform,
-        width: i.width,
-        height: i.height,
-        hasEOL: i.hasEOL
-      }));
-    return reconstruct(items, viewport.width);
+  async function extractDocumentPageText(
+    document: PdfDocument,
+    pageNo: number
+  ): Promise<string> {
+    return extractPageText(await document.getPage(pageNo));
   }
 
   /** Render `pageNo` onto the canvas and show its reconstructed text. */
-  async function showPage(pageNo: number): Promise<void> {
-    if (!pdfDoc || !canvasEl) return;
-    // Claim this navigation. A later `showPage` bumps `navToken`, so if two
-    // renders race we only let the newest one commit its state (finding 2).
-    const myToken = ++navToken;
-    const page = await pdfDoc.getPage(pageNo);
+  async function showPage(
+    pageNo: number,
+    activeDocument: ActiveDocument,
+    generation = documentGeneration
+  ): Promise<void> {
+    const myToken = pageRenderer.beginNavigation();
+    const canvas = canvasEl;
+    if (!canvas) return;
+
+    const document = activeDocument.document;
+    const page = await document.getPage(pageNo);
+    if (
+      !pageRenderer.isLatest(myToken) ||
+      !pageRenderer.isCurrentDocument(generation) ||
+      !documentLoader.isActive(activeDocument)
+    ) {
+      return;
+    }
     const viewport = page.getViewport({ scale: RENDER_SCALE });
-    canvasEl.width = viewport.width;
-    canvasEl.height = viewport.height;
-    const ctx = canvasEl.getContext('2d');
+    const ctx = canvas.getContext('2d');
     if (!ctx) return;
-    await page.render({ canvasContext: ctx, viewport, canvas: canvasEl }).promise;
-    const text = await extractPageText(pageNo);
+
+    const rendered = await pageRenderer.render(myToken, () => {
+      // Resizing clears the bitmap, so it must happen after the cancelled task
+      // has fully settled and immediately before the replacement starts.
+      canvas.width = viewport.width;
+      canvas.height = viewport.height;
+      return page.render({ canvasContext: ctx, viewport, canvas });
+    });
+    if (!rendered) return;
+
+    const text = await extractPageText(page);
     // Drop a superseded render: committing it would leave `reconstructedPage`
     // != `currentPage`, and since navigation is the only reliable re-trigger a
     // later language change would then skip re-translating the visible page.
-    if (!isLatestNav(myToken, navToken)) return;
+    if (
+      !pageRenderer.isLatest(myToken) ||
+      !pageRenderer.isCurrentDocument(generation) ||
+      !documentLoader.isActive(activeDocument)
+    ) {
+      return;
+    }
     // Assign page + text together so a reader of `reconstructedText` always sees
     // the matching `reconstructedPage` (no window where they disagree).
     reconstructedText = text;
@@ -159,10 +183,17 @@
   }
 
   /** Does any sampled page yield extractable text? (EC01 guard.) */
-  async function hasExtractableText(pageCount: number): Promise<boolean> {
+  async function hasExtractableText(
+    document: PdfDocument,
+    pageCount: number,
+    generation: number
+  ): Promise<boolean> {
     const sample = Math.min(pageCount, 10);
     for (let p = 1; p <= sample; p++) {
-      if ((await extractPageText(p)).trim().length > 0) return true;
+      if (!pageRenderer.isCurrentDocument(generation)) return false;
+      const text = await extractDocumentPageText(document, p);
+      if (!pageRenderer.isCurrentDocument(generation)) return false;
+      if (text.trim().length > 0) return true;
     }
     return false;
   }
@@ -172,6 +203,82 @@
     return file.replace(/\.pdf$/i, '');
   }
 
+  function clearDocumentBoundState(): void {
+    pdfDoc = null;
+    session = null;
+    title = '';
+    totalPages = 0;
+    currentPage = 1;
+    pageDraft = '';
+    reconstructedText = '';
+    reconstructedPage = 0;
+    translatedText = '';
+    translating = false;
+    translationError = '';
+    pageStatus = 'idle';
+    contextNoteText = '';
+  }
+
+  function publishPreparedDocument(prepared: ActiveDocument): void {
+    // These assignments share one synchronous Svelte update: reactive work can
+    // observe either the cleared state or this complete matching bundle.
+    pdfDoc = prepared.document;
+    session = prepared.session;
+    title = prepared.title;
+    totalPages = prepared.totalPages;
+    currentPage = prepared.currentPage;
+    pageDraft = String(prepared.currentPage);
+    targetLanguage = prepared.targetLanguage;
+  }
+
+  let routePublication: ActiveDocument | null = null;
+
+  function applyDocumentLoadState(
+    state: PdfDocumentLoadState<PdfDocument, SessionRecord>
+  ): void {
+    loading = state.phase === 'loading' || state.phase === 'activating';
+
+    if (state.publication !== routePublication) {
+      clearDocumentBoundState();
+      routePublication = state.publication;
+      if (state.publication) publishPreparedDocument(state.publication);
+    }
+
+    if (state.phase === 'unsupported') {
+      errorMsg = EC01_MESSAGE;
+    } else if (state.phase === 'error') {
+      errorMsg = `Errore nell'apertura del PDF: ${state.error}`;
+    } else {
+      errorMsg = '';
+    }
+  }
+
+  const documentLoader = new PdfDocumentLoadController<
+    Uint8Array,
+    PdfDocument,
+    SessionRecord
+  >({
+    readBytes: async (filePath) => {
+      const buffer = await invoke<ArrayBuffer>('read_pdf_bytes', { path: filePath });
+      return new Uint8Array(buffer);
+    },
+    openDocument: (data) => pdfjsLib.getDocument({ data }),
+    hasExtractableText: (document, pageCount) =>
+      hasExtractableText(document, pageCount, documentGeneration),
+    registerDocument: ({ path: filePath, totalPages: pageCount, title: docTitle }) =>
+      invoke<DocumentRecord>('register_document', {
+        path: filePath,
+        totalPages: pageCount,
+        title: docTitle
+      }),
+    openSession: (documentId) =>
+      invoke<SessionRecord>('open_or_create_session', { documentId }),
+    titleFromPath: baseName,
+    clampPage,
+    beforeDestroy: async () => pageRenderer.waitForIdle(),
+    onStateChange: applyDocumentLoadState
+  });
+
   /**
    * Load, register and render a PDF by absolute path. Shared by the file
    * picker, the "Recenti" list and startup restore (ticket 11). Rehydrates the
@@ -179,58 +286,35 @@
    * live in the DB and are used by the core / glossary panel on demand).
    */
   async function loadDocument(path: string): Promise<void> {
-    errorMsg = '';
+    // Invalidate/cancel the visible document's render before the first load
+    // await. Every later commit is tied to this document identity.
+    const loadGeneration = pageRenderer.beginDocument();
+    documentGeneration = loadGeneration;
     relocateError = '';
     missingFile = null;
-    translatedText = '';
-    translationError = '';
-    pageStatus = 'idle';
-    reconstructedText = '';
-    reconstructedPage = 0; // no page text belongs to the incoming document yet
     translationSeq++; // invalidate any in-flight translation from a prior doc
 
-    loading = true;
-    try {
-      const buffer = await invoke<ArrayBuffer>('read_pdf_bytes', { path });
-      const data = new Uint8Array(buffer);
-      pdfDoc = await pdfjsLib.getDocument({ data }).promise;
-      const pageCount = pdfDoc.numPages;
+    await documentLoader.load(path, {
+      hasExtractableText: (document, pageCount) =>
+        hasExtractableText(document, pageCount, loadGeneration),
+      activate: async (prepared) => {
+        if (
+          !pageRenderer.isCurrentDocument(loadGeneration) ||
+          !documentLoader.isActive(prepared)
+        ) {
+          return;
+        }
 
-      // EC01: scanned/image-only PDFs have no extractable text.
-      if (!(await hasExtractableText(pageCount))) {
-        pdfDoc = null;
-        totalPages = 0;
-        reconstructedText = '';
-        reconstructedPage = 0;
-        errorMsg = EC01_MESSAGE;
-        return;
+        await showPage(prepared.currentPage, prepared, loadGeneration);
+        if (
+          !pageRenderer.isCurrentDocument(loadGeneration) ||
+          !documentLoader.isActive(prepared)
+        ) {
+          return;
+        }
+        await refreshRecents();
       }
-
-      const docTitle = baseName(path);
-      const doc = await invoke<DocumentRecord>('register_document', {
-        path,
-        totalPages: pageCount,
-        title: docTitle
-      });
-      const sess = await invoke<SessionRecord>('open_or_create_session', {
-        documentId: doc.document_id
-      });
-
-      title = doc.title;
-      totalPages = doc.total_pages;
-      session = sess;
-      targetLanguage = sess.target_language;
-      currentPage = clampPage(sess.current_page, pageCount);
-
-      await showPage(currentPage);
-      await refreshRecents();
-    } catch (e) {
-      errorMsg = `Errore nell'apertura del PDF: ${e}`;
-      pdfDoc = null;
-      totalPages = 0;
-    } finally {
-      loading = false;
-    }
+    });
   }
 
   async function openPdf(): Promise<void> {
@@ -367,17 +451,29 @@
     }
   });
 
-  async function persistSession(): Promise<void> {
-    if (!session) return;
+  onDestroy(async () => {
+    pageRenderer.beginDocument();
+    await documentLoader.dispose();
+  });
+
+  async function persistSession(
+    sessionToPersist = session,
+    pageToPersist = currentPage,
+    languageToPersist = targetLanguage
+  ): Promise<void> {
+    if (!sessionToPersist) return;
     await invoke('update_session', {
-      sessionId: session.session_id,
-      currentPage,
-      targetLanguage
+      sessionId: sessionToPersist.session_id,
+      currentPage: pageToPersist,
+      targetLanguage: languageToPersist
     });
   }
 
   async function goTo(pageNo: number): Promise<void> {
-    if (!pdfDoc || pageNo < 1 || pageNo > totalPages) return;
+    const activeDocument = documentLoader.captureActive();
+    if (loading || !activeDocument || pageNo < 1 || pageNo > totalPages) return;
+    const generation = documentGeneration;
+    const activeSession = activeDocument.session;
     // Reset the translation pane immediately so the previous page's translation
     // is not shown while the new page renders (ticket 16). The effect will
     // re-translate once the new page's text is extracted.
@@ -385,13 +481,40 @@
     translationError = '';
     pageStatus = 'idle';
     currentPage = pageNo;
-    await showPage(currentPage);
-    await persistSession();
+    pageDraft = String(pageNo);
+    await showPage(pageNo, activeDocument, generation);
+    if (
+      loading ||
+      !pageRenderer.isCurrentDocument(generation) ||
+      !documentLoader.isActive(activeDocument) ||
+      currentPage !== pageNo
+    ) {
+      return;
+    }
+    await persistSession(activeSession, pageNo, targetLanguage);
+  }
+
+  function commitPageDraft(): void {
+    const destination = parsePageDraft(pageDraft, totalPages);
+    if (loading || destination === null || !pdfDoc) {
+      pageDraft = pdfDoc ? String(currentPage) : '';
+      return;
+    }
+
+    pageDraft = String(destination);
+    if (destination !== currentPage) void goTo(destination);
+  }
+
+  function onPageDraftKeydown(event: KeyboardEvent): void {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    commitPageDraft();
   }
 
   function setLanguage(value: string): void {
+    const activeSession = session;
     targetLanguage = value;
-    void persistSession();
+    void persistSession(activeSession, currentPage, value);
   }
 
   /**
@@ -403,7 +526,7 @@
    * while it was translating, the stale result is dropped (ticket 12).
    */
   async function translateCurrentPage(): Promise<void> {
-    if (!session) return;
+    if (loading || !session || !pdfDoc) return;
     // Couple `page_number` with the exact text it was extracted from: send
     // `reconstructedPage`/`reconstructedText` from the same source, never a
     // fresh `currentPage` mixed with stale text (ticket 16 invariant).
@@ -470,7 +593,9 @@
         // Advancing the context is best-effort: a failure never blocks reading
         // (the translation is already shown). A later re-visit retries it.
       }
-      void prefetchNextPage(); // warm N+1 in the background (D5), after context advanced
+      // Only the translation continuation that still owns this exact page may
+      // warm N+1. A stale continuation must not capture a newly loaded document.
+      if (seq === translationSeq) void prefetchNextPage(requested);
     } catch (e) {
       const now = currentKey();
       if (seq !== translationSeq || !now || !isCurrentRequest(requested, now)) return;
@@ -491,17 +616,33 @@
    * Best-effort: any error (offline, rate limit) is swallowed — it just means no
    * warm cache.
    */
-  async function prefetchNextPage(): Promise<void> {
-    if (!prefetchEnabled || !session || !pdfDoc) return;
-    const next = currentPage + 1;
+  async function prefetchNextPage(sourceRequest: RequestKey): Promise<void> {
+    const activeDocument = documentLoader.captureActive();
+    if (loading || !prefetchEnabled || !activeDocument) return;
+    const current = currentKey();
+    if (!current || !isCurrentRequest(sourceRequest, current)) return;
+    const document = activeDocument.document;
+    const generation = documentGeneration;
+    const activeSession = activeDocument.session;
+    const next = sourceRequest.pageNumber + 1;
     if (next > totalPages) return;
     try {
-      const nextText = await extractPageText(next);
+      const nextText = await extractDocumentPageText(document, next);
+      const now = currentKey();
+      if (
+        loading ||
+        !pageRenderer.isCurrentDocument(generation) ||
+        !documentLoader.isActive(activeDocument) ||
+        !now ||
+        !isCurrentRequest(sourceRequest, now)
+      ) {
+        return;
+      }
       if (!nextText.trim()) return;
       await invoke<TranslationResult>('translate_page', {
-        documentId: session.document_id,
+        documentId: activeSession.document_id,
         pageNumber: next,
-        targetLanguage,
+        targetLanguage: sourceRequest.targetLanguage,
         pageText: nextText,
         updateContext: false // prefetch caches only; no context mutation
       });
@@ -518,7 +659,7 @@
     const page = currentPage;
     const textPage = reconstructedPage;
     const text = reconstructedText;
-    const ready = session !== null;
+    const ready = !loading && session !== null;
     // Only translate once the extracted text belongs to the page on screen; this
     // suppresses the stale pre-fire (currentPage=N, text of N-1) that poisoned
     // the cache (ticket 16).
@@ -626,7 +767,7 @@
       {/if}
       <canvas
         bind:this={canvasEl}
-        class:hidden={totalPages === 0 || !!errorMsg || !!missingFile}
+        class:hidden={loading || totalPages === 0 || !!errorMsg || !!missingFile}
       ></canvas>
     </div>
     <div class="pane pane-right">
@@ -649,7 +790,25 @@
 
   <footer class="bottombar">
     <button onclick={() => goTo(currentPage - 1)} disabled={!canPrev}>◀</button>
-    <span class="pageinfo">Pag. {totalPages ? currentPage : 0} / {totalPages}</span>
+    <label class="pageinfo">
+      <span>Pag.</span>
+      <input
+        class="page-selector"
+        type="number"
+        aria-label={totalPages
+          ? `Vai alla pagina, da 1 a ${totalPages}`
+          : 'Vai alla pagina'}
+        value={pageDraft}
+        min={1}
+        max={totalPages}
+        step={1}
+        disabled={totalPages === 0 || loading}
+        oninput={(event) => (pageDraft = event.currentTarget.value)}
+        onkeydown={onPageDraftKeydown}
+        onblur={commitPageDraft}
+      />
+      <span>/ {totalPages}</span>
+    </label>
     <button onclick={() => goTo(currentPage + 1)} disabled={!canNext}>▶</button>
     <button
       class="glossary-btn"
@@ -711,6 +870,7 @@
     border-top: 1px solid #e2e2e2;
     border-bottom: none;
     justify-content: center;
+    flex-wrap: wrap;
   }
 
   .brand {
@@ -915,8 +1075,29 @@
   }
 
   .pageinfo {
-    min-width: 8rem;
-    text-align: center;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.35rem;
+    white-space: nowrap;
+  }
+
+  .page-selector {
+    box-sizing: border-box;
+    width: clamp(3.5rem, 10vw, 7rem);
+    min-width: 0;
+    padding: 0.3em 0.4em;
+    border: 1px solid #b8b8b8;
+    border-radius: 5px;
+    font: inherit;
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+    color: inherit;
+    background: inherit;
+  }
+
+  .page-selector:disabled {
+    opacity: 0.5;
   }
 
   .status-indicator {
