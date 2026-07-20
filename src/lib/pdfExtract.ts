@@ -1,4 +1,4 @@
-// Coordinate-based text reconstruction for pdf.js `getTextContent()` output.
+// Coordinate-based text reconstruction for PDF.js text-content items.
 //
 // pdf.js delivers glyph runs in drawing order, not reading order. This module
 // rebuilds a natural reading order: it groups runs into lines by baseline y,
@@ -7,7 +7,7 @@
 //
 // Ported from the validated prototype `prototypes/pdfjs/extract.mjs` (ticket 06).
 
-/** A text run as produced by pdf.js `getTextContent().items`. */
+/** A text run as produced by PDF.js text-content streams. */
 export interface TextItem {
   str: string;
   /** [a, b, c, d, e, f]; e = x (left), f = y (baseline, origin bottom-left). */
